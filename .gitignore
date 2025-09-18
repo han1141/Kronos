@@ -74,3 +74,4 @@ venv.bak/
 *.temp
 temp/
 tmp/
+webui/prediction_results/*
