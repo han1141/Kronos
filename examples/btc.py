@@ -62,7 +62,7 @@ def main():
 
     # 2. 计算时间范围（最近3年）
     end_dt = datetime.datetime.now()
-    start_dt = end_dt - datetime.timedelta(days=22)
+    start_dt = end_dt - datetime.timedelta(days=2200)
 
     start_timestamp_ms = int(start_dt.timestamp() * 1000)
     end_timestamp_ms = int(end_dt.timestamp() * 1000)
