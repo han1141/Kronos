@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ECharts</title>
+    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/dayjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/plugin/utc.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.0/dist/echarts.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/plugin/timezone.js"></script>
+    <style>
+      body {
+        font-family: "Arial", sans-serif;
+        margin: 20px;
+        background-color: #f5f5f5;
+      }
+
+      .container {
+        max-width: 1200px;
+        margin: 0 auto;
+        background: white;
+        padding: 20px;
+        border-radius: 8px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+      }
+
+      .file-input-section {
+        margin-bottom: 20px;
+        padding: 15px;
+        background: #f8f9fa;
+        border-radius: 5px;
+      }
+
+      .file-input-section label {
+        display: block;
+        margin-bottom: 10px;
+        font-weight: bold;
+        color: #333;
+      }
+
+      .file-input-section input[type="file"] {
+        padding: 8px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+      }
+
+      #main {
+        width: 100%;
+        height: 600px;
+        border: 1px solid #e0e0e0;
+        border-radius: 5px;
+      }
+
+      .error-message {
+        color: #dc3545;
+        background: #f8d7da;
+        padding: 10px;
+        border-radius: 4px;
+        margin: 10px 0;
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+        <input type="file" id="jsonFile" accept=".json" />
+        <div id="errorMessage" class="error-message"></div>
+      </div>
+      <div id="main"></div>
+    </div>
+
+    <script type="text/javascript">
+      const CHART_CONFIG = {
+        COLORS: {
+          UP: "#ef232a",
+          DOWN: "#14b143",
+          MAIN: ["#c23531", "#2f4554"],
+        },
+        LAYOUT: {
+          MAIN_GRID: {
+            left: "10%",
+            right: "8%",
+            height: "50%",
+          },
+          VOLUME_GRID: {
+            left: "10%",
+            right: "8%",
+            top: "65%",
+            height: "16%",
+          },
+        },
+      };
+      let myChart = null;
+      const fileInput = document.getElementById("jsonFile");
+      const errorMessage = document.getElementById("errorMessage");
+      function showError(message) {
+        errorMessage.textContent = message;
+        errorMessage.style.display = "block";
+        console.error(message);
+      }
+      function hideError() {
+        errorMessage.style.display = "none";
+      }
+      function validateData(data) {
+        if (!data || !data.historical_data || !Array.isArray(data.historical_data) || data.historical_data.length === 0) {
+          showError("JSON文件为空或格式不正确，缺少historical_data字段");
+          return false;
+        }
+        const requiredFields = [
+          "open",
+          "high",
+          "low",
+          "close",
+          "volume",
+          "timestamps",
+        ];
+        const firstRow = data.historical_data[0];
+        for (const field of requiredFields) {
+          if (!(field in firstRow)) {
+            showError(`JSON文件缺少必需字段: ${field}`);
+            return false;
+          }
+        }
+        return true;
+      }
+      function processChartData(jsonData) {
+        const historicalData = jsonData.historical_data;
+        const predictionData = jsonData.prediction_data || [];
+        
+        console.log("开始处理数据，历史数据", historicalData.length, "条，预测数据", predictionData.length, "条");
+        
+        const kLineData = [];
+        const volumeData = [];
+        const predictionKLineData = [];
+        const predictionVolumeData = [];
+        
+        // 处理历史数据
+        for (let i = 0; i < historicalData.length; i++) {
+          const row = historicalData[i];
+          const open = parseFloat(row.open);
+          const high = parseFloat(row.high);
+          const low = parseFloat(row.low);
+          const close = parseFloat(row.close);
+          const volume = parseFloat(row.volume);
+          if (
+            isNaN(open) ||
+            isNaN(high) ||
+            isNaN(low) ||
+            isNaN(close) ||
+            isNaN(volume)
+          ) {
+            console.warn(`第${i + 1}行历史数据无效，跳过处理`);
+            continue;
+          }
+          const timestamp = new Date(row.timestamps).getTime();
+          kLineData.push([timestamp, open, close, low, high]);
+          const isUp = close >= open;
+          volumeData.push([timestamp, volume, isUp ? CHART_CONFIG.COLORS.UP : CHART_CONFIG.COLORS.DOWN]);
+        }
+        
+        // 处理预测数据
+        for (let i = 0; i < predictionData.length; i++) {
+          const row = predictionData[i];
+          const open = parseFloat(row.open);
+          const high = parseFloat(row.high);
+          const low = parseFloat(row.low);
+          const close = parseFloat(row.close);
+          const volume = parseFloat(row.volume);
+          if (
+            isNaN(open) ||
+            isNaN(high) ||
+            isNaN(low) ||
+            isNaN(close) ||
+            isNaN(volume)
+          ) {
+            console.warn(`第${i + 1}行预测数据无效，跳过处理`);
+            continue;
+          }
+          const timestamp = new Date(row.timestamps).getTime();
+          predictionKLineData.push([timestamp, open, close, low, high]);
+          const isUp = close >= open;
+          predictionVolumeData.push([timestamp, volume, isUp ? '#ff9500' : '#00d4aa']);
+        }
+        
+        console.log("数据处理完成，历史数据", kLineData.length, "条，预测数据", predictionKLineData.length, "条");
+        return {
+          kLineData,
+          volumeData,
+          predictionKLineData,
+          predictionVolumeData,
+        };
+      }
+      function createChartOption(processedData) {
+        const currentDate = new Date().getTime();
+        
+        return {
+          animation: false,
+          color: CHART_CONFIG.COLORS.MAIN,
+          title: {
+            text: "K线与成交量展示（历史数据 + 预测数据）",
+            left: "center",
+            textStyle: {
+              fontSize: 18,
+              fontWeight: "bold",
+            },
+          },
+          legend: {
+            data: ["历史K线", "预测K线", "历史成交量", "预测成交量"],
+            top: 30,
+          },
+          tooltip: {
+            trigger: "axis",
+            axisPointer: {
+              type: "cross",
+            },
+            borderWidth: 1,
+            borderColor: "#ccc",
+            padding: 10,
+            textStyle: {
+              color: "#000",
+            },
+            formatter: function (params) {
+              if (!params || params.length === 0) return '';
+              
+              const timestamp = params[0].data[0];
+              const date = new Date(timestamp);
+              let result = date.toLocaleString('zh-CN') + "<br/>";
+              
+              // 判断是否为预测数据
+              const isPrediction = params[0].seriesName.includes('预测');
+              result += `数据类型: ${isPrediction ? '预测' : '历史'}<br/>`;
+              
+              // K线数据
+              const kParam = params.find(p => p.seriesName.includes('K线'));
+              if (kParam && kParam.data) {
+                const kData = kParam.data;
+                result += `开盘: ${kData[1]}<br/>`;
+                result += `收盘: ${kData[2]}<br/>`;
+                result += `最低: ${kData[3]}<br/>`;
+                result += `最高: ${kData[4]}<br/>`;
+              }
+              
+              // 成交量数据
+              const volumeParam = params.find(p => p.seriesName.includes('成交量'));
+              if (volumeParam && volumeParam.data) {
+                result += `成交量: ${volumeParam.data[1]}`;
+              }
+
+              return result;
+            },
+          },
+          axisPointer: {
+            link: [{ xAxisIndex: "all" }],
+            label: {
+              backgroundColor: "#777",
+            },
+          },
+          grid: [
+            CHART_CONFIG.LAYOUT.MAIN_GRID,
+            CHART_CONFIG.LAYOUT.VOLUME_GRID,
+          ],
+          xAxis: [
+            {
+              type: "time",
+              scale: true,
+              boundaryGap: false,
+              axisLine: { onZero: false },
+              splitLine: { show: false },
+              axisLabel: {
+                formatter: function (value) {
+                  return new Date(value).toLocaleDateString('zh-CN');
+                }
+              },
+            },
+            {
+              type: "time",
+              gridIndex: 1,
+              scale: true,
+              boundaryGap: false,
+              axisLine: { onZero: false },
+              axisTick: { show: false },
+              splitLine: { show: false },
+              axisLabel: { show: false },
+            },
+          ],
+          yAxis: [
+            {
+              scale: true,
+              splitArea: { show: true },
+            },
+            {
+              scale: true,
+              gridIndex: 1,
+              axisLabel: { show: false },
+              axisLine: { show: false },
+              axisTick: { show: false },
+              splitLine: { show: false },
+            },
+          ],
+          dataZoom: [
+            {
+              type: "inside",
+              xAxisIndex: [0, 1],
+              start: 0,
+              end: 100,
+            },
+            {
+              show: true,
+              type: "slider",
+              xAxisIndex: [0, 1],
+              top: "90%",
+              start: 0,
+              end: 100,
+            },
+          ],
+          series: [
+            {
+              name: "历史K线",
+              type: "candlestick",
+              data: processedData.kLineData,
+              itemStyle: {
+                color: CHART_CONFIG.COLORS.UP,
+                color0: CHART_CONFIG.COLORS.DOWN,
+                borderColor: CHART_CONFIG.COLORS.UP,
+                borderColor0: CHART_CONFIG.COLORS.DOWN,
+              },
+              markLine: {
+                symbol: ['none', 'none'],
+                data: [
+                  {
+                    name: '当前时间',
+                    xAxis: currentDate,
+                    lineStyle: {
+                      color: '#ff6b35',
+                      width: 2,
+                      type: 'dashed'
+                    },
+                    label: {
+                      show: true,
+                      position: 'insideEndTop',
+                      formatter: '当前时间',
+                      color: '#ff6b35',
+                      fontSize: 12,
+                      fontWeight: 'bold'
+                    }
+                  }
+                ]
+              },
+            },
+            {
+              name: "预测K线",
+              type: "candlestick",
+              data: processedData.predictionKLineData,
+              itemStyle: {
+                color: '#ff9500',
+                color0: '#00d4aa',
+                borderColor: '#ff9500',
+                borderColor0: '#00d4aa',
+              },
+              xAxisIndex: 0,
+              yAxisIndex: 0,
+            },
+            {
+              name: "历史成交量",
+              type: "bar",
+              xAxisIndex: 1,
+              yAxisIndex: 1,
+              data: processedData.volumeData,
+              barWidth: "60%",
+              itemStyle: {
+                color: function(params) {
+                  return params.data[2];
+                }
+              },
+            },
+            {
+              name: "预测成交量",
+              type: "bar",
+              xAxisIndex: 1,
+              yAxisIndex: 1,
+              data: processedData.predictionVolumeData,
+              barWidth: "60%",
+              itemStyle: {
+                color: function(params) {
+                  return params.data[2];
+                }
+              },
+            },
+          ],
+        };
+      }
+      function renderChart(processedData) {
+        try {
+          const option = createChartOption(processedData);
+          myChart.setOption(option, true);
+          hideError();
+          console.log("图表渲染成功");
+        } catch (error) {
+          showError("图表渲染失败: " + error.message);
+        }
+      }
+      function handleJSONFile(file) {
+        if (!file) {
+          showError("请选择一个JSON文件");
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = function (event) {
+          try {
+            const jsonText = event.target.result;
+            console.log("JSON文件读取成功");
+            const jsonData = JSON.parse(jsonText);
+            console.log("JSON解析完成");
+            if (!validateData(jsonData)) {
+              return;
+            }
+            const processedData = processChartData(jsonData);
+            if (processedData.kLineData.length === 0) {
+              showError("没有有效的历史数据可以显示");
+              return;
+            }
+            renderChart(processedData);
+          } catch (error) {
+            showError("文件处理失败: " + error.message);
+          }
+        };
+        reader.onerror = function () {
+          showError("文件读取失败");
+        };
+        reader.readAsText(file, "UTF-8");
+      }
+      function initializeApp() {
+        try {
+          dayjs.extend(dayjs_plugin_utc);
+          dayjs.extend(dayjs_plugin_timezone);
+          myChart = echarts.init(document.getElementById("main"));
+          window.addEventListener("resize", function () {
+            if (myChart) {
+              myChart.resize();
+            }
+          });
+          fileInput.addEventListener("change", function (event) {
+            const file = event.target.files[0];
+            handleJSONFile(file);
+          });
+          console.log("应用初始化完成");
+        } catch (error) {
+          showError("应用初始化失败: " + error.message);
+        }
+      }
+      document.addEventListener("DOMContentLoaded", initializeApp);
+    </script>
+  </body>
+</html>

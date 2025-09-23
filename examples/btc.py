@@ -2,7 +2,6 @@ import requests
 import pandas as pd
 import datetime
 import time
-import pytz
 
 
 def get_binance_klines(symbol, interval, start_time, end_time):
@@ -37,13 +36,9 @@ def get_binance_klines(symbol, interval, start_time, end_time):
             all_klines.extend(klines)
             current_start_time = klines[-1][0] + 1
 
-            # 转换为北京时间显示
-            beijing_tz = pytz.timezone('Asia/Shanghai')
-            utc_time = datetime.datetime.fromtimestamp(klines[-1][0] / 1000, tz=pytz.UTC)
-            beijing_time = utc_time.astimezone(beijing_tz)
-            print(
-                f"已获取 {len(all_klines)} 条数据，最新时间: {beijing_time.date()}"
-            )
+            # 显示进度信息
+            utc_time = datetime.datetime.fromtimestamp(klines[-1][0] / 1000)
+            print(f"已获取 {len(all_klines)} 条数据，最新时间: {utc_time.date()}")
 
             time.sleep(0.1)
 
@@ -62,7 +57,7 @@ def main():
 
     # 2. 计算时间范围（最近3年）
     end_dt = datetime.datetime.now()
-    start_dt = end_dt - datetime.timedelta(days=2200)
+    start_dt = end_dt - datetime.timedelta(days=22)
 
     start_timestamp_ms = int(start_dt.timestamp() * 1000)
     end_timestamp_ms = int(end_dt.timestamp() * 1000)
@@ -99,10 +94,8 @@ def main():
         ["open_time", "open", "high", "low", "close", "volume", "quote_asset_volume"]
     ]
 
-    # 2. 将 open_time 从毫秒时间戳转换为北京时间格式
-    df_final["open_time"] = pd.to_datetime(df_final["open_time"], unit="ms", utc=True)
-    # 转换为北京时间
-    df_final["open_time"] = df_final["open_time"].dt.tz_convert('Asia/Shanghai')
+    # 2. 将 open_time 从毫秒时间戳转换为时间格式
+    df_final["open_time"] = pd.to_datetime(df_final["open_time"], unit="ms")
 
     # 3. 将所有数值列转换为数值类型
     numeric_cols = ["open", "high", "low", "close", "volume", "quote_asset_volume"]

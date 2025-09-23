@@ -2,160 +2,20 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import sys
 import torch
-import numpy as np
-from datetime import datetime, timedelta
 
 sys.path.append("../")
 from model import Kronos, KronosTokenizer, KronosPredictor
 
-
-def is_chinese_stock_data(df):
-    """
-    检测是否为A股数据
-    通过分析时间戳的模式来判断：
-    1. 对于日级别数据：检查是否跳过周末且有交易日模式
-    2. 对于小时级别数据：检查是否在A股交易时段内且跳过非交易时间
-    """
-    if 'timestamps' not in df.columns:
-        return False
-    
-    timestamps = pd.to_datetime(df['timestamps'])
-    
-    if len(timestamps) < 10:
-        return False
-    weekdays = timestamps.dt.dayofweek
-    has_weekend = any(weekdays >= 5)
-    time_diffs = timestamps.diff().dropna()
-    median_diff = time_diffs.median()
-    is_hourly_data = pd.Timedelta(minutes=30) <= median_diff <= pd.Timedelta(hours=2)
-    if not has_weekend:
-        if is_hourly_data:
-            hours = timestamps.dt.hour
-            minutes = timestamps.dt.minute
-            morning_session = ((hours == 9) & (minutes >= 30)) | (hours == 10) | ((hours == 11) & (minutes <= 30))
-            afternoon_session = (hours >= 13) & (hours < 15)
-            in_trading_hours = morning_session | afternoon_session
-            
-            trading_hours_ratio = in_trading_hours.sum() / len(timestamps)
-            
-            if trading_hours_ratio > 0.7:
-                return True
-        else:
-            one_day_count = sum(time_diffs == pd.Timedelta(days=1))
-            three_day_count = sum(time_diffs == pd.Timedelta(days=3))
-            
-            if one_day_count > 0 and three_day_count > 0:
-                return True
-    
-    return False
-
-
-def generate_chinese_trading_days(start_date, periods):
-    """
-    生成中国A股交易日
-    跳过周末和主要法定节假日
-    """
-    holidays_2024 = [
-        '2024-01-01',  # 元旦
-        '2024-02-10', '2024-02-11', '2024-02-12', '2024-02-13', '2024-02-14', '2024-02-15', '2024-02-16', '2024-02-17',  # 春节
-        '2024-04-04', '2024-04-05', '2024-04-06',  # 清明节
-        '2024-05-01', '2024-05-02', '2024-05-03',  # 劳动节
-        '2024-06-10',  # 端午节
-        '2024-09-15', '2024-09-16', '2024-09-17',  # 中秋节
-        '2024-10-01', '2024-10-02', '2024-10-03', '2024-10-04', '2024-10-05', '2024-10-06', '2024-10-07',  # 国庆节
-    ]
-    
-    holidays_2025 = [
-        '2025-01-01',  # 元旦
-        '2025-01-28', '2025-01-29', '2025-01-30', '2025-01-31', '2025-02-01', '2025-02-02', '2025-02-03', '2025-02-04',  # 春节
-        '2025-04-05', '2025-04-06', '2025-04-07',  # 清明节
-        '2025-05-01', '2025-05-02', '2025-05-03',  # 劳动节
-        '2025-05-31',  # 端午节
-        '2025-10-01', '2025-10-02', '2025-10-03', '2025-10-04', '2025-10-05', '2025-10-06', '2025-10-07',  # 国庆节
-        '2025-10-06',  # 中秋节（与国庆重叠）
-    ]
-    
-    all_holidays = holidays_2024 + holidays_2025
-    holiday_dates = pd.to_datetime(all_holidays)
-    
-    trading_days = []
-    current_date = pd.to_datetime(start_date)
-    
-    while len(trading_days) < periods:
-        current_date += pd.Timedelta(days=1)
-        
-        if current_date.dayofweek >= 5:
-            continue
-            
-        if current_date.normalize() in holiday_dates:
-            continue
-            
-        trading_days.append(current_date)
-    
-    return pd.Series(trading_days)
-
-
-def generate_chinese_trading_hours(start_timestamp, periods):
-    """
-    生成中国A股小时级别交易时间戳
-    包含交易时段：9:30-11:30, 13:00-15:00
-    跳过周末和主要法定节假日
-    """
-    holidays_2024 = [
-        '2024-01-01',  # 元旦
-        '2024-02-10', '2024-02-11', '2024-02-12', '2024-02-13', '2024-02-14', '2024-02-15', '2024-02-16', '2024-02-17',  # 春节
-        '2024-04-04', '2024-04-05', '2024-04-06',  # 清明节
-        '2024-05-01', '2024-05-02', '2024-05-03',  # 劳动节
-        '2024-06-10',  # 端午节
-        '2024-09-15', '2024-09-16', '2024-09-17',  # 中秋节
-        '2024-10-01', '2024-10-02', '2024-10-03', '2024-10-04', '2024-10-05', '2024-10-06', '2024-10-07',  # 国庆节
-    ]
-    
-    holidays_2025 = [
-        '2025-01-01',  # 元旦
-        '2025-01-28', '2025-01-29', '2025-01-30', '2025-01-31', '2025-02-01', '2025-02-02', '2025-02-03', '2025-02-04',  # 春节
-        '2025-04-05', '2025-04-06', '2025-04-07',  # 清明节
-        '2025-05-01', '2025-05-02', '2025-05-03',  # 劳动节
-        '2025-05-31',  # 端午节
-        '2025-10-01', '2025-10-02', '2025-10-03', '2025-10-04', '2025-10-05', '2025-10-06', '2025-10-07',  # 国庆节
-        '2025-10-06',  # 中秋节（与国庆重叠）
-    ]
-    
-    all_holidays = holidays_2024 + holidays_2025
-    holiday_dates = pd.to_datetime(all_holidays)
-    
-    morning_hours = ['09:30', '10:00', '10:30', '11:00', '11:30']
-    afternoon_hours = ['13:00', '13:30', '14:00', '14:30', '15:00']
-    trading_hours = morning_hours + afternoon_hours
-    
-    trading_timestamps = []
-    current_date = pd.to_datetime(start_timestamp).normalize()
-    
-    while len(trading_timestamps) < periods:
-        current_date += pd.Timedelta(days=1)
-        
-        if current_date.dayofweek >= 5:
-            continue
-            
-        if current_date.normalize() in holiday_dates:
-            continue
-        
-        for hour_str in trading_hours:
-            if len(trading_timestamps) >= periods:
-                break
-            timestamp = pd.to_datetime(f"{current_date.date()} {hour_str}")
-            trading_timestamps.append(timestamp)
-    
-    return pd.Series(trading_timestamps[:periods])
-
-
+# --- dong tai xuan ze she bei ---
 if torch.backends.mps.is_available():
     device = "mps"
+    print("✅ jian ce dao MPS (Apple Silicon GPU), jiang shi yong GPU.")
 else:
     device = "cpu"
+    print("⚠️ wei jian ce dao MPS, jiang shi yong CPU.")
 
+# 1. jia zai shu ju he mo xing
 csv_name = "./history.csv"
-csv_name1 = "./btc_usdt_1d_no_time.csv"
 df = pd.read_csv(csv_name)
 df["timestamps"] = pd.to_datetime(df["timestamps"])
 
@@ -168,32 +28,33 @@ predictor = KronosPredictor(
     device=device,
 )
 
+# 2. zhun bei shu ju (yong yu zhen shi yu ce)
 lookback = 400
 pred_len = 120
 
 if len(df) < lookback:
+    print(
+        f"❌ shu ju bu zu! xu yao zhi shao {lookback} hang li shi shu ju, dan wen jian zhi you {len(df)} hang."
+    )
     sys.exit()
 
 x_df_for_forecast = df.iloc[-lookback:].copy()
 x_timestamp_for_forecast = x_df_for_forecast["timestamps"]
 
+print(f"shi yong zui hou {lookback} tiao shu ju jin xing zhen shi yu ce...")
+print(
+    f"li shi shu ju de zui hou yi ge shi jian dian shi: {x_timestamp_for_forecast.iloc[-1]}"
+)
+
+# shou dong chuang jian wei lai de shi jian chuo (zhe yi bu shi zheng que qie bi xu de)
 last_timestamp = x_timestamp_for_forecast.iloc[-1]
 freq = pd.infer_freq(x_timestamp_for_forecast)
 if freq is None:
     freq = "h"
-
-is_chinese_stock = is_chinese_stock_data(df)
-
-if is_chinese_stock:
-    if freq == 'h' or freq == 'H':
-        future_timestamps = generate_chinese_trading_hours(last_timestamp, pred_len)
-    else:
-        future_timestamps = generate_chinese_trading_days(last_timestamp, pred_len)
-else:
-    future_timestamps = pd.date_range(
-        start=last_timestamp, periods=pred_len + 1, freq=freq
-    )[1:]
-
+    print(f"wu fa zi dong tui duan shi jian pin lv, yi mo ren shi yong '{freq}'.")
+future_timestamps = pd.date_range(
+    start=last_timestamp, periods=pred_len + 1, freq=freq
+)[1:]
 y_timestamp_for_forecast = pd.Series(future_timestamps)
 
 # 3. zhi xing zhen shi yu ce
@@ -208,75 +69,47 @@ forecast_df = predictor.predict(
     verbose=True,
 )
 
+# --- HE XIN XIU GAI: Jiang zheng que de shi jian chuo tian jia dao yu ce jie guo zhong ---
+# predictor fan hui de forecast_df zhi you shu zhi, mei you shi jian. Wo men shou dong ba ta men pin jie qi lai.
+# wei le que bao an quan pin jie, wo men hu lue liang zhe de yuan you suo yin
 forecast_df["timestamps"] = y_timestamp_for_forecast.values
-output_filename = "kronos_forecast_result.csv"
-forecast_df.to_csv(output_filename, index=False)
-def plot_prediction(historical_df, prediction_df, actual_df=None):
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
 
-    ax1.plot(
-        historical_df["timestamps"],
-        historical_df["close"],
-        label="li shi shu ju (Historical)",
-        color="blue",
-        linewidth=1.5,
-    )
+print("\nxiu zheng hou de yu ce jie guo (yi bao han zheng que de shi jian chuo):")
+print(forecast_df.head())
 
-    ax1.plot(
-        prediction_df["timestamps"],
-        prediction_df["close"],
-        label="yu ce shu ju (Prediction)",
-        color="red",
-        linewidth=1.5,
-        linestyle="--",
-    )
+# 5. 合并历史数据和预测数据一起导出
+# 为历史数据添加标识列
+x_df_for_forecast_export = x_df_for_forecast.copy()
+x_df_for_forecast_export['data_type'] = 'historical'
 
-    if actual_df is not None and not actual_df.empty:
-        ax1.plot(
-            actual_df["timestamps"],
-            actual_df["close"],
-            label="zhen shi shu ju (Actual)",
-            color="green",
-            linewidth=1.5,
-            alpha=0.8,
-        )
+# 为预测数据添加标识列
+forecast_df_export = forecast_df.copy()
+forecast_df_export['data_type'] = 'prediction'
 
-    ax1.set_ylabel("shou pan jia (Close Price)")
-    ax1.legend()
-    ax1.grid(True)
-    ax1.set_title("Kronos zhen shi yu ce jie guo (Forecasting)")
+# 修复时区问题：确保两个DataFrame的timestamps列都是相同的时区格式
+# 将所有时间戳转换为无时区格式（tz-naive）
+if hasattr(x_df_for_forecast_export['timestamps'].dtype, 'tz') and x_df_for_forecast_export['timestamps'].dtype.tz is not None:
+    x_df_for_forecast_export['timestamps'] = x_df_for_forecast_export['timestamps'].dt.tz_localize(None)
 
-    ax2.plot(
-        historical_df["timestamps"],
-        historical_df["volume"],
-        label="li shi cheng jiao liang",
-        color="blue",
-        alpha=0.7,
-    )
-    ax2.plot(
-        prediction_df["timestamps"],
-        prediction_df["volume"],
-        label="yu ce cheng jiao liang",
-        color="red",
-        alpha=0.7,
-        linestyle="--",
-    )
-    if actual_df is not None and not actual_df.empty:
-        ax2.plot(
-            actual_df["timestamps"],
-            actual_df["volume"],
-            label="zhen shi cheng jiao liang",
-            color="green",
-            alpha=0.6,
-        )
+if hasattr(forecast_df_export['timestamps'].dtype, 'tz') and forecast_df_export['timestamps'].dtype.tz is not None:
+    forecast_df_export['timestamps'] = forecast_df_export['timestamps'].dt.tz_localize(None)
 
-    ax2.set_ylabel("cheng jiao liang (Volume)")
-    ax2.set_xlabel("shi jian (Time)")
-    ax2.legend()
-    ax2.grid(True)
+# 合并历史数据和预测数据
+combined_df = pd.concat([x_df_for_forecast_export, forecast_df_export], ignore_index=True)
 
-    plt.tight_layout()
-    plt.show()
+# 按时间排序
+combined_df = combined_df.sort_values('timestamps').reset_index(drop=True)
 
+# 导出合并后的数据
+output_filename = "kronos_a_share.csv"
+combined_df.to_csv(output_filename, index=False)
 
-plot_prediction(x_df_for_forecast, forecast_df, actual_df=None)
+print(f"\n✅ 已成功导出合并数据到: {output_filename}")
+print(f"   - 历史数据: {len(x_df_for_forecast_export)} 条")
+print(f"   - 预测数据: {len(forecast_df_export)} 条")
+print(f"   - 总计: {len(combined_df)} 条")
+
+# 同时保留原来的单独预测数据导出
+# forecast_only_filename = "kronos_forecast_only_btc.csv"
+# forecast_df.to_csv(forecast_only_filename, index=False)
+# print(f"✅ 同时导出纯预测数据到: {forecast_only_filename}")

@@ -64,7 +64,7 @@ forecast_df = predictor.predict(
     x_timestamp=x_timestamp_for_forecast,
     y_timestamp=y_timestamp_for_forecast,
     pred_len=pred_len,
-    T=0.5,
+    T=1.0,
     top_p=0.9,
     sample_count=3,
     verbose=True,
@@ -78,8 +78,42 @@ forecast_df["timestamps"] = y_timestamp_for_forecast.values
 print("\nxiu zheng hou de yu ce jie guo (yi bao han zheng que de shi jian chuo):")
 print(forecast_df.head())
 
-output_filename = "kronos_forecast_btc.csv"
-forecast_df.to_csv(output_filename, index=False)
+# 5. 合并历史数据和预测数据一起导出
+# 为历史数据添加标识列
+x_df_for_forecast_export = x_df_for_forecast.copy()
+x_df_for_forecast_export['data_type'] = 'historical'
+
+# 为预测数据添加标识列
+forecast_df_export = forecast_df.copy()
+forecast_df_export['data_type'] = 'prediction'
+
+# 修复时区问题：确保两个DataFrame的timestamps列都是相同的时区格式
+# 将所有时间戳转换为无时区格式（tz-naive）
+if hasattr(x_df_for_forecast_export['timestamps'].dtype, 'tz') and x_df_for_forecast_export['timestamps'].dtype.tz is not None:
+    x_df_for_forecast_export['timestamps'] = x_df_for_forecast_export['timestamps'].dt.tz_localize(None)
+
+if hasattr(forecast_df_export['timestamps'].dtype, 'tz') and forecast_df_export['timestamps'].dtype.tz is not None:
+    forecast_df_export['timestamps'] = forecast_df_export['timestamps'].dt.tz_localize(None)
+
+# 合并历史数据和预测数据
+combined_df = pd.concat([x_df_for_forecast_export, forecast_df_export], ignore_index=True)
+
+# 按时间排序
+combined_df = combined_df.sort_values('timestamps').reset_index(drop=True)
+
+# 导出合并后的数据
+output_filename = "kronos_btc.csv"
+combined_df.to_csv(output_filename, index=False)
+
+print(f"\n✅ 已成功导出合并数据到: {output_filename}")
+print(f"   - 历史数据: {len(x_df_for_forecast_export)} 条")
+print(f"   - 预测数据: {len(forecast_df_export)} 条")
+print(f"   - 总计: {len(combined_df)} 条")
+
+# 同时保留原来的单独预测数据导出
+# forecast_only_filename = "kronos_forecast_only_btc.csv"
+# forecast_df.to_csv(forecast_only_filename, index=False)
+# print(f"✅ 同时导出纯预测数据到: {forecast_only_filename}")
 
 
 # 4. ding yi hui tu han shu (jin xing jian hua)
@@ -155,6 +189,4 @@ def plot_prediction(historical_df, prediction_df, actual_df=None):
     plt.tight_layout()
     plt.show()
 
-
-# 5. hui zhi jie guo
 # plot_prediction(x_df_for_forecast, forecast_df, actual_df=None)
