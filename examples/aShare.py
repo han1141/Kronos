@@ -39,7 +39,7 @@ def get_stock_hist_data(symbol, period="daily", start_date=None, end_date=None):
 
 def main():
     """主函数，执行数据获取、处理和保存"""
-    symbol = "300275"
+    symbol = "601138"
     period = "daily"  # 支持 "daily", "weekly", "monthly"
 
     end_dt = datetime.datetime.now()

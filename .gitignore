@@ -49,6 +49,7 @@ Desktop.ini
 *.h5
 *.csv
 *.hdf5
+*.json
 
 # Model files (large files)
 *.pth
