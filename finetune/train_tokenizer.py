@@ -15,8 +15,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import comet_ml
 
 # Ensure project root is in path
-sys.path.append("../")
-from config import Config
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from config import Config
+except ImportError:
+    from btc_config import BTCConfig as Config
 from dataset import QlibDataset
 from model.kronos import KronosTokenizer
 # Import shared utilities
@@ -220,7 +223,13 @@ def main(config: dict):
     Main function to orchestrate the DDP training process.
     """
     rank, world_size, local_rank = setup_ddp()
-    device = torch.device(f"cuda:{local_rank}")
+    
+    # Set device based on CUDA availability
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
+    
     set_seed(config['seed'], rank)
 
     save_dir = os.path.join(config['save_path'], config['tokenizer_save_folder_name'])
@@ -250,7 +259,12 @@ def main(config: dict):
     # Model Initialization
     model = KronosTokenizer.from_pretrained(config['pretrained_tokenizer_path'])
     model.to(device)
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    
+    # DDP initialization - different for CPU vs GPU
+    if torch.cuda.is_available():
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    else:
+        model = DDP(model, find_unused_parameters=False)
 
     if rank == 0:
         print(f"Model Size: {get_model_size(model.module)}")
@@ -273,9 +287,57 @@ def main(config: dict):
 
 
 if __name__ == '__main__':
-    # Usage: torchrun --standalone --nproc_per_node=NUM_GPUS train_tokenizer.py
+    # Usage: torchrun --standalone --nproc_per_node=NUM_GPUS train_tokenizer.py --config btc_config
+    # Or for testing: python train_tokenizer.py --config btc_config --test
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='config', help='Config module name (config or btc_config)')
+    parser.add_argument('--test', action='store_true', help='Test mode: only validate configuration and data loading')
+    args = parser.parse_args()
+    
+    # Import the specified config
+    if args.config == 'btc_config':
+        from btc_config import BTCConfig
+        config_instance = BTCConfig()
+    else:
+        from config import Config
+        config_instance = Config()
+    
+    if args.test:
+        # Test mode: validate configuration and data loading
+        print("=== 测试模式：验证配置和数据加载 ===")
+        print(f"配置类型: {args.config}")
+        print(f"数据路径: {config_instance.dataset_path}")
+        print(f"预训练tokenizer路径: {config_instance.pretrained_tokenizer_path}")
+        
+        # Check if processed data exists
+        import os
+        train_data_path = os.path.join(config_instance.dataset_path, "train_data.pkl")
+        val_data_path = os.path.join(config_instance.dataset_path, "val_data.pkl")
+        test_data_path = os.path.join(config_instance.dataset_path, "test_data.pkl")
+        
+        if os.path.exists(train_data_path) and os.path.exists(val_data_path) and os.path.exists(test_data_path):
+            print("✅ 处理后的数据文件存在")
+            
+            # Try to load a small sample
+            try:
+                import pickle
+                with open(train_data_path, 'rb') as f:
+                    train_data = pickle.load(f)
+                print(f"✅ 训练数据加载成功，样本数: {len(train_data)}")
+                print(f"✅ 样本特征维度: {train_data[0]['input_data'].shape}")
+            except Exception as e:
+                print(f"❌ 数据加载失败: {e}")
+        else:
+            print("❌ 处理后的数据文件不存在，请先运行 btc_data_preprocess.py")
+        
+        print("\n=== 配置验证完成 ===")
+        print("注意：实际训练需要:")
+        print("1. 有效的预训练模型路径")
+        print("2. GPU资源（推荐）")
+        print("3. 使用 torchrun 启动分布式训练")
+        exit(0)
+    
     if "WORLD_SIZE" not in os.environ:
         raise RuntimeError("This script must be launched with `torchrun`.")
-
-    config_instance = Config()
+    
     main(config_instance.__dict__)

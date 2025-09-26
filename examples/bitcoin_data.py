@@ -92,15 +92,18 @@ def main():
 
     df_final = df[
         ["open_time", "open", "high", "low", "close", "volume", "quote_asset_volume"]
-    ]
+    ].copy()
 
     # 2. 将 open_time 从毫秒时间戳转换为时间格式
-    df_final["open_time"] = pd.to_datetime(df_final["open_time"], unit="ms")
+    # 检查是否已经是 datetime 类型
+    if not pd.api.types.is_datetime64_any_dtype(df_final["open_time"]):
+        df_final.loc[:, "open_time"] = pd.to_numeric(df_final["open_time"], errors='coerce')
+        df_final.loc[:, "open_time"] = pd.to_datetime(df_final["open_time"], unit="ms")
 
     # 3. 将所有数值列转换为数值类型
     numeric_cols = ["open", "high", "low", "close", "volume", "quote_asset_volume"]
     for col in numeric_cols:
-        df_final[col] = pd.to_numeric(df_final[col])
+        df_final.loc[:, col] = pd.to_numeric(df_final[col])
 
     # 4. 重命名列以匹配预测脚本的格式
     df_final = df_final.rename(
