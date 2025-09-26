@@ -12,7 +12,7 @@ if torch.backends.mps.is_available():
 else:
     device = "cpu"
 
-csv_name1 = "./btc_usdt_1d_no_time.csv"
+csv_name1 = "./csv/btc_usdt_1d_no_time.csv"
 df = pd.read_csv(csv_name1)
 df["timestamps"] = pd.to_datetime(df["timestamps"])
 
@@ -69,7 +69,7 @@ if hasattr(forecast_df_export['timestamps'].dtype, 'tz') and forecast_df_export[
     forecast_df_export['timestamps'] = forecast_df_export['timestamps'].dt.tz_localize(None)
 combined_df = pd.concat([x_df_for_forecast_export, forecast_df_export], ignore_index=True)
 combined_df = combined_df.sort_values('timestamps').reset_index(drop=True)
-output_filename = "kronos_btc.csv"
+output_filename = "csv/kronos_btc.csv"
 combined_df.to_csv(output_filename, index=False)
 
 print(f"\n✅ 已成功导出合并数据到: {output_filename}")

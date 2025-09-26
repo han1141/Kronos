@@ -13,7 +13,7 @@ else:
     device = "cpu"
     print("⚠️ wei jian ce dao MPS, jiang shi yong CPU.")
 
-csv_name = "./history.csv"
+csv_name = "./csv/history.csv"
 df = pd.read_csv(csv_name)
 df["timestamps"] = pd.to_datetime(df["timestamps"])
 
@@ -85,7 +85,7 @@ combined_df = pd.concat([x_df_for_forecast_export, forecast_df_export], ignore_i
 
 combined_df = combined_df.sort_values('timestamps').reset_index(drop=True)
 
-output_filename = "kronos_a_share.csv"
+output_filename = "csv/kronos_a_share.csv"
 combined_df.to_csv(output_filename, index=False)
 
 print(f"\n✅ 已成功导出合并数据到: {output_filename}")

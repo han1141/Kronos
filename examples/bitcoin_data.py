@@ -108,7 +108,7 @@ def main():
     )
 
     # 6. 保存为CSV文件
-    output_filename = "btc_usdt_1d_no_time.csv"  # 更新文件名以反映内容
+    output_filename = "csv/btc_usdt_1d_no_time.csv"  # 更新文件名以反映内容
     df_final.to_csv(output_filename, index=False)
 
     print(f"\n数据处理完成！")

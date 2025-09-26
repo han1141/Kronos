@@ -94,7 +94,7 @@ def main():
             df_final[col] = pd.to_numeric(df_final[col], errors='coerce')
     if 'timestamps' in df_final.columns:
         df_final = df_final.sort_values('timestamps').reset_index(drop=True)
-    output_filename = "history.csv"
+    output_filename = "csv/history.csv"
     df_final.to_csv(output_filename, index=False)
 
     print(f"\n数据处理完成！")

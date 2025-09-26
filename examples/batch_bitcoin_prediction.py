@@ -14,7 +14,7 @@ model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
 predictor = KronosPredictor(model, tokenizer, device="mps:0", max_context=512)
 
 # 3. Prepare Data
-df = pd.read_csv("./btc_usdt_1d_no_time.csv")
+df = pd.read_csv("./csv/btc_usdt_1d_no_time.csv")
 df['timestamps'] = pd.to_datetime(df['timestamps'])
 
 lookback = 400
@@ -46,7 +46,7 @@ if 'timestamps' not in pred_df.columns:
 kline_df = df.loc[:lookback+pred_len-1]
 
 # 7. Export Results to JSON
-json_filename = "prediction_results.json"
+json_filename = "json/prediction_results.json"
 export_data = {
     "historical_data": kline_df.to_dict('records'),
     "prediction_data": pred_df.to_dict('records')
