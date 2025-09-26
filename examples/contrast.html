@@ -180,7 +180,7 @@
           const timestamp = new Date(row.timestamps).getTime();
           predictionKLineData.push([timestamp, open, close, low, high]);
           const isUp = close >= open;
-          predictionVolumeData.push([timestamp, volume, isUp ? '#ff9500' : '#00d4aa']);
+          predictionVolumeData.push([timestamp, volume, '#000000']);
         }
         
         console.log("数据处理完成，历史数据", kLineData.length, "条，预测数据", predictionKLineData.length, "条");
@@ -353,10 +353,10 @@
               type: "candlestick",
               data: processedData.predictionKLineData,
               itemStyle: {
-                color: '#ff9500',
-                color0: '#00d4aa',
-                borderColor: '#ff9500',
-                borderColor0: '#00d4aa',
+                color: '#000000',
+                color0: '#000000',
+                borderColor: '#000000',
+                borderColor0: '#000000',
               },
               xAxisIndex: 0,
               yAxisIndex: 0,

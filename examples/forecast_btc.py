@@ -2,19 +2,18 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import sys
 import torch
-# 预测a股
+# 预测btc
 sys.path.append("../")
 from model import Kronos, KronosTokenizer, KronosPredictor
 
 if torch.backends.mps.is_available():
     device = "mps"
-    print("✅ jian ce dao MPS (Apple Silicon GPU), jiang shi yong GPU.")
+    print("✅  MPS (Apple Silicon GPU).")
 else:
     device = "cpu"
-    print("⚠️ wei jian ce dao MPS, jiang shi yong CPU.")
 
-csv_name = "./history.csv"
-df = pd.read_csv(csv_name)
+csv_name1 = "./btc_usdt_1d_no_time.csv"
+df = pd.read_csv(csv_name1)
 df["timestamps"] = pd.to_datetime(df["timestamps"])
 
 tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
@@ -37,12 +36,6 @@ if len(df) < lookback:
 
 x_df_for_forecast = df.iloc[-lookback:].copy()
 x_timestamp_for_forecast = x_df_for_forecast["timestamps"]
-
-print(f"shi yong zui hou {lookback} tiao shu ju jin xing zhen shi yu ce...")
-print(
-    f"li shi shu ju de zui hou yi ge shi jian dian shi: {x_timestamp_for_forecast.iloc[-1]}"
-)
-
 last_timestamp = x_timestamp_for_forecast.iloc[-1]
 freq = pd.infer_freq(x_timestamp_for_forecast)
 if freq is None:
@@ -58,34 +51,25 @@ forecast_df = predictor.predict(
     x_timestamp=x_timestamp_for_forecast,
     y_timestamp=y_timestamp_for_forecast,
     pred_len=pred_len,
-    T=1.0,
-    top_p=0.9,
+    T=0.7,
+    top_p=1.0,
     sample_count=3,
     verbose=True,
 )
-
 forecast_df["timestamps"] = y_timestamp_for_forecast.values
-
-print("\nxiu zheng hou de yu ce jie guo (yi bao han zheng que de shi jian chuo):")
-print(forecast_df.head())
 
 x_df_for_forecast_export = x_df_for_forecast.copy()
 x_df_for_forecast_export['data_type'] = 'historical'
-
 forecast_df_export = forecast_df.copy()
 forecast_df_export['data_type'] = 'prediction'
-
 if hasattr(x_df_for_forecast_export['timestamps'].dtype, 'tz') and x_df_for_forecast_export['timestamps'].dtype.tz is not None:
     x_df_for_forecast_export['timestamps'] = x_df_for_forecast_export['timestamps'].dt.tz_localize(None)
 
 if hasattr(forecast_df_export['timestamps'].dtype, 'tz') and forecast_df_export['timestamps'].dtype.tz is not None:
     forecast_df_export['timestamps'] = forecast_df_export['timestamps'].dt.tz_localize(None)
-
 combined_df = pd.concat([x_df_for_forecast_export, forecast_df_export], ignore_index=True)
-
 combined_df = combined_df.sort_values('timestamps').reset_index(drop=True)
-
-output_filename = "kronos_a_share.csv"
+output_filename = "kronos_btc.csv"
 combined_df.to_csv(output_filename, index=False)
 
 print(f"\n✅ 已成功导出合并数据到: {output_filename}")
