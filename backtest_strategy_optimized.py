@@ -170,10 +170,10 @@ class BullBearRangeStrategy(Strategy):
 if __name__ == "__main__":
     SYMBOL = "BTCUSDT"
     TIME_INTERVAL = "4h"
-    START_DATE = "2025-01-01"
+    START_DATE = "2022-01-01"
     END_DATE = "2025-09-27"
     INITIAL_CASH = 500_000
-    COMMISSION_FEE = 0.001
+    COMMISSION_FEE = 0.0005
 
     print("📡 获取历史数据...")
     data = get_full_historical_data(

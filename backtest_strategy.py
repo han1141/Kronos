@@ -110,7 +110,7 @@ if __name__ == '__main__':
     START_DATE = "2023-01-01"
     END_DATE = "2025-09-27"
     INITIAL_CASH = 100_000
-    COMMISSION_FEE = 0.001
+    COMMISSION_FEE = 0.0005
 
     data = get_full_historical_data(symbol=SYMBOL, interval=TIME_INTERVAL, start_str=START_DATE, end_str=END_DATE)
 
