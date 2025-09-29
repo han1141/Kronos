@@ -36,7 +36,7 @@ if os.path.exists(finetuned_predictor_path):
 else:
     print("⚠️  未找到微调后的predictor模型，使用微调后的tokenizer + 预训练的predictor")
     tokenizer = KronosTokenizer.from_pretrained(finetuned_tokenizer_path)
-    model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
+    model = Kronos.from_pretrained("NeoQuasar/Kronos-base")
     print("✅ 成功加载微调后的tokenizer和预训练的predictor")
 
 predictor = KronosPredictor(
