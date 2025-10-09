@@ -1,21 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-🚀 终极优化版加密货币趋势交易系统 (V40.1 - “最终修正”版)
+🚀 终极优化版加密货币趋势交易系统 (V33.1 - “系统稳定器增强”版，修复版)
 
-这是我们策略开发迭代之旅的毕业作品。它象征着一次“螺旋式上升”的顿悟：我们保留了
-后期版本中所有被验证为成功的专业模块，但将它们嫁接到一个更纯粹、更强大、更符合
-市场本质的“纯趋势跟踪”内核之上。
-
- V40.1 更新日志:
-- 【修正】: 修复了因重构代码时遗留的“幽灵”变量而导致的TypeError。彻底移除了与
-            动态ADX阈值相关的占位符和适配逻辑，确保策略内核的纯粹性和稳定性。
-
- V40.0 最终版特性:
-- 【心脏】: 回归纯粹的趋势跟踪内核 (V19.1)
-- 【利刃】: 动态参数引擎 (V33.0)
-- 【护盾】: 动态风险平价 (V33.0)
-- 【堡垒】: 多层动态风控 (V31.0)
-- 【智慧】: 资产个性化配置 & 组合管理 (V34.0)
+基于V33.1，修复KeyError和RuntimeWarning：
+- 包装Hurst日志访问以防数组键错误。
+- 优化compute_hurst：使用std_diff（无sqrt），过滤std>0，避免log(0)警告；返回poly[0]作为H（标准方法）。
+- 调整Hurst标准化：clip((hurst-0.3)/0.7, 0,1)以覆盖0-1范围，>0.5偏趋势。
+- 确保无HTML输出（show_plots=False）。
 """
 
 # --- 1. 导入库与配置 ---
@@ -75,14 +66,15 @@ import ta
 
 # --- 全局配置 ---
 CONFIG = {
-    "symbols_to_test": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],  # 最终决策: 专注于高期望资产
+    "symbols_to_test": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
     "interval": "4h",
-    "start_date": "2020-01-01",
+    "start_date": "2024-01-01",
     "end_date": "2025-10-08",
     "initial_cash": 500_000,
-    "commission": 0.0005,
+    "commission": 0.0002,
+    "spread": 0.0005,  # 滑点模拟 (0.05%)
     "run_monte_carlo": True,
-    "show_plots": False,
+    "show_plots": False,  # 确保不打开HTML界面
 }
 
 # --- 策略核心参数 (全局默认值) ---
@@ -95,26 +87,60 @@ STRATEGY_PARAMS = {
     "dd_initial_pct": 0.35,
     "dd_final_pct": 0.25,
     "dd_decay_bars": 4320,
-    # 纯趋势跟随策略 (TF)
-    "tf_donchian_period": 20,
+    # 市场状态合成评分
+    "regime_adx_period": 14,
+    "regime_atr_period": 14,
+    "regime_atr_slope_period": 5,
+    "regime_rsi_period": 14,
+    "regime_rsi_vol_period": 14,
+    "regime_norm_period": 252,
+    "regime_hurst_period": 100,  # Hurst指数滚动窗口
+    "regime_score_weight_adx": 0.6,
+    "regime_score_weight_atr": 0.3,
+    "regime_score_weight_rsi": 0.05,  # 降低以容纳Hurst
+    "regime_score_weight_hurst": 0.05,  # Hurst权重
+    "regime_score_threshold": 0.45,
+    # 子策略1: 趋势跟随 (TF)
+    "tf_donchian_period": 30,
     "tf_ema_fast_period": 20,
-    "tf_ema_slow_period": 50,
+    "tf_ema_slow_period": 75,
     "tf_adx_confirm_period": 14,
-    "tf_adx_confirm_threshold": 25,
+    "tf_adx_confirm_threshold": 18,
+    "tf_chandelier_period": 22,
     "tf_chandelier_atr_multiplier": 3.0,
     "tf_atr_period": 14,
+    # 子策略2: 均值回归 (MR)
+    "mr_bb_period": 20,
+    "mr_bb_std": 2.0,
+    "mr_rsi_period": 14,
+    "mr_rsi_oversold": 30,
+    "mr_rsi_overbought": 70,
+    "mr_stop_loss_atr_multiplier": 1.5,
+    "mr_risk_multiplier": 0.5,
+    # 信号评分
+    "mtf_period": 50,
+    "score_mtf_bonus": 0.5,
+    "ai_filter_rsi_period": 14,
+    "ai_filter_fast_ma": 3,
+    "ai_filter_slow_ma": 10,
+    "ai_filter_confidence_threshold": 0.2,
+    "score_ai_bonus": 0.5,
+    "score_nonlinear_factor": 2.0,
+    # 波动率调整
+    "volatility_norm_period": 100,
 }
 
 # --- 资产个性化配置中心 ---
 ASSET_SPECIFIC_OVERRIDES = {
-    # "BTCUSDT": { "tf_adx_confirm_threshold": 22 },
+    "BTCUSDT": {"regime_score_threshold": 0.45},
+    "SOLUSDT": {"regime_score_threshold": 0.45},
+    "ETHUSDT": {},
 }
 
 
 def fetch_binance_klines(
     symbol: str, interval: str, start_str: str, end_str: str = None, limit: int = 1000
 ) -> pd.DataFrame:
-    # ... 此函数与之前版本完全相同 ...
     url = "https://api.binance.com/api/v3/klines"
     columns = [
         "timestamp",
@@ -177,19 +203,48 @@ def fetch_binance_klines(
     return df
 
 
+# 修复: Hurst指数计算函数（避免log(0)，使用std_diff作为tau，poly[0]=H）
+def compute_hurst(ts, max_lag=100):
+    """
+    计算Hurst指数，用于检测均值回归（H<0.5）或趋势（H>0.5）。
+    ts: log价格序列 (np.array)
+    """
+    if len(ts) < 10:
+        return 0.5
+    lags = range(2, min(max_lag, len(ts) // 2 + 1))
+    tau = []
+    valid_lags = []
+    for lag in lags:
+        diff = ts[lag:] - ts[:-lag]
+        std_diff = np.std(diff)
+        if std_diff > 0:  # 过滤零std，避免log(0)
+            tau.append(std_diff)
+            valid_lags.append(lag)
+    if len(tau) < 2:
+        return 0.5  # 默认随机游走
+    try:
+        poly = np.polyfit(np.log(valid_lags), np.log(tau), 1)
+        return max(0.0, min(1.0, poly[0]))  # 夹紧0-1
+    except:
+        return 0.5
+
+
 class UltimateStrategy(Strategy):
-    # 为动态和个性化参数声明占位符
+    # 为动态参数声明占位符
     tf_donchian_period_dynamic = None
     tf_chandelier_atr_multiplier_dynamic = None
+    mr_bb_std_dynamic = None
     max_risk_pct_override = None
-    # <-- 修正: 彻底移除 tf_adx_confirm_threshold_override 占位符
+
+    # 为个性化参数声明占位符
+    regime_score_threshold_override = None
 
     for key, value in STRATEGY_PARAMS.items():
         exec(f"{key} = {value}")
     vol_weight = 1.0
 
     def init(self):
-        # 参数适配
+        # 参数适配 (动态参数优先，其次是个性化参数，最后是全局默认)
         self.tf_donchian_period = int(
             getattr(self, "tf_donchian_period_dynamic", self.tf_donchian_period)
         )
@@ -198,16 +253,21 @@ class UltimateStrategy(Strategy):
             "tf_chandelier_atr_multiplier_dynamic",
             self.tf_chandelier_atr_multiplier,
         )
+        self.mr_bb_std = getattr(self, "mr_bb_std_dynamic", self.mr_bb_std)
+        self.regime_score_threshold = getattr(
+            self, "regime_score_threshold_override", self.regime_score_threshold
+        )
         self.max_risk_pct = getattr(self, "max_risk_pct_override", self.max_risk_pct)
-        # <-- 修正: 彻底移除对 tf_adx_confirm_threshold_override 的适配
 
-        # --- 初始化指标 ---
+        # --- 现有初始化代码 ---
         close = pd.Series(self.data.Close, index=self.data.index)
         high = pd.Series(self.data.High, index=self.data.index)
         low = pd.Series(self.data.Low, index=self.data.index)
         self.recent_trade_returns = deque(maxlen=self.kelly_trade_history)
         self.reset_trade_state()
-
+        self.market_regime = self.I(lambda: self.data.market_regime)
+        self.mtf_signal = self.I(lambda: self.data.mtf_signal)
+        self.ai_filter_signal = self.I(lambda: self.data.ai_filter_signal)
         self.tf_atr = self.I(
             lambda: ta.volatility.AverageTrueRange(
                 high, low, close, self.tf_atr_period
@@ -234,17 +294,40 @@ class UltimateStrategy(Strategy):
                 high, low, close, self.tf_adx_confirm_period
             ).adx()
         )
-
+        bb_indicator = ta.volatility.BollingerBands(
+            close, self.mr_bb_period, self.mr_bb_std
+        )
+        self.mr_bb_upper = self.I(lambda: bb_indicator.bollinger_hband())
+        self.mr_bb_lower = self.I(lambda: bb_indicator.bollinger_lband())
+        self.mr_bb_mid = self.I(lambda: bb_indicator.bollinger_mavg())
+        self.mr_rsi = self.I(
+            lambda: ta.momentum.RSIIndicator(close, self.mr_rsi_period).rsi()
+        )
+        self.long_term_atr = self.I(
+            lambda: ta.volatility.AverageTrueRange(
+                high, low, close, self.volatility_norm_period
+            ).average_true_range()
+        )
         self.equity_peak = self.equity
         self.global_stop_triggered = False
 
+        # 修复: 包装Hurst日志访问，防止KeyError
+        try:
+            if len(self.data.hurst) > 0:
+                logger.info(f"当前Hurst指数: {self.data.hurst[-1]:.2f}")
+            else:
+                logger.info("Hurst未计算（序列为空）")
+        except Exception as e:
+            logger.info(f"Hurst未计算: {e}")
+
     def reset_trade_state(self):
+        self.active_sub_strategy = None
         self.chandelier_exit_level = 0.0
         self.highest_high_in_trade = 0
         self.lowest_low_in_trade = float("inf")
+        self.mr_stop_loss = 0.0
 
     def next(self):
-        # 智能熔断
         current_bar = len(self.data.Close) - 1
         if current_bar > self.dd_grace_period_bars:
             decay_progress = min(
@@ -266,39 +349,66 @@ class UltimateStrategy(Strategy):
                 return
         if self.global_stop_triggered:
             return
-
         price = self.data.Close[-1]
-
-        # 核心交易逻辑
         if not self.position:
-            self.run_trend_entry(price)
+            if len(self.market_regime) > 0 and self.market_regime[-1] == 1:
+                self.run_trend_following_entry(price)
+            else:
+                self.run_mean_reversion_entry(price)
         else:
-            self.manage_trend_exit(price)
+            self.manage_open_position(price)
 
-    def run_trend_entry(self, price):
+    def manage_open_position(self, price):
+        if self.active_sub_strategy == "TF":
+            self.manage_trend_following_exit(price)
+        elif self.active_sub_strategy == "MR":
+            self.manage_mean_reversion_exit(price)
+
+    def run_trend_following_entry(self, price):
         is_trend_strong = self.tf_adx[-1] > self.tf_adx_confirm_threshold
         is_breakout_up = self.data.High[-1] > self.tf_donchian_h[-1]
         is_breakout_down = self.data.Low[-1] < self.tf_donchian_l[-1]
         is_momentum_long = self.tf_ema_fast[-1] > self.tf_ema_slow[-1]
         is_momentum_short = self.tf_ema_fast[-1] < self.tf_ema_slow[-1]
-
+        base_signal = 0
         if is_trend_strong and is_breakout_up and is_momentum_long:
-            self.open_position(price, is_long=True)
+            base_signal = 1
         elif is_trend_strong and is_breakout_down and is_momentum_short:
-            self.open_position(price, is_long=False)
+            base_signal = -1
+        if base_signal == 0:
+            return
+        score = 1.0
+        if (base_signal == 1 and self.mtf_signal[-1] == 1) or (
+            base_signal == -1 and self.mtf_signal[-1] == -1
+        ):
+            score += self.score_mtf_bonus
+        if (
+            base_signal == 1
+            and self.ai_filter_signal[-1] > self.ai_filter_confidence_threshold
+        ) or (
+            base_signal == -1
+            and self.ai_filter_signal[-1] < -self.ai_filter_confidence_threshold
+        ):
+            score += self.score_ai_bonus
+        nonlinear_score = score**self.score_nonlinear_factor
+        self.open_tf_position(price, is_long=(base_signal == 1), score=nonlinear_score)
 
-    def open_position(self, price, is_long):
+    def open_tf_position(self, price, is_long, score):
         initial_atr = self.tf_atr[-1]
         risk_per_share = initial_atr * self.tf_chandelier_atr_multiplier
         if risk_per_share <= 0:
             return
-
         target_risk_pct = self._calculate_dynamic_risk()
-        size = self._calculate_position_size(price, risk_per_share, target_risk_pct)
+        if len(self.long_term_atr) > 1 and self.long_term_atr[-1] > 0:
+            vol_ratio = initial_atr / self.long_term_atr[-1]
+            volatility_dampener = 1 / max(vol_ratio, 0.5)
+            target_risk_pct *= volatility_dampener
+        final_risk_pct = target_risk_pct * score
+        size = self._calculate_position_size(price, risk_per_share, final_risk_pct)
         if not (0 < size < 0.98):
             return
-
         self.reset_trade_state()
+        self.active_sub_strategy = "TF"
         if is_long:
             self.buy(size=size)
             self.highest_high_in_trade = self.data.High[-1]
@@ -307,7 +417,7 @@ class UltimateStrategy(Strategy):
                 - initial_atr * self.tf_chandelier_atr_multiplier
             )
             logger.debug(
-                f"📈 开多仓: {size:.4f} @ {price:.2f}, SL: {self.chandelier_exit_level:.2f}"
+                f"[TF] 📈 开多仓 (评分: {score:.2f}): {size:.4f} @ {price:.2f}, SL: {self.chandelier_exit_level:.2f}"
             )
         else:
             self.sell(size=size)
@@ -317,10 +427,10 @@ class UltimateStrategy(Strategy):
                 + initial_atr * self.tf_chandelier_atr_multiplier
             )
             logger.debug(
-                f"📉 开空仓: {size:.4f} @ {price:.2f}, SL: {self.chandelier_exit_level:.2f}"
+                f"[TF] 📉 开空仓 (评分: {score:.2f}): {size:.4f} @ {price:.2f}, SL: {self.chandelier_exit_level:.2f}"
             )
 
-    def manage_trend_exit(self, price):
+    def manage_trend_following_exit(self, price):
         current_atr = self.tf_atr[-1]
         if self.position.is_long:
             self.highest_high_in_trade = max(
@@ -331,7 +441,7 @@ class UltimateStrategy(Strategy):
                 - current_atr * self.tf_chandelier_atr_multiplier
             )
             if price < self.chandelier_exit_level:
-                self.close_position("钱德勒止盈")
+                self.close_position("TF(钱德勒)")
         elif self.position.is_short:
             self.lowest_low_in_trade = min(self.lowest_low_in_trade, self.data.Low[-1])
             self.chandelier_exit_level = (
@@ -339,7 +449,63 @@ class UltimateStrategy(Strategy):
                 + current_atr * self.tf_chandelier_atr_multiplier
             )
             if price > self.chandelier_exit_level:
-                self.close_position("钱德勒止盈")
+                self.close_position("TF(钱德勒)")
+
+    def run_mean_reversion_entry(self, price):
+        is_oversold = (
+            crossover(self.data.Close, self.mr_bb_lower)
+            and self.mr_rsi[-1] < self.mr_rsi_oversold
+        )
+        is_overbought = (
+            crossover(self.mr_bb_upper, self.data.Close)
+            and self.mr_rsi[-1] > self.mr_rsi_overbought
+        )
+        if is_oversold:
+            self.open_mr_position(price, is_long=True)
+        elif is_overbought:
+            self.open_mr_position(price, is_long=False)
+
+    def open_mr_position(self, price, is_long):
+        initial_atr = self.tf_atr[-1]
+        risk_per_share = initial_atr * self.mr_stop_loss_atr_multiplier
+        if risk_per_share <= 0:
+            return
+        target_risk_pct = self._calculate_dynamic_risk() * self.mr_risk_multiplier
+        size = self._calculate_position_size(price, risk_per_share, target_risk_pct)
+        if not (0 < size < 0.98):
+            return
+        self.reset_trade_state()
+        self.active_sub_strategy = "MR"
+        if is_long:
+            self.buy(size=size)
+            self.mr_stop_loss = price - risk_per_share
+            logger.debug(
+                f"[MR] 📈 开多仓: {size:.4f} @ {price:.2f}, SL: {self.mr_stop_loss:.2f}"
+            )
+        else:
+            self.sell(size=size)
+            self.mr_stop_loss = price + risk_per_share
+            logger.debug(
+                f"[MR] 📉 开空仓: {size:.4f} @ {price:.2f}, SL: {self.mr_stop_loss:.2f}"
+            )
+
+    def manage_mean_reversion_exit(self, price):
+        should_close = False
+        reason = ""
+        if self.position.is_long and price >= self.mr_bb_mid[-1]:
+            should_close = True
+            reason = "回归中轨"
+        elif self.position.is_short and price <= self.mr_bb_mid[-1]:
+            should_close = True
+            reason = "回归中轨"
+        if self.position.is_long and price <= self.mr_stop_loss:
+            should_close = True
+            reason = "ATR止损"
+        elif self.position.is_short and price >= self.mr_stop_loss:
+            should_close = True
+            reason = "ATR止损"
+        if should_close:
+            self.close_position(f"MR({reason})")
 
     def close_position(self, reason: str):
         price = self.data.Close[-1]
@@ -378,7 +544,6 @@ class UltimateStrategy(Strategy):
 
 
 def run_monte_carlo(trades_df, initial_cash, symbol: str, n_simulations=1000):
-    # ... 此函数与之前版本完全相同 ...
     if trades_df.empty:
         logger.warning("没有交易数据，无法进行蒙特卡洛模拟。")
         return
@@ -417,17 +582,21 @@ def run_monte_carlo(trades_df, initial_cash, symbol: str, n_simulations=1000):
 
 
 def generate_dynamic_params(volatility: float, baseline_vol: float) -> dict:
-    # ... 此函数与V33.0版本完全相同 ...
+    """根据年化波动率和动态基线，为单个品种生成一套动态参数。"""
     volatility_factor = volatility / baseline_vol
-    volatility_factor = np.clip(volatility_factor, 0.7, 1.5)
+    volatility_factor = np.clip(volatility_factor, 0.8, 1.2)  # 收紧范围，防止异变
     p = STRATEGY_PARAMS
+
     dynamic_chandelier = p["tf_chandelier_atr_multiplier"] * volatility_factor
     dynamic_donchian = p["tf_donchian_period"] * volatility_factor
+    dynamic_bb_std = p["mr_bb_std"] * volatility_factor
     dynamic_max_risk_pct = p["max_risk_pct"] / volatility_factor
     dynamic_max_risk_pct = np.clip(dynamic_max_risk_pct, 0.02, 0.05)
+
     params = {
         "tf_chandelier_atr_multiplier_dynamic": np.round(dynamic_chandelier, 2),
         "tf_donchian_period_dynamic": int(np.round(dynamic_donchian)),
+        "mr_bb_std_dynamic": np.round(dynamic_bb_std, 2),
         "max_risk_pct_override": np.round(dynamic_max_risk_pct, 4),
     }
     return params
@@ -436,7 +605,7 @@ def generate_dynamic_params(volatility: float, baseline_vol: float) -> dict:
 if __name__ == "__main__":
     all_stats = {}
     total_final_equity = 0
-    logger.info(f"🚀 (V40.1: “最终修正”版) 开始运行...")
+    logger.info(f"🚀 (V33.1: “系统稳定器增强”版，修复) 开始运行...")
     logger.info(f"详细交易日志将保存在文件: {log_filename}")
 
     all_data = {}
@@ -476,6 +645,8 @@ if __name__ == "__main__":
             continue
 
         symbol_volatility = volatilities.get(symbol, 0.7)
+
+        # 计算稳健的动态基线
         daily_vol_series = all_data[symbol]["Close"].resample(
             "D"
         ).last().pct_change().rolling(252).std() * np.sqrt(365)
@@ -502,11 +673,112 @@ if __name__ == "__main__":
                 f"  - {key.replace('_dynamic', '').replace('_override', '')}: {value}"
             )
 
+        final_regime_threshold = final_params.get(
+            "regime_score_threshold_override", STRATEGY_PARAMS["regime_score_threshold"]
+        )
+
+        logger.info("开始进行数据预处理 (多因子信号)...")
+        data_1d = fetch_binance_klines(
+            symbol, "1d", CONFIG["start_date"], CONFIG["end_date"]
+        )
+        if not data_1d.empty:
+            sma_1d = ta.trend.SMAIndicator(
+                data_1d["Close"], window=STRATEGY_PARAMS["mtf_period"]
+            ).sma_indicator()
+            data_1d["mtf_signal"] = np.where(data_1d["Close"] > sma_1d, 1, -1)
+            data_4h["mtf_signal"] = (
+                data_1d["mtf_signal"].reindex(data_4h.index, method="ffill").fillna(0)
+            )
+        else:
+            logger.warning("未能获取日线数据，MTF过滤器将停用。")
+            data_4h["mtf_signal"] = 0
+
+        logger.info("  - 计算市场状态合成评分...")
+        adx = ta.trend.ADXIndicator(
+            data_4h["High"],
+            data_4h["Low"],
+            data_4h["Close"],
+            STRATEGY_PARAMS["regime_adx_period"],
+        ).adx()
+        adx_norm = (adx - adx.rolling(STRATEGY_PARAMS["regime_norm_period"]).min()) / (
+            adx.rolling(STRATEGY_PARAMS["regime_norm_period"]).max()
+            - adx.rolling(STRATEGY_PARAMS["regime_norm_period"]).min()
+        )
+        adx_norm = adx_norm.fillna(0.5)
+        atr = ta.volatility.AverageTrueRange(
+            data_4h["High"],
+            data_4h["Low"],
+            data_4h["Close"],
+            STRATEGY_PARAMS["regime_atr_period"],
+        ).average_true_range()
+        atr_slope = (
+            atr - atr.shift(STRATEGY_PARAMS["regime_atr_slope_period"])
+        ) / atr.shift(STRATEGY_PARAMS["regime_atr_slope_period"])
+        atr_slope_norm = (
+            atr_slope - atr_slope.rolling(STRATEGY_PARAMS["regime_norm_period"]).min()
+        ) / (
+            atr_slope.rolling(STRATEGY_PARAMS["regime_norm_period"]).max()
+            - atr_slope.rolling(STRATEGY_PARAMS["regime_norm_period"]).min()
+        )
+        atr_slope_norm = atr_slope_norm.fillna(0.5)
+        rsi = ta.momentum.RSIIndicator(
+            data_4h["Close"], window=STRATEGY_PARAMS["regime_rsi_period"]
+        ).rsi()
+        rsi_vol = rsi.rolling(STRATEGY_PARAMS["regime_rsi_vol_period"]).std()
+        rsi_vol_norm = (
+            rsi_vol - rsi_vol.rolling(STRATEGY_PARAMS["regime_norm_period"]).min()
+        ) / (
+            rsi_vol.rolling(STRATEGY_PARAMS["regime_norm_period"]).max()
+            - rsi_vol.rolling(STRATEGY_PARAMS["regime_norm_period"]).min()
+        )
+        rsi_vol_norm = 1 - rsi_vol_norm.fillna(0.5)
+
+        # 修复: 计算滚动Hurst指数（使用log价格，避免警告）
+        hurst_series = pd.Series(index=data_4h.index, dtype=float)
+        period = STRATEGY_PARAMS["regime_hurst_period"]
+        for i in range(period, len(data_4h)):
+            price_slice = data_4h["Close"].iloc[i - period : i]
+            if (price_slice <= 0).any():
+                ts = np.log(price_slice + 1e-8)  # 避免log(0)
+            else:
+                ts = np.log(price_slice)
+            hurst_series.iloc[i] = compute_hurst(ts.values)
+        hurst_series = hurst_series.fillna(0.5)
+        data_4h["hurst"] = hurst_series
+        # 调整标准化：H>0.5 favoring趋势 (TF=1)，范围0-1
+        hurst_norm = np.clip((hurst_series - 0.3) / 0.7, 0, 1)
+
+        # 更新regime_score: 添加Hurst项
+        regime_score = (
+            adx_norm * STRATEGY_PARAMS["regime_score_weight_adx"]
+            + atr_slope_norm * STRATEGY_PARAMS["regime_score_weight_atr"]
+            + rsi_vol_norm * STRATEGY_PARAMS["regime_score_weight_rsi"]
+            + hurst_norm * STRATEGY_PARAMS["regime_score_weight_hurst"]
+        )
+        data_4h["market_regime"] = np.where(
+            regime_score > final_regime_threshold, 1, -1
+        )
+
+        logger.info("  - 模拟AI信号过滤器...")
+        rsi_filter = ta.momentum.RSIIndicator(
+            data_4h["Close"], window=STRATEGY_PARAMS["ai_filter_rsi_period"]
+        ).rsi()
+        rsi_fast = rsi_filter.rolling(
+            window=STRATEGY_PARAMS["ai_filter_fast_ma"]
+        ).mean()
+        rsi_slow = rsi_filter.rolling(
+            window=STRATEGY_PARAMS["ai_filter_slow_ma"]
+        ).mean()
+        data_4h["ai_filter_signal"] = (rsi_fast - rsi_slow) / 50
+        data_4h["ai_filter_signal"] = data_4h["ai_filter_signal"].clip(-1, 1).fillna(0)
+        logger.info("数据预处理完成。")
+
         bt = Backtest(
             data_4h,
             UltimateStrategy,
             cash=CONFIG["initial_cash"],
             commission=CONFIG["commission"],
+            spread=CONFIG["spread"],  # 滑点
             finalize_trades=True,
         )
         stats = bt.run(vol_weight=vol_weights.get(symbol, 1.0), **final_params)
@@ -527,6 +799,18 @@ if __name__ == "__main__":
             print(f"凯利准则: {kelly:.4f}")
         if calmar is not None and not np.isnan(calmar):
             print(f"卡玛比率 (Cal-Ratio): {calmar:.3f}")
+        if CONFIG["show_plots"]:
+            try:
+                bt.plot(
+                    resample="D",
+                    supertitle=f"{symbol} Equity Curve",
+                    open_browser=False,
+                )
+            except TypeError:
+                logger.warning(
+                    "您的 backtesting.py 库版本较旧，不支持 supertitle/open_browser 参数。"
+                )
+                bt.plot()
         if CONFIG["run_monte_carlo"] and not stats["_trades"].empty:
             run_monte_carlo(stats["_trades"], CONFIG["initial_cash"], symbol)
 
