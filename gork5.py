@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-🚀 终极优化版加密货币趋势交易系统 (V40.9-Flow-Optimize)
+🚀 终极优化版加密货币趋势交易系统 (V40.12-Cache-Fix)
 
 版本更新：
-- (V40.9-Flow-Optimize) 优化了主程序逻辑。当 `train_new_model` 设置为 `False` 时，程序现在仅加载和处理
-                       回测所需时间段的数据，显著提高了仅回测模式下的启动速度和效率。
-- (V40.8-News-Cache) 实现了强大的新闻缓存功能，避免了API频率限制和网络错误。
-- (V40.7-API-Date-Fix) 修复了 GNews 初始化 TypeError 并实现了训练/回测数据范围的自动分离。
-- (V40.6-Real-News-Enabled) 默认启用真实新闻获取逻辑。
-- (V40.5-Rolling-Fix) 修复了 `AttributeError`。
+- (V40.12-Cache-Fix) 优化了新闻缓存逻辑：当检测到缓存文件为空（包含0条新闻）时，系统将自动尝试
+                       重新从API获取，实现了对过去API错误的自我修复，确保数据质量。
+- (V40.11-Style-Fix) 修复了 Pylance linter 因单行多语句导致的报错，提升了代码可读性。
+- (V40.10-Risk-Stab-Fix) 增强新闻获取稳定性并为趋势跟踪策略加入了硬性初始止损。
+- (V40.9-Flow-Optimize) 优化了主程序逻辑，提高了仅回测模式下的启动速度。
+- (V40.8-News-Cache) 实现了新闻缓存功能。
 """
 
 # --- 1. 导入库与配置 ---
@@ -32,7 +32,6 @@ try:
     NEWS_LIBS_INSTALLED = True
 except ImportError:
     NEWS_LIBS_INSTALLED = False
-
 try:
     import lightgbm as lgb
     from sklearn.model_selection import train_test_split
@@ -41,7 +40,6 @@ try:
     ML_LIBS_INSTALLED = True
 except ImportError:
     ML_LIBS_INSTALLED = False
-
 try:
     import tensorflow as tf
 
@@ -105,12 +103,12 @@ CONFIG = {
     "spread": 0.0005,
     "run_monte_carlo": True,
     "show_plots": False,
-    "train_new_model": False,  # <-- 设置为 False 将跳过训练数据的加载和处理
+    "train_new_model": False,
     "run_learning_phase": False,
     "run_adaptive_backtest": True,
 }
 NEWS_CONFIG = {
-    "gnews_api_key": "439183c4b004dd34c1f940f0dabb44f8",
+    "gnews_api_key": "YOUR_GNEWS_API_KEY",
     "search_keywords": {
         "BTCUSDT": "Bitcoin OR BTC crypto",
         "ETHUSDT": "Ethereum OR ETH crypto",
@@ -149,6 +147,7 @@ STRATEGY_PARAMS = {
     "tf_chandelier_period": 22,
     "tf_chandelier_atr_multiplier": 3.0,
     "tf_atr_period": 14,
+    "tf_stop_loss_atr_multiplier": 2.5,
     "mr_bb_period": 20,
     "mr_bb_std": 2.0,
     "mr_rsi_period": 14,
@@ -216,11 +215,9 @@ class StrategyMemory:
         self.memory_df = self._load_memory()
 
     def _load_memory(self):
-        return (
-            pd.read_csv(self.filepath, parse_dates=["timestamp"])
-            if os.path.exists(self.filepath)
-            else pd.DataFrame(columns=self.columns)
-        )
+        if os.path.exists(self.filepath):
+            return pd.read_csv(self.filepath, parse_dates=["timestamp"])
+        return pd.DataFrame(columns=self.columns)
 
     def record_optimization(self, timestamp, symbol, regime, best_params, performance):
         new_records = [
@@ -279,7 +276,8 @@ def fetch_binance_klines(
         "taker_buy_quote_volume",
         "ignore",
     ]
-    start_ts, end_ts = int(pd.to_datetime(start_str).timestamp() * 1000), (
+    start_ts = int(pd.to_datetime(start_str).timestamp() * 1000)
+    end_ts = (
         int(pd.to_datetime(end_str).timestamp() * 1000)
         if end_str
         else int(time.time() * 1000)
@@ -344,6 +342,7 @@ def compute_hurst(ts, max_lag=100):
         return 0.5
 
 
+# ✅✅✅ (V40.12) 更新: 优化空缓存处理逻辑 ✅✅✅
 def get_news_sentiment(symbol: str, data_index: pd.DatetimeIndex) -> pd.Series:
     logger.info(f"[{symbol}] 正在获取新闻情绪...")
     cache_dir = "news_cache"
@@ -353,63 +352,83 @@ def get_news_sentiment(symbol: str, data_index: pd.DatetimeIndex) -> pd.Series:
     cache_file = os.path.join(
         cache_dir, f"{symbol}_{start_date_str}_{end_date_str}.json"
     )
+
     news_items = None
+
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
-                news_items = json.load(f)
-            logger.info(
-                f"✅ [{symbol}] 从缓存文件 {cache_file} 成功加载了 {len(news_items)} 条新闻。"
-            )
+                cached_data = json.load(f)
+            # 检查缓存数据是否为非空列表
+            if isinstance(cached_data, list) and cached_data:
+                news_items = cached_data
+                logger.info(
+                    f"✅ [{symbol}] 从缓存文件 {cache_file} 成功加载了 {len(news_items)} 条新闻。"
+                )
+            else:
+                logger.warning(
+                    f"缓存文件 {cache_file} 为空或格式不正确。将尝试重新从API获取。"
+                )
         except (json.JSONDecodeError, IOError) as e:
             logger.warning(f"读取缓存文件 {cache_file} 失败: {e}。将重新从API获取。")
-            news_items = None
+
     if news_items is None:
         api_key = NEWS_CONFIG.get("gnews_api_key")
         if not api_key or api_key == "YOUR_GNEWS_API_KEY":
-            logger.warning("GNews API 密钥无效或未设置。将使用模拟数据。")
+            logger.warning("GNews API 密钥无效或未设置。")
         elif not NEWS_LIBS_INSTALLED:
-            logger.warning(
-                "GNews 或 TextBlob 未安装，无法获取新闻情绪。将使用模拟数据。"
-            )
+            logger.warning("GNews 或 TextBlob 未安装，无法获取新闻情绪。")
         else:
-            try:
-                logger.info(f"正在通过 GNews API 获取 '{symbol}' 的新闻...")
-                gnews = GNews()
-                gnews.api_key = api_key
-                keyword = NEWS_CONFIG["search_keywords"].get(symbol, symbol)
-                start_date_news = data_index.min().to_pydatetime()
-                end_date_news = data_index.max().to_pydatetime()
-                gnews.start_date = (
-                    start_date_news.year,
-                    start_date_news.month,
-                    start_date_news.day,
-                )
-                gnews.end_date = (
-                    end_date_news.year,
-                    end_date_news.month,
-                    end_date_news.day,
-                )
-                news_items_fetched = gnews.get_news(f'"{keyword}"')
-                if not news_items_fetched:
-                    logger.warning(
-                        f"[{symbol}] API 未返回任何新闻条目。将创建空缓存文件。"
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    logger.info(
+                        f"正在通过 GNews API 获取 '{symbol}' 的新闻 (尝试 {attempt + 1}/{max_retries})..."
                     )
-                    news_items = []
-                else:
-                    news_items = news_items_fetched
-                with open(cache_file, "w", encoding="utf-8") as f:
-                    json.dump(news_items, f, ensure_ascii=False, indent=4)
-                logger.info(
-                    f"✅ [{symbol}] 从 API 获取了 {len(news_items)} 条新闻并已缓存至 {cache_file}。"
-                )
-            except Exception as e:
-                logger.error(f"[{symbol}] API 请求失败: {e}。将使用模拟数据（如有）。")
-                news_items = None
+                    gnews = GNews()
+                    gnews.api_key = api_key
+                    keyword = NEWS_CONFIG["search_keywords"].get(symbol, symbol)
+                    start_date_news = data_index.min().to_pydatetime()
+                    end_date_news = data_index.max().to_pydatetime()
+                    gnews.start_date = (
+                        start_date_news.year,
+                        start_date_news.month,
+                        start_date_news.day,
+                    )
+                    gnews.end_date = (
+                        end_date_news.year,
+                        end_date_news.month,
+                        end_date_news.day,
+                    )
+                    news_items_fetched = gnews.get_news(f'"{keyword}"')
+
+                    if not news_items_fetched:
+                        logger.warning(f"[{symbol}] API 未返回任何新闻条目。")
+                        news_items = []
+                    else:
+                        news_items = news_items_fetched
+
+                    with open(cache_file, "w", encoding="utf-8") as f:
+                        json.dump(news_items, f, ensure_ascii=False, indent=4)
+                    logger.info(
+                        f"✅ [{symbol}] 从 API 获取了 {len(news_items)} 条新闻并已缓存至 {cache_file}。"
+                    )
+                    break
+                except Exception as e:
+                    logger.error(f"[{symbol}] API 请求失败 (尝试 {attempt + 1}): {e}。")
+                    if attempt < max_retries - 1:
+                        sleep_time = (attempt + 1) * 5
+                        logger.info(f"将在 {sleep_time} 秒后重试...")
+                        time.sleep(sleep_time)
+                    else:
+                        logger.error(f"[{symbol}] 达到最大重试次数，获取新闻失败。")
+                        news_items = None
+
     if news_items is not None:
         if not news_items:
             logger.warning(f"[{symbol}] 无可用新闻数据。返回中性情绪。")
             return pd.Series(0, index=data_index, name="news_sentiment")
+
         sentiments = []
         for item in news_items:
             title = item.get("title", "") or ""
@@ -427,9 +446,11 @@ def get_news_sentiment(symbol: str, data_index: pd.DatetimeIndex) -> pd.Series:
                             "sentiment": sentiment,
                         }
                     )
+
         if not sentiments:
             logger.warning(f"[{symbol}] 新闻内容为空或无法进行情绪分析。返回中性情绪。")
             return pd.Series(0, index=data_index, name="news_sentiment")
+
         sentiment_df = pd.DataFrame(sentiments).groupby("date")["sentiment"].mean()
         daily_index_range = pd.date_range(
             start=data_index.min().floor("D"), end=data_index.max().floor("D")
@@ -443,6 +464,7 @@ def get_news_sentiment(symbol: str, data_index: pd.DatetimeIndex) -> pd.Series:
             .mean()
             .fillna(0)
         )
+
     logger.info(f"[{symbol}] 正在生成模拟新闻情绪作为最终备用方案...")
     daily_index = pd.date_range(
         start=data_index.min().floor("D"), end=data_index.max().floor("D"), freq="D"
@@ -655,7 +677,9 @@ class BaseAssetStrategy:
 
 class BTCStrategy(BaseAssetStrategy):
     def _calculate_entry_score(self) -> float:
-        return super()._calculate_entry_score() if self.main.tf_adx[-1] > 20 else 0
+        if self.main.tf_adx[-1] > 20:
+            return super()._calculate_entry_score()
+        return 0
 
 
 class ETHStrategy(BaseAssetStrategy):
@@ -731,6 +755,7 @@ class UltimateStrategy(Strategy):
         self.asset_strategy = STRATEGY_MAPPING.get(
             strategy_class_name, BaseAssetStrategy
         )(self)
+
         close, high, low = (
             pd.Series(self.data.Close, index=self.data.index),
             pd.Series(self.data.High, index=self.data.index),
@@ -751,14 +776,18 @@ class UltimateStrategy(Strategy):
                 high, low, close, self.tf_atr_period
             ).average_true_range()
         )
-        self.tf_donchian_h, self.tf_donchian_l = self.I(
+        self.tf_donchian_h = self.I(
             lambda: high.rolling(self.tf_donchian_period).max().shift(1)
-        ), self.I(lambda: low.rolling(self.tf_donchian_period).min().shift(1))
-        self.tf_ema_fast, self.tf_ema_slow = self.I(
+        )
+        self.tf_donchian_l = self.I(
+            lambda: low.rolling(self.tf_donchian_period).min().shift(1)
+        )
+        self.tf_ema_fast = self.I(
             lambda: ta.trend.EMAIndicator(
                 close, self.tf_ema_fast_period
             ).ema_indicator()
-        ), self.I(
+        )
+        self.tf_ema_slow = self.I(
             lambda: ta.trend.EMAIndicator(
                 close, self.tf_ema_slow_period
             ).ema_indicator()
@@ -818,10 +847,8 @@ class UltimateStrategy(Strategy):
 
     def run_scoring_system_entry(self, price):
         final_score = self.asset_strategy._calculate_entry_score()
-        is_long, is_short = (
-            final_score > self.score_entry_threshold,
-            final_score < -self.score_entry_threshold,
-        )
+        is_long = final_score > self.score_entry_threshold
+        is_short = final_score < -self.score_entry_threshold
         if not (is_long or is_short):
             return
         self.open_tf_position(
@@ -847,13 +874,12 @@ class UltimateStrategy(Strategy):
         return confidence_score
 
     def reset_trade_state(self):
-        (
-            self.active_sub_strategy,
-            self.chandelier_exit_level,
-            self.highest_high_in_trade,
-            self.lowest_low_in_trade,
-            self.mr_stop_loss,
-        ) = (None, 0.0, 0, float("inf"), 0.0)
+        self.active_sub_strategy = None
+        self.chandelier_exit_level = 0.0
+        self.highest_high_in_trade = 0
+        self.lowest_low_in_trade = float("inf")
+        self.mr_stop_loss = 0.0
+        self.tf_initial_stop_loss = 0.0
 
     def manage_open_position(self, price):
         if self.active_sub_strategy == "TF":
@@ -862,7 +888,7 @@ class UltimateStrategy(Strategy):
             self.manage_mean_reversion_exit(price)
 
     def open_tf_position(self, price, is_long, score, confidence_factor):
-        risk_per_share = self.tf_atr[-1] * self.tf_chandelier_atr_multiplier
+        risk_per_share = self.tf_atr[-1] * self.tf_stop_loss_atr_multiplier
         if risk_per_share <= 0:
             return
         final_risk = self._calculate_dynamic_risk() * score * confidence_factor
@@ -871,22 +897,30 @@ class UltimateStrategy(Strategy):
             return
         self.reset_trade_state()
         self.active_sub_strategy = "TF"
+
         if is_long:
             self.buy(size=size)
-            self.highest_high_in_trade, self.chandelier_exit_level = (
-                self.data.High[-1],
-                self.data.High[-1] - risk_per_share,
+            self.tf_initial_stop_loss = price - risk_per_share
+            self.highest_high_in_trade = self.data.High[-1]
+            self.chandelier_exit_level = (
+                self.highest_high_in_trade
+                - self.tf_atr[-1] * self.tf_chandelier_atr_multiplier
             )
         else:
             self.sell(size=size)
-            self.lowest_low_in_trade, self.chandelier_exit_level = (
-                self.data.Low[-1],
-                self.data.Low[-1] + risk_per_share,
+            self.tf_initial_stop_loss = price + risk_per_share
+            self.lowest_low_in_trade = self.data.Low[-1]
+            self.chandelier_exit_level = (
+                self.lowest_low_in_trade
+                + self.tf_atr[-1] * self.tf_chandelier_atr_multiplier
             )
 
     def manage_trend_following_exit(self, price):
         atr = self.tf_atr[-1]
         if self.position.is_long:
+            if price < self.tf_initial_stop_loss:
+                self.close_position("TF_Initial_SL")
+                return
             self.highest_high_in_trade = max(
                 self.highest_high_in_trade, self.data.High[-1]
             )
@@ -894,14 +928,17 @@ class UltimateStrategy(Strategy):
                 self.highest_high_in_trade - atr * self.tf_chandelier_atr_multiplier
             )
             if price < self.chandelier_exit_level:
-                self.close_position("TF")
+                self.close_position("TF_Chandelier")
         elif self.position.is_short:
+            if price > self.tf_initial_stop_loss:
+                self.close_position("TF_Initial_SL")
+                return
             self.lowest_low_in_trade = min(self.lowest_low_in_trade, self.data.Low[-1])
             self.chandelier_exit_level = (
                 self.lowest_low_in_trade + atr * self.tf_chandelier_atr_multiplier
             )
             if price > self.chandelier_exit_level:
-                self.close_position("TF")
+                self.close_position("TF_Chandelier")
 
     def open_mr_position(self, price, is_long):
         risk_per_share = self.tf_atr[-1] * self.mr_stop_loss_atr_multiplier
@@ -947,26 +984,22 @@ class UltimateStrategy(Strategy):
     def _calculate_dynamic_risk(self):
         if len(self.recent_trade_returns) < self.kelly_trade_history:
             return self.default_risk_pct * self.vol_weight
-        wins, losses = [r for r in self.recent_trade_returns if r > 0], [
-            r for r in self.recent_trade_returns if r < 0
-        ]
+        wins = [r for r in self.recent_trade_returns if r > 0]
+        losses = [r for r in self.recent_trade_returns if r < 0]
         if not wins or not losses:
             return self.default_risk_pct * self.vol_weight
-        win_rate, reward_ratio = len(wins) / len(self.recent_trade_returns), (
-            sum(wins) / len(wins)
-        ) / (abs(sum(losses) / len(losses)))
+        win_rate = len(wins) / len(self.recent_trade_returns)
+        reward_ratio = (sum(wins) / len(wins)) / (abs(sum(losses) / len(losses)))
         if reward_ratio == 0:
             return self.default_risk_pct * self.vol_weight
         kelly = win_rate - (1 - win_rate) / reward_ratio
         return min(max(0.005, kelly * 0.5) * self.vol_weight, self.max_risk_pct)
 
 
-# --- 主程序逻辑 (V40.9 重构) ---
 if __name__ == "__main__":
-    logger.info(f"🚀 (V40.9-Flow-Optimize) 开始运行...")
+    logger.info(f"🚀 (V40.12-Cache-Fix) 开始运行...")
     strategy_memory = StrategyMemory()
 
-    # 确定数据加载的起始日期
     load_start_date = (
         CONFIG["training_start_date"]
         if CONFIG["train_new_model"]
@@ -974,7 +1007,6 @@ if __name__ == "__main__":
     )
     logger.info(f"数据加载期间: {load_start_date} to {CONFIG['end_date']}")
 
-    # 加载所需时间段的原始数据
     raw_data = {
         symbol: fetch_binance_klines(
             symbol, CONFIG["interval"], load_start_date, CONFIG["end_date"]
@@ -986,11 +1018,9 @@ if __name__ == "__main__":
         logger.error("所有品种数据获取失败，程序终止。")
         exit()
 
-    # --- 模型训练 (如果需要) ---
     if CONFIG["train_new_model"]:
         logger.info("### 进入模型训练模式 ###")
         for symbol, data in raw_data.items():
-            # 使用加载的全部数据进行预处理和训练
             logger.info(f"为 {symbol} 预处理训练数据...")
             processed_training_data = preprocess_data_for_strategy(data.copy(), symbol)
             if not processed_training_data.empty:
@@ -998,15 +1028,12 @@ if __name__ == "__main__":
     else:
         logger.info("跳过模型训练环节 (train_new_model=False)。")
 
-    # --- 准备回测数据 ---
     logger.info(f"### 准备回测数据 (开始日期: {CONFIG['start_date']}) ###")
     processed_backtest_data = {}
     for symbol, data in raw_data.items():
-        # 仅截取回测期的数据
         backtest_period_slice = data.loc[CONFIG["start_date"] :].copy()
         if not backtest_period_slice.empty:
             logger.info(f"为 {symbol} 预处理回测数据...")
-            # 仅对回测期数据进行预处理
             processed_backtest_data[symbol] = preprocess_data_for_strategy(
                 backtest_period_slice, symbol
             )
@@ -1018,10 +1045,8 @@ if __name__ == "__main__":
         logger.error("回测时间段内没有可用的预处理数据，程序终止。")
         exit()
 
-    # --- 执行回测或学习 ---
     if CONFIG["run_learning_phase"]:
         logger.info("### 进入学习与记忆模式 ###")
-        # (略... 此部分逻辑与回测类似，使用 processed_backtest_data)
     else:
         mode = "自适应" if CONFIG["run_adaptive_backtest"] else "标准"
         logger.info(f"### 进入{mode}回测模式 ###")
