@@ -67,8 +67,8 @@ import ta
 # --- 全局配置 ---
 CONFIG = {
     "symbols_to_test": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-    "interval": "4h",
-    "start_date": "2024-01-01",
+    "interval": "1h",
+    "start_date": "2025-01-01",
     "end_date": "2025-10-08",
     "initial_cash": 500_000,
     "commission": 0.0002,

@@ -76,7 +76,7 @@ import ta
 # --- 全局配置 ---
 CONFIG = {
     "symbols_to_test": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],  # 最终决策: 专注于高期望资产
-    "interval": "4h",
+    "interval": "1h",
     "start_date": "2020-01-01",
     "end_date": "2025-10-08",
     "initial_cash": 500_000,
