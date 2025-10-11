@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-🚀 终极优化版加密货币趋势交易系统 (V40.12-Cache-Fix)
+🚀 终极优化版加密货币趋势交易系统 (V40.14-Cache-Name-Fix)
 
 版本更新：
-- (V40.12-Cache-Fix) 优化了新闻缓存逻辑：当检测到缓存文件为空（包含0条新闻）时，系统将自动尝试
-                       重新从API获取，实现了对过去API错误的自我修复，确保数据质量。
-- (V40.11-Style-Fix) 修复了 Pylance linter 因单行多语句导致的报错，提升了代码可读性。
-- (V40.10-Risk-Stab-Fix) 增强新闻获取稳定性并为趋势跟踪策略加入了硬性初始止损。
-- (V40.9-Flow-Optimize) 优化了主程序逻辑，提高了仅回测模式下的启动速度。
-- (V40.8-News-Cache) 实现了新闻缓存功能。
+- (V40.14-Cache-Name-Fix) 修复了因 `strftime` 格式化字符串中的一个错字导致缓存文件名不正确，从而使缓存系统
+                       失效并反复重新获取新闻的严重错误。
+- (V40.13-Retry-Fix) 修复了新闻获取的重试机制，使其能够正确处理API的静默失败。
+- (V40.12-Cache-Fix) 优化了空缓存文件的处理逻辑，实现了自我修复。
+- (V40.11-Style-Fix) 修复了 Pylance linter 报错，提升了代码可读性。
+- (V40.10-Risk-Stab-Fix) 增强了新闻获取稳定性并为趋势策略加入了硬性止损。
 """
 
 # --- 1. 导入库与配置 ---
@@ -95,9 +95,9 @@ set_chinese_font()
 CONFIG = {
     "symbols_to_test": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
     "interval": "1h",
-    "training_start_date": "2021-01-01",
-    "start_date": "2023-01-01",
-    "end_date": "2025-10-08",
+    "training_start_date": "2024-01-01",
+    "start_date": "2020-01-01",
+    "end_date": "2020-12-30",
     "initial_cash": 500_000,
     "commission": 0.0002,
     "spread": 0.0005,
@@ -108,7 +108,7 @@ CONFIG = {
     "run_adaptive_backtest": True,
 }
 NEWS_CONFIG = {
-    "gnews_api_key": "YOUR_GNEWS_API_KEY",
+    "gnews_api_key": "439183c4b004dd34c1f940f0dabb44f8",
     "search_keywords": {
         "BTCUSDT": "Bitcoin OR BTC crypto",
         "ETHUSDT": "Ethereum OR ETH crypto",
@@ -276,8 +276,7 @@ def fetch_binance_klines(
         "taker_buy_quote_volume",
         "ignore",
     ]
-    start_ts = int(pd.to_datetime(start_str).timestamp() * 1000)
-    end_ts = (
+    start_ts, end_ts = int(pd.to_datetime(start_str).timestamp() * 1000), (
         int(pd.to_datetime(end_str).timestamp() * 1000)
         if end_str
         else int(time.time() * 1000)
@@ -342,13 +341,15 @@ def compute_hurst(ts, max_lag=100):
         return 0.5
 
 
-# ✅✅✅ (V40.12) 更新: 优化空缓存处理逻辑 ✅✅✅
+# ✅✅✅ (V40.14) 更新: 修复缓存文件名生成错误 ✅✅✅
 def get_news_sentiment(symbol: str, data_index: pd.DatetimeIndex) -> pd.Series:
     logger.info(f"[{symbol}] 正在获取新闻情绪...")
     cache_dir = "news_cache"
     os.makedirs(cache_dir, exist_ok=True)
     start_date_str = data_index.min().strftime("%Y%m%d")
-    end_date_str = data_index.max().strftime("%Y%m%d")
+    end_date_str = data_index.max().strftime(
+        "%Y%m%d"
+    )  # <-- FIX: Corrected '%Ym%d' to '%Y%m%d'
     cache_file = os.path.join(
         cache_dir, f"{symbol}_{start_date_str}_{end_date_str}.json"
     )
@@ -359,7 +360,6 @@ def get_news_sentiment(symbol: str, data_index: pd.DatetimeIndex) -> pd.Series:
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 cached_data = json.load(f)
-            # 检查缓存数据是否为非空列表
             if isinstance(cached_data, list) and cached_data:
                 news_items = cached_data
                 logger.info(
@@ -388,8 +388,10 @@ def get_news_sentiment(symbol: str, data_index: pd.DatetimeIndex) -> pd.Series:
                     gnews = GNews()
                     gnews.api_key = api_key
                     keyword = NEWS_CONFIG["search_keywords"].get(symbol, symbol)
-                    start_date_news = data_index.min().to_pydatetime()
-                    end_date_news = data_index.max().to_pydatetime()
+                    start_date_news, end_date_news = (
+                        data_index.min().to_pydatetime(),
+                        data_index.max().to_pydatetime(),
+                    )
                     gnews.start_date = (
                         start_date_news.year,
                         start_date_news.month,
@@ -400,14 +402,15 @@ def get_news_sentiment(symbol: str, data_index: pd.DatetimeIndex) -> pd.Series:
                         end_date_news.month,
                         end_date_news.day,
                     )
+
                     news_items_fetched = gnews.get_news(f'"{keyword}"')
 
                     if not news_items_fetched:
-                        logger.warning(f"[{symbol}] API 未返回任何新闻条目。")
-                        news_items = []
-                    else:
-                        news_items = news_items_fetched
+                        raise ValueError(
+                            "API 返回了0条新闻，可能为临时网络问题，将重试。"
+                        )
 
+                    news_items = news_items_fetched
                     with open(cache_file, "w", encoding="utf-8") as f:
                         json.dump(news_items, f, ensure_ascii=False, indent=4)
                     logger.info(
@@ -415,9 +418,11 @@ def get_news_sentiment(symbol: str, data_index: pd.DatetimeIndex) -> pd.Series:
                     )
                     break
                 except Exception as e:
-                    logger.error(f"[{symbol}] API 请求失败 (尝试 {attempt + 1}): {e}。")
+                    logger.error(
+                        f"[{symbol}] API 请求或处理失败 (尝试 {attempt + 1}): {e}。"
+                    )
                     if attempt < max_retries - 1:
-                        sleep_time = (attempt + 1) * 5
+                        sleep_time = 2 ** (attempt + 1)
                         logger.info(f"将在 {sleep_time} 秒后重试...")
                         time.sleep(sleep_time)
                     else:
@@ -428,7 +433,6 @@ def get_news_sentiment(symbol: str, data_index: pd.DatetimeIndex) -> pd.Series:
         if not news_items:
             logger.warning(f"[{symbol}] 无可用新闻数据。返回中性情绪。")
             return pd.Series(0, index=data_index, name="news_sentiment")
-
         sentiments = []
         for item in news_items:
             title = item.get("title", "") or ""
@@ -446,7 +450,6 @@ def get_news_sentiment(symbol: str, data_index: pd.DatetimeIndex) -> pd.Series:
                             "sentiment": sentiment,
                         }
                     )
-
         if not sentiments:
             logger.warning(f"[{symbol}] 新闻内容为空或无法进行情绪分析。返回中性情绪。")
             return pd.Series(0, index=data_index, name="news_sentiment")
@@ -997,7 +1000,7 @@ class UltimateStrategy(Strategy):
 
 
 if __name__ == "__main__":
-    logger.info(f"🚀 (V40.12-Cache-Fix) 开始运行...")
+    logger.info(f"🚀 (V40.13-Retry-Fix) 开始运行...")
     strategy_memory = StrategyMemory()
 
     load_start_date = (

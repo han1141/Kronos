@@ -97,15 +97,15 @@ CONFIG = {
     "symbols_to_test": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
     "interval": "1h",
     # ✅✅✅ (V40.7) 新功能: 分离训练和回测日期 ✅✅✅
-    "training_start_date": "2021-01-01",  # 用于模型训练的数据开始日期
-    "start_date": "2025-01-01",  # 用于回测的开始日期
-    "end_date": "2025-10-08",  # 统一的结束日期
+    "training_start_date": "2020-01-01",  # 用于模型训练的数据开始日期
+    "start_date": "2020-01-01",  # 用于回测的开始日期
+    "end_date": "2020-12-30",  # 统一的结束日期
     "initial_cash": 500_000,
     "commission": 0.0002,
     "spread": 0.0005,
     "run_monte_carlo": True,
     "show_plots": False,
-    "train_new_model": True,
+    "train_new_model": False,
     "run_learning_phase": False,
     "run_adaptive_backtest": True,
 }
