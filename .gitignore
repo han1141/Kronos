@@ -51,6 +51,7 @@ Desktop.ini
 *.csv
 *.hdf5
 *.json
+*.joblib
 
 # Model files (large files)
 *.pth
