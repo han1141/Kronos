@@ -72,20 +72,20 @@ def set_chinese_font():
 
 set_chinese_font()
 
-# --- 核心配置 --- "BTCUSDT"
+# --- 核心配置 ---
 CONFIG = {
     "symbols_to_test": ["ETHUSDT"],
-    "interval": "30m",
-    "backtest_start_date": "2025-01-01",
-    "backtest_end_date": "2025-08-14",
+    "interval": "1m",
+    "backtest_start_date": "2025-06-01",
+    "backtest_end_date": "2025-10-16",
     "initial_cash": 500_000,
     "commission": 0.0002,
     "spread": 0.0005,
     "show_plots": False,
-    "training_window_days": 365 * 2,
+    "training_window_days": 365 * 1.5,
     "enable_ml_component": False,
 }
-ML_HORIZONS = [4, 8, 12]  # <-- 修复此行
+ML_HORIZONS = [4, 8, 12]
 
 # --- 参数与类定义 ---
 STRATEGY_PARAMS = {
@@ -119,19 +119,16 @@ STRATEGY_PARAMS = {
     "tf_stop_loss_atr_multiplier": 2.5,
     "mr_bb_period": 20,
     "mr_bb_std": 2.0,
-    "mr_rsi_period": 14,
-    "mr_rsi_oversold": 30,
-    "mr_rsi_overbought": 70,
     "mr_stop_loss_atr_multiplier": 1.5,
     "mr_risk_multiplier": 0.5,
     "mtf_period": 50,
     "score_entry_threshold": 0.4,
     "score_weights_tf": {
-        "breakout": 0.20,
-        "momentum": 0.15,
-        "mtf": 0.10,
-        "ml": 0.30,
-        "advanced_ml": 0.25,
+        "breakout": 0.2667,
+        "momentum": 0.20,
+        "mtf": 0.1333,
+        "ml": 0.2182,
+        "advanced_ml": 0.1818,
     },
 }
 ASSET_SPECIFIC_OVERRIDES = {
@@ -143,9 +140,9 @@ ASSET_SPECIFIC_OVERRIDES = {
     },
     "ETHUSDT": {
         "strategy_class": "ETHStrategy",
-        "ml_weights": {"4h": 0.3, "8h": 0.35, "12h": 0.35},
+        "ml_weights": {"4h": 0.15, "8h": 0.3, "12h": 0.55},
         "ml_weighted_threshold": 0.2,
-        "score_entry_threshold": 0.40,
+        "score_entry_threshold": 0.35,
     },
 }
 
@@ -447,8 +444,7 @@ def train_and_save_model(
         logger.info(
             f"[{symbol}-{h}h] 模型评估报告:\n{classification_report(y_eval, y_pred, zero_division=0)}"
         )
-        date_str = training_end_date.strftime("%Y%m%d")
-        model_filename = f"directional_model_{symbol}_{h}h_{date_str}.joblib"
+        model_filename = f"directional_model_{symbol}_{h}h.joblib"
         joblib.dump(model, model_filename)
         logger.info(f"✅ [{symbol}-{h}h] 模型训练完成并已保存至: {model_filename}")
 
@@ -476,19 +472,45 @@ class BaseAssetStrategy:
             + m.advanced_ml_signal[-1] * w.get("advanced_ml", 0)
         )
 
+    # <<< 修改：使用增强版 “布林带回归 + Stoch RSI 确认” 逻辑 >>>
     def _define_mr_entry_signal(self) -> int:
         m = self.main
-        return (
-            1
-            if crossover(m.data.Close, m.mr_bb_lower)
-            and m.mr_rsi[-1] < m.mr_rsi_oversold
-            else (
-                -1
-                if crossover(m.mr_bb_upper, m.data.Close)
-                and m.mr_rsi[-1] > m.mr_rsi_overbought
-                else 0
-            )
+
+        # --- 做多信号判断 ---
+        # 1. 回归确认：价格从布林带下轨之下，穿越回其之上
+        long_reentry_condition = (
+            m.data.Close[-2] < m.mr_bb_lower[-2]
+            and m.data.Close[-1] > m.mr_bb_lower[-1]
         )
+
+        # 2. 动量确认：Stoch RSI 在超卖区发生金叉
+        stoch_long_confirmation = (
+            m.mr_stoch_rsi_k[-1] > m.mr_stoch_rsi_d[-1]
+            and m.mr_stoch_rsi_k[-2] <= m.mr_stoch_rsi_d[-2]
+            and m.mr_stoch_rsi_k[-1] < 40
+        )  # 放宽阈值以捕捉更多机会
+
+        if long_reentry_condition and stoch_long_confirmation:
+            return 1
+
+        # --- 做空信号判断 ---
+        # 1. 回归确认：价格从布lin带上轨之上，穿越回其之下
+        short_reentry_condition = (
+            m.data.Close[-2] > m.mr_bb_upper[-2]
+            and m.data.Close[-1] < m.mr_bb_upper[-1]
+        )
+
+        # 2. 动量确认：Stoch RSI 在超买区发生死叉
+        stoch_short_confirmation = (
+            m.mr_stoch_rsi_k[-1] < m.mr_stoch_rsi_d[-1]
+            and m.mr_stoch_rsi_k[-2] >= m.mr_stoch_rsi_d[-2]
+            and m.mr_stoch_rsi_k[-1] > 60
+        )  # 放宽阈值
+
+        if short_reentry_condition and stoch_short_confirmation:
+            return -1
+
+        return 0
 
 
 class BTCStrategy(BaseAssetStrategy):
@@ -517,30 +539,20 @@ class UltimateStrategy(Strategy):
     ml_weighted_threshold_override = None
 
     def init(self):
-        # 1. 首先加载全局默认参数
         for key, value in STRATEGY_PARAMS.items():
             setattr(self, key, value)
-
-        # 2. 获取该品种的特定配置
         asset_overrides = ASSET_SPECIFIC_OVERRIDES.get(self.symbol, {})
-
-        # 3. 应用从 bt.run() 传递过来的覆盖参数
         if self.score_entry_threshold_override is not None:
             self.score_entry_threshold = self.score_entry_threshold_override
-
         if self.score_weights_tf_override is not None:
             self.score_weights_tf = self.score_weights_tf_override
-
-        if self.ml_weights_override is not None:
-            self.ml_weights_dict = self.ml_weights_override
-        else:
-            self.ml_weights_dict = asset_overrides.get("ml_weights")
-
-        if self.ml_weighted_threshold_override is not None:
-            self.ml_weighted_threshold = self.ml_weighted_threshold_override
-        else:
-            self.ml_weighted_threshold = asset_overrides.get("ml_weighted_threshold")
-
+        self.ml_weights_dict = self.ml_weights_override or asset_overrides.get(
+            "ml_weights"
+        )
+        self.ml_weighted_threshold = (
+            self.ml_weighted_threshold_override
+            or asset_overrides.get("ml_weighted_threshold")
+        )
         strategy_class_name = self.strategy_class_override or asset_overrides.get(
             "strategy_class", "BaseAssetStrategy"
         )
@@ -548,7 +560,6 @@ class UltimateStrategy(Strategy):
             strategy_class_name, BaseAssetStrategy
         )(self)
 
-        # 准备数据序列和指标
         close, high, low = (
             pd.Series(self.data.Close),
             pd.Series(self.data.High),
@@ -594,27 +605,35 @@ class UltimateStrategy(Strategy):
             self.I(lambda: bb.bollinger_lband()),
             self.I(lambda: bb.bollinger_mavg()),
         )
+        # 原始的RSI指标仍然保留，以防其他地方可能用到，但震荡入场信号不再直接使用它
         self.mr_rsi = self.I(
-            lambda: ta.momentum.RSIIndicator(close, self.mr_rsi_period).rsi()
+            lambda: ta.momentum.RSIIndicator(
+                close, STRATEGY_PARAMS["regime_rsi_period"]
+            ).rsi()
         )
 
-        # 模型加载
+        # <<< 新增：为增强版震荡策略计算 Stoch RSI >>>
+        stoch_rsi = ta.momentum.StochRSIIndicator(
+            close, window=14, smooth1=3, smooth2=3
+        )
+        self.mr_stoch_rsi_k = self.I(lambda: stoch_rsi.stochrsi_k())
+        self.mr_stoch_rsi_d = self.I(lambda: stoch_rsi.stochrsi_d())
+
         self.ml_models = {}
         self._load_models()
 
     def _load_models(self):
-        if not CONFIG.get("enable_ml_component", False):
-            return
         if not self.symbol or not ML_LIBS_INSTALLED:
+            logger.warning(
+                f"[{self.symbol}] 缺少 ML 库 (scikit-learn, lightgbm)，跳过模型加载。"
+            )
             return
         backtest_start_str = pd.to_datetime(CONFIG["backtest_start_date"]).strftime(
             "%Y%m%d"
         )
         loaded_count = 0
         for h in ML_HORIZONS:
-            model_files = glob.glob(
-                f"directional_model_{self.symbol}_{h}h_{backtest_start_str}.joblib"
-            )
+            model_files = glob.glob(f"directional_model_{self.symbol}_{h}h.joblib")
             if model_files:
                 try:
                     self.ml_models[h] = joblib.load(model_files[0])
@@ -638,11 +657,7 @@ class UltimateStrategy(Strategy):
                 self.run_mean_reversion_entry(self.data.Close[-1])
 
     def get_ml_confidence_score(self) -> float:
-        if (
-            not CONFIG.get("enable_ml_component", False)
-            or not self.ml_models
-            or not self.ml_weights_dict
-        ):
+        if not self.ml_models or not self.ml_weights_dict:
             return 0.0
         features = [col for col in self.data.df.columns if "feature_" in col]
         if self.data.df[features].iloc[-1].isnull().any():
@@ -657,7 +672,6 @@ class UltimateStrategy(Strategy):
                 pass
         return score
 
-    # (其他策略方法无变动)
     def run_scoring_system_entry(self, price):
         score = self.asset_strategy._calculate_entry_score()
         if abs(score) > self.score_entry_threshold:
@@ -671,12 +685,9 @@ class UltimateStrategy(Strategy):
             self.open_mr_position(price, is_long=(signal == 1))
 
     def reset_trade_state(self):
-        self.active_sub_strategy = None
-        self.chandelier_exit_level = 0.0
-        self.highest_high_in_trade = 0
-        self.lowest_low_in_trade = float("inf")
-        self.mr_stop_loss = 0.0
-        self.tf_initial_stop_loss = 0.0
+        self.active_sub_strategy, self.chandelier_exit_level = None, 0.0
+        self.highest_high_in_trade, self.lowest_low_in_trade = 0, float("inf")
+        self.mr_stop_loss, self.tf_initial_stop_loss = 0.0, 0.0
 
     def manage_open_position(self, p):
         if self.active_sub_strategy == "TF":
@@ -793,9 +804,9 @@ class UltimateStrategy(Strategy):
 
 
 if __name__ == "__main__":
-    logger.info(f"🚀 (V41.04c-FinalFix) 开始运行...")
+    logger.info(f"🚀 (V41.05-MR-Enhanced) 开始运行...")
     backtest_start_dt = pd.to_datetime(CONFIG["backtest_start_date"])
-    data_fetch_start_date = data_fetch_start_date = CONFIG["backtest_start_date"]
+    data_fetch_start_date = CONFIG["backtest_start_date"]
     if CONFIG["enable_ml_component"]:
         training_window = timedelta(days=CONFIG["training_window_days"])
         data_fetch_start_date = (backtest_start_dt - training_window).strftime(
@@ -817,13 +828,10 @@ if __name__ == "__main__":
         exit()
 
     if CONFIG.get("enable_ml_component", False):
-        logger.info("### 模式: 单次模型训练 (已启用) ###")
+        logger.info("### 模式: 执行模型训练 (已启用) ###")
         training_data_end_dt = backtest_start_dt - pd.Timedelta(seconds=1)
         logger.info(
-            "=" * 50
-            + f"\n准备训练周期，训练数据截止于: {training_data_end_dt.date()}\n"
-            + f"训练数据窗口: {data_fetch_start_date} -> {training_data_end_dt.date()}\n"
-            + "=" * 50
+            f"{'='*50}\n准备训练周期，训练数据截止于: {training_data_end_dt.date()}\n训练数据窗口: {data_fetch_start_date} -> {training_data_end_dt.date()}\n{'='*50}"
         )
         for symbol, data in raw_data.items():
             training_slice = data.loc[data_fetch_start_date:training_data_end_dt].copy()
@@ -836,7 +844,7 @@ if __name__ == "__main__":
             if not processed_training_data.empty:
                 train_and_save_model(processed_training_data, symbol, backtest_start_dt)
     else:
-        logger.info("### 模式: 单次模型训练 (已禁用) ###")
+        logger.info("### 模式: 跳过模型训练 (已禁用) ###")
 
     logger.info(f"### 准备完整回测数据 (开始日期: {CONFIG['backtest_start_date']}) ###")
     processed_backtest_data = {}
@@ -866,11 +874,9 @@ if __name__ == "__main__":
     }
 
     for symbol, data in processed_backtest_data.items():
-        print("\n" + "=" * 80 + f"\n正在回测品种: {symbol}\n" + "=" * 80)
-
+        print(f"\n{'='*80}\n正在回测品种: {symbol}\n{'='*80}")
         asset_overrides = ASSET_SPECIFIC_OVERRIDES.get(symbol, {})
         bt_params = {"symbol": symbol, "vol_weight": vol_weights.get(symbol, 1.0)}
-
         override_keys = [
             "strategy_class",
             "score_entry_threshold",
@@ -881,7 +887,6 @@ if __name__ == "__main__":
         for key in override_keys:
             if key in asset_overrides:
                 bt_params[f"{key}_override"] = asset_overrides[key]
-
         bt = Backtest(
             data,
             UltimateStrategy,
@@ -890,21 +895,18 @@ if __name__ == "__main__":
             finalize_trades=True,
         )
         stats = bt.run(**bt_params)
-
         all_stats[symbol], total_equity = (
             stats,
             total_equity + stats["Equity Final [$]"],
         )
-        print(
-            "\n" + "-" * 40 + f"\n          {symbol} 回测结果摘要\n" + "-" * 40, stats
-        )
+        print(f"\n{'-'*40}\n          {symbol} 回测结果摘要\n{'-'*40}", stats)
         if CONFIG["show_plots"]:
             bt.plot()
 
     if all_stats:
         initial_total = CONFIG["initial_cash"] * len(all_stats)
         ret = ((total_equity - initial_total) / initial_total) * 100
-        print("\n" + "#" * 80 + "\n                 组合策略表现总览\n" + "#" * 80)
+        print(f"\n{'#'*80}\n                 组合策略表现总览\n{'#'*80}")
         for symbol, stats in all_stats.items():
             print(
                 f"  - {symbol}:\n    - 最终权益: ${stats['Equity Final [$]']:,.2f} (回报率: {stats['Return [%]']:.2f}%)\n    - 最大回撤: {stats['Max. Drawdown [%]']:.2f}%\n    - 夏普比率: {stats.get('Sharpe Ratio', 'N/A')}"

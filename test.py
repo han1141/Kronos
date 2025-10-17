@@ -1,52 +1,123 @@
-import requests
+import websocket
 import json
+import time
+import threading
 
-stock_code = "sh601208"
-# 获取日线数据
-scale = 240
-# 获取的数据长度
-datalen = 10  # 获取更多数据点以便测试
+# --- 配置 ---
+# OKX 公共 WebSocket 地址
+WSS_URL = "wss://ws.okx.com:8443/ws/v5/public"
 
-# 构建请求URL
-url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={stock_code}&scale={scale}&datalen={datalen}"
+# 要订阅的交易对和频道
+# 示例：ETH-USDT 现货的 ticker (行情数据)
+SUBSCRIBE_OP = {
+    "op": "subscribe",
+    "args": [{"channel": "tickers", "instId": "ETH-USDT"}],
+}
 
-# 初始化 data 变量为 None
-data = None
-
-print(f"正在从以下URL获取数据: {url}")
-
-try:
-    # 发送HTTP请求，并设置超时
-    response = requests.get(url, timeout=10)
-    response.raise_for_status()  # 如果状态码不是200, 会抛出异常
-
-    # 尝试解析返回的JSON数据
-    # 新浪接口有时会返回非标准JSON，需要手动处理
-    text_content = response.text
-    if text_content and text_content.strip():
-        data = json.loads(text_content)
-    else:
-        print("请求成功，但返回内容为空。")
-
-except requests.exceptions.RequestException as e:
-    print(f"HTTP请求失败: {e}")
-except json.JSONDecodeError:
-    # 关键的调试步骤：打印出无法解析的原始文本
-    print("无法解析JSON数据。服务器返回的原始内容是:")
-    print("-----------------------------------------")
-    print(response.text)
-    print("-----------------------------------------")
+# --- 如果你需要代理 (例如在中国大陆) ---
+# 如果不需要代理，保持为 None
+# http_proxy_host = "127.0.0.1"
+# http_proxy_port = 7890
+http_proxy_host = None
+http_proxy_port = None
 
 
-# --- 核心修正：在使用 data 之前，检查它是否有效 ---
-if data:
-    print("\n数据获取并解析成功，开始处理数据：")
-    # 现在 data 肯定不是 None，可以安全地进行循环
-    for item in data:
-        # 确保 item 是字典并且包含所需键
-        if isinstance(item, dict) and 'day' in item:
-            print(f"日期: {item['day']}, 开盘价: {item['open']}, 收盘价: {item['close']}")
+def send_heartbeat(ws):
+    """
+    发送心跳包 (Ping) 以保持连接活跃。
+    OKX 要求每 30 秒内至少发送一次。
+    """
+    while ws.keep_running:
+        try:
+            ws.send("ping")
+            # print("Ping sent") # 调试用
+            time.sleep(20)  # 每20秒发送一次
+        except Exception as e:
+            print(f"心跳发送失败: {e}")
+            break
+
+
+def on_open(ws):
+    """连接建立后触发"""
+    print("--- 连接已建立 ---")
+
+    # 1. 启动心跳线程
+    ws.keep_running = True
+    threading.Thread(target=send_heartbeat, args=(ws,), daemon=True).start()
+
+    # 2. 发送订阅请求
+    json_str = json.dumps(SUBSCRIBE_OP)
+    ws.send(json_str)
+    print(f"已发送订阅请求: {json_str}")
+
+
+def on_message(ws, message):
+    """接收到服务器消息时触发"""
+
+    # 处理心跳响应
+    if message == "pong":
+        # print("Received: pong") # 调试用
+        return
+
+    # 处理业务数据
+    try:
+        data = json.loads(message)
+
+        # 处理订阅成功的确认消息
+        if "event" in data and data["event"] == "subscribe":
+            print(f"订阅成功: {data['arg']['instId']} - {data['arg']['channel']}")
+            return
+
+        # 处理实际的行情数据
+        if "data" in data:
+            for ticker in data["data"]:
+                inst_id = ticker.get("instId")
+                last_price = ticker.get("last")  # 最新成交价
+                ask_price = ticker.get("askPx")  # 卖一价
+                bid_price = ticker.get("bidPx")  # 买一价
+
+                print("-" * 30)
+                print(f"产品: {inst_id}")
+                print(f"最新价: {last_price}")
+                print(f"买一: {bid_price} | 卖一: {ask_price}")
         else:
-            print(f"发现无效的数据项: {item}")
-else:
-    print("\n未能获取到有效数据，程序结束。")
+            print(f"收到其他消息: {message}")
+
+    except json.JSONDecodeError:
+        print(f"JSON 解析错误: {message}")
+
+
+def on_error(ws, error):
+    """发生错误时触发"""
+    print(f"--- 错误发生 --- : {error}")
+    ws.keep_running = False
+
+
+def on_close(ws, close_status_code, close_msg):
+    """连接关闭时触发"""
+    print("--- 连接已关闭 ---")
+    print(f"状态码: {close_status_code}, 信息: {close_msg}")
+    ws.keep_running = False
+
+
+if __name__ == "__main__":
+    # 打开调试信息 (可选，不需要可以注释掉)
+    # websocket.enableTrace(True)
+
+    ws = websocket.WebSocketApp(
+        WSS_URL,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+    )
+
+    print(f"正在连接到 {WSS_URL} ...")
+
+    # 开始运行，如果有代理则配置代理
+    ws.run_forever(
+        http_proxy_host=http_proxy_host,
+        http_proxy_port=http_proxy_port,
+        ping_interval=None,  # 我们手动实现 ping，所以这里设为 None
+        ping_timeout=None,
+    )

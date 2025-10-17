@@ -75,14 +75,14 @@ set_chinese_font()
 # --- 核心配置 --- "BTCUSDT"
 CONFIG = {
     "symbols_to_test": ["ETHUSDT"],
-    "interval": "30m",
-    "backtest_start_date": "2025-01-01",
-    "backtest_end_date": "2025-08-14",
+    "interval": "15m",
+    "backtest_start_date": "2025-10-01",
+    "backtest_end_date": "2025-10-16",
     "initial_cash": 500_000,
     "commission": 0.0002,
     "spread": 0.0005,
     "show_plots": False,
-    "training_window_days": 365 * 2,
+    "training_window_days": 365 * 1.5,
     "enable_ml_component": False,
 }
 ML_HORIZONS = [4, 8, 12]  # <-- 修复此行
@@ -120,18 +120,19 @@ STRATEGY_PARAMS = {
     "mr_bb_period": 20,
     "mr_bb_std": 2.0,
     "mr_rsi_period": 14,
-    "mr_rsi_oversold": 30,
+    "mr_rsi_oversold": 25,
     "mr_rsi_overbought": 70,
     "mr_stop_loss_atr_multiplier": 1.5,
     "mr_risk_multiplier": 0.5,
     "mtf_period": 50,
     "score_entry_threshold": 0.4,
+    # MODIFIED: Rebalanced weights. ML total is now 40%, non-ML is 60%.
     "score_weights_tf": {
-        "breakout": 0.20,
-        "momentum": 0.15,
-        "mtf": 0.10,
-        "ml": 0.30,
-        "advanced_ml": 0.25,
+        "breakout": 0.2667,  # Was 0.20
+        "momentum": 0.20,  # Was 0.15
+        "mtf": 0.1333,  # Was 0.10
+        "ml": 0.2182,  # Was 0.30
+        "advanced_ml": 0.1818,  # Was 0.25
     },
 }
 ASSET_SPECIFIC_OVERRIDES = {
@@ -143,9 +144,9 @@ ASSET_SPECIFIC_OVERRIDES = {
     },
     "ETHUSDT": {
         "strategy_class": "ETHStrategy",
-        "ml_weights": {"4h": 0.3, "8h": 0.35, "12h": 0.35},
+        "ml_weights": {"4h": 0.15, "8h": 0.3, "12h": 0.55},
         "ml_weighted_threshold": 0.2,
-        "score_entry_threshold": 0.40,
+        "score_entry_threshold": 0.35,
     },
 }
 
@@ -447,8 +448,7 @@ def train_and_save_model(
         logger.info(
             f"[{symbol}-{h}h] 模型评估报告:\n{classification_report(y_eval, y_pred, zero_division=0)}"
         )
-        date_str = training_end_date.strftime("%Y%m%d")
-        model_filename = f"directional_model_{symbol}_{h}h_{date_str}.joblib"
+        model_filename = f"directional_model_{symbol}_{h}h.joblib"
         joblib.dump(model, model_filename)
         logger.info(f"✅ [{symbol}-{h}h] 模型训练完成并已保存至: {model_filename}")
 
@@ -603,18 +603,20 @@ class UltimateStrategy(Strategy):
         self._load_models()
 
     def _load_models(self):
-        if not CONFIG.get("enable_ml_component", False):
-            return
+        # MODIFIED: Removed check for 'enable_ml_component'.
+        # The strategy will now always attempt to load models if they exist.
         if not self.symbol or not ML_LIBS_INSTALLED:
+            logger.warning(
+                f"[{self.symbol}] 缺少 ML 库 (scikit-learn, lightgbm)，跳过模型加载。"
+            )
             return
+
         backtest_start_str = pd.to_datetime(CONFIG["backtest_start_date"]).strftime(
             "%Y%m%d"
         )
         loaded_count = 0
         for h in ML_HORIZONS:
-            model_files = glob.glob(
-                f"directional_model_{self.symbol}_{h}h_{backtest_start_str}.joblib"
-            )
+            model_files = glob.glob(f"directional_model_{self.symbol}_{h}h.joblib")
             if model_files:
                 try:
                     self.ml_models[h] = joblib.load(model_files[0])
@@ -638,12 +640,11 @@ class UltimateStrategy(Strategy):
                 self.run_mean_reversion_entry(self.data.Close[-1])
 
     def get_ml_confidence_score(self) -> float:
-        if (
-            not CONFIG.get("enable_ml_component", False)
-            or not self.ml_models
-            or not self.ml_weights_dict
-        ):
+        # MODIFIED: Removed check for 'enable_ml_component'.
+        # The score is now calculated if models were successfully loaded, regardless of the config setting.
+        if not self.ml_models or not self.ml_weights_dict:
             return 0.0
+
         features = [col for col in self.data.df.columns if "feature_" in col]
         if self.data.df[features].iloc[-1].isnull().any():
             return 0.0
@@ -817,7 +818,7 @@ if __name__ == "__main__":
         exit()
 
     if CONFIG.get("enable_ml_component", False):
-        logger.info("### 模式: 单次模型训练 (已启用) ###")
+        logger.info("### 模式: 执行模型训练 (已启用) ###")
         training_data_end_dt = backtest_start_dt - pd.Timedelta(seconds=1)
         logger.info(
             "=" * 50
@@ -836,7 +837,7 @@ if __name__ == "__main__":
             if not processed_training_data.empty:
                 train_and_save_model(processed_training_data, symbol, backtest_start_dt)
     else:
-        logger.info("### 模式: 单次模型训练 (已禁用) ###")
+        logger.info("### 模式: 跳过模型训练 (已禁用) ###")
 
     logger.info(f"### 准备完整回测数据 (开始日期: {CONFIG['backtest_start_date']}) ###")
     processed_backtest_data = {}
