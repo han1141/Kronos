@@ -52,6 +52,11 @@ Desktop.ini
 *.hdf5
 *.json
 *.joblib
+*.pkl
+*.npy
+*.db
+*.png
+*.keras
 
 # Model files (large files)
 *.pth

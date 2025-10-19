@@ -1,170 +1,307 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V38.1 宏观风险加权版框架
-作者: ChatGPT (GPT-5)
-描述: 在V38.0基础上新增宏观风险权重引擎，
-     实现牛熊周期下的动态风险敞口控制。
+改进版：EMA + RSI 双核共振 + 趋势过滤（适用于加密货币1分钟数据）
+- [修复] 入场条件过于严苛导致信号稀少
+- [新增] ADX 趋势强度过滤，避免震荡市频繁交易
+- [新增] 动态 RSI 阈值（基于ATR波动率调整）
+- [增强] 更合理的止损/止盈逻辑（基于ATR）
+- [调试] 添加交易日志输出
+- [优化] 使用 pd.Series 直接计算，提升性能和可读性
 """
-
-import pandas as pd
-import numpy as np
-import talib
-import plotly.express as px
-from backtesting import Strategy, Backtest
-from backtesting.lib import crossover
+import os
+import time
 import logging
-import warnings
-warnings.filterwarnings("ignore")
+import requests
+import numpy as np
+import pandas as pd
 
-# ==============================
-# 📘 日志系统
-# ==============================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("v38_1_log.txt", encoding="utf-8"), logging.StreamHandler()]
-)
+from backtesting import Backtest, Strategy
+from backtesting.lib import crossover, plot_heatmaps
+from backtesting.lib import resample_apply
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==============================
-# 🧭 宏观状态计算
-# ==============================
-def compute_macro_regime(df_daily):
-    sma200 = df_daily['Close'].rolling(200).mean()
-    macro_regime = np.where(df_daily['Close'] > sma200, 1, -1)
-    df_daily['macro_regime'] = macro_regime
-    return df_daily[['macro_regime']]
 
-# ==============================
-# ⚙️ 动态参数生成器
-# ==============================
-def generate_dynamic_params(df):
-    vol = df['Close'].pct_change().std() * np.sqrt(365)
-    return {
-        'donchian_period': int(20 * (1 + vol)),
-        'chandelier_mult': round(2.5 * (1 + vol), 2),
-        'bb_std': round(2 * (1 + vol / 2), 2),
-        'max_risk_pct': min(0.03 * (1 + vol), 0.05)
-    }
+# ---------------------------
+# fetch_binance_klines（稳健版）
+# ---------------------------
+def fetch_binance_klines(
+    symbol: str,
+    interval: str,
+    start_str: str,
+    end_str: str = None,
+    limit: int = 1000,
+) -> pd.DataFrame:
+    url = "https://api.binance.com/api/v3/klines"
+    columns = [
+        "timestamp",
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+        "close_time",
+        "quote_asset_volume",
+        "number_of_trades",
+        "taker_buy_base_volume",
+        "taker_buy_quote_volume",
+        "ignore",
+    ]
+    start_ts = int(pd.to_datetime(start_str).timestamp() * 1000)
+    end_ts = (
+        int(pd.to_datetime(end_str).timestamp() * 1000)
+        if end_str
+        else int(time.time() * 1000)
+    )
+    all_data = []
+    retries = 5
 
-# ==============================
-# 💹 宏观风险权重引擎
-# ==============================
-def calculate_macro_risk_weight(macro_regime, asset_volatility, equity_curve):
-    base_weight = 1.2 if macro_regime == 1 else 0.7
-    vol_factor = 1 / (1 + np.log1p(asset_volatility * 10))
-    perf_factor = 1.0
-    if len(equity_curve) > 20:
-        slope = np.polyfit(range(20), equity_curve[-20:], 1)[0]
-        perf_factor = 1.1 if slope > 0 else 0.9
-    weight = base_weight * vol_factor * perf_factor
-    return np.clip(weight, 0.5, 1.5)
+    while start_ts < end_ts:
+        params = {
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "startTime": start_ts,
+            "endTime": end_ts,
+            "limit": limit,
+        }
+        for attempt in range(retries):
+            try:
+                response = requests.get(url, params=params, timeout=20)
+                response.raise_for_status()
+                data = response.json()
+                if not data:
+                    start_ts = end_ts
+                    break
+                all_data.extend(data)
+                start_ts = data[-1][0] + 1
+                break
+            except Exception as e:
+                wait = 2**attempt
+                logger.warning(f"请求失败: {e}，{wait}s后重试...")
+                time.sleep(wait)
+        else:
+            logger.error("多次重试后仍无法获取数据，终止。")
+            break
 
-class MacroRiskManager:
-    def __init__(self, max_total_risk=0.05):
-        self.max_total_risk = max_total_risk
+    if not all_data:
+        logger.error("未获取到任何数据。")
+        return pd.DataFrame()
 
-    def allocate(self, strategies, macro_regime, vol_dict, equity_curve):
-        weights = {}
-        macro_weight = calculate_macro_risk_weight(macro_regime, np.mean(list(vol_dict.values())), equity_curve)
-        for name, vol in vol_dict.items():
-            risk_unit = (1 / (1 + vol)) / len(strategies)
-            weights[name] = risk_unit * macro_weight
-        total = sum(weights.values())
-        return {k: v / total * self.max_total_risk for k, v in weights.items()}
+    df = pd.DataFrame(all_data, columns=columns)
+    df = df[["timestamp", "Open", "High", "Low", "Close", "Volume"]].copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df.set_index("timestamp", inplace=True)
+    df.sort_index(inplace=True)
+    logger.info(
+        f"✅ 获取 {symbol} 数据成功：{len(df)} 条，从 {df.index[0]} 到 {df.index[-1]}"
+    )
+    return df
 
-# ==============================
-# 📈 策略定义
-# ==============================
-class FilteredTF_MR(Strategy):
+
+# ---------------------------
+# 技术指标（直接返回 pd.Series，更高效）
+# ---------------------------
+def ema(s: pd.Series, span: int):
+    return s.ewm(span=span, adjust=False).mean()
+
+
+def rsi(s: pd.Series, period: int = 14):
+    delta = s.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    ma_up = up.rolling(period).mean()
+    ma_down = down.rolling(period).mean()
+    rs = ma_up / (ma_down + 1e-12)
+    return 100 - (100 / (1 + rs))
+
+
+def atr(high, low, close, period=14):
+    tr0 = high - low
+    tr1 = abs(high - close.shift())
+    tr2 = abs(low - close.shift())
+    tr = pd.concat([tr0, tr1, tr2], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def adx(high, low, close, period=14):
+    plus_dm = high.diff()
+    minus_dm = low.diff()
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0)
+    tr = pd.concat(
+        [high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1
+    ).max(axis=1)
+
+    atr_val = tr.rolling(period).mean()
+    plus_di = 100 * pd.Series(plus_dm).rolling(period).sum() / atr_val
+    minus_di = 100 * pd.Series(minus_dm).rolling(period).sum() / atr_val
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12)) * 100
+    return dx.rolling(period).mean()
+
+
+# ---------------------------
+# 改进版 EMA + RSI 策略（V2）
+# ---------------------------
+class EMA_RSI_Strategy_V2(Strategy):
+    # --- 参数配置 ---
+    ema_fast = 10
+    ema_slow = 25
+    rsi_period = 14
+    rsi_oversold_base = 35
+    rsi_overbought_base = 65
+    atr_period = 14
+    adx_period = 14
+    adx_threshold = 20  # 只有ADX > 20才认为有趋势
+
+    size_fraction = 0.95
+    stop_loss_atr_multiplier = 1.5
+    take_profit_atr_multiplier = 2.0
+
+    min_bars_between_entries = 5
+
     def init(self):
-        self.macro_regime = self.data.macro_regime
-        self.equity_curve = []
+        close = pd.Series(self.data.Close)
+        high = pd.Series(self.data.High)
+        low = pd.Series(self.data.Low)
+
+        self.ema_fast_v = self.I(ema, close, self.ema_fast)
+        self.ema_slow_v = self.I(ema, close, self.ema_slow)
+        self.rsi_v = self.I(rsi, close, self.rsi_period)
+        self.atr_v = self.I(atr, high, low, close, self.atr_period)
+        self.adx_v = self.I(adx, high, low, close, self.adx_period)
+
+        self._last_entry_bar = -9999
+        self._log_trades = True  # 开启交易日志
+
+    def _bars_since_last_entry(self):
+        return len(self.data) - 1 - self._last_entry_bar
 
     def next(self):
         price = self.data.Close[-1]
-        atr = self.I(talib.ATR, self.data.High, self.data.Low, self.data.Close, timeperiod=14)[-1]
-        macro_regime = int(self.macro_regime[-1])
-        self.equity_curve.append(self.equity)
-        risk = self._calculate_dynamic_risk(atr, macro_regime)
+        ef = self.ema_fast_v[-1]
+        es = self.ema_slow_v[-1]
+        r = self.rsi_v[-1]
+        atr = self.atr_v[-1]
+        adx = self.adx_v[-1]
 
-        # 策略方向过滤
-        sma_fast = self.I(talib.SMA, self.data.Close, 20)
-        sma_slow = self.I(talib.SMA, self.data.Close, 50)
+        # --- 动态RSI阈值（波动大时放宽）---
+        rsi_oversold = self.rsi_oversold_base - (atr / price * 100)
+        rsi_overbought = self.rsi_overbought_base + (atr / price * 100)
 
-        if crossover(sma_fast, sma_slow) and macro_regime == 1:
-            self.buy(size=self._calc_size(risk))
-        elif crossover(sma_slow, sma_fast) and macro_regime == -1:
-            self.sell(size=self._calc_size(risk))
+        # --- 趋势判断 ---
+        uptrend = ef > es
+        downtrend = ef < es
 
-    def _calc_size(self, risk):
-        return max(int(self.equity * risk / self.data.Close[-1]), 1)
+        # --- 仅在趋势明确时交易 ---
+        strong_trend = adx > self.adx_threshold
 
-    def _calculate_dynamic_risk(self, current_volatility, macro_regime):
-        base_risk = min(0.02, 1.0 / np.sqrt(1 + current_volatility))
-        weight = calculate_macro_risk_weight(macro_regime, current_volatility, self.equity_curve)
-        return base_risk * weight
+        enter_long = (
+            crossover(self.ema_fast_v, self.ema_slow_v)
+            and r <= rsi_oversold
+            and uptrend
+            and strong_trend
+        )
+        exit_long = (not uptrend) or (r >= self.rsi_overbought_base)
 
-# ==============================
-# 📉 宏观风险热力图
-# ==============================
-def plot_macro_risk_heatmap(df):
-    fig = px.imshow(
-        df[['macro_regime', 'macro_risk_weight']],
-        color_continuous_scale='RdYlGn',
-        title='📊 Macro Regime & Risk Heatmap'
-    )
-    fig.update_xaxes(title='Time')
-    fig.update_yaxes(title='Indicator')
-    fig.show()
+        enter_short = (
+            crossover(self.ema_slow_v, self.ema_fast_v)
+            and r >= rsi_overbought
+            and downtrend
+            and strong_trend
+        )
+        exit_short = (not downtrend) or (r <= self.rsi_oversold_base)
 
-# ==============================
-# 🚀 主回测流程
-# ==============================
-def run_backtest(symbol, df_4h, df_1d):
-    logger.info(f"开始运行 {symbol} 回测...")
+        # --- 交易间隔控制 ---
+        if self._bars_since_last_entry() < self.min_bars_between_entries:
+            enter_long = False
+            enter_short = False
 
-    # 宏观状态同步
-    df_macro = compute_macro_regime(df_1d)
-    df_4h = df_4h.join(df_macro, how='left').ffill()
+        # --- 平仓逻辑 ---
+        if self.position:
+            if self.position.is_long and exit_long:
+                self.position.close()
+            elif self.position.is_short and exit_short:
+                self.position.close()
 
-    # 计算动态参数
-    params = generate_dynamic_params(df_4h)
-    vol = df_4h['Close'].pct_change().std() * np.sqrt(365)
+        # --- 开仓逻辑 ---
+        if not self.position:
+            if enter_long:
+                sl = price - self.stop_loss_atr_multiplier * atr
+                tp = price + self.take_profit_atr_multiplier * atr
+                self.buy(size=self.size_fraction, sl=sl, tp=tp)
+                self._last_entry_bar = len(self.data) - 1
+                if self._log_trades:
+                    logger.info(
+                        f"{self.data.index[-1]} | LONG  @ {price:.2f} | SL={sl:.2f} | TP={tp:.2f}"
+                    )
 
-    # 初始化风险管理器
-    risk_manager = MacroRiskManager(max_total_risk=0.05)
-    vol_dict = {symbol: vol}
-    equity_curve = np.linspace(10000, 12000, len(df_4h))  # 模拟权益曲线
-    risk_allocation = risk_manager.allocate([symbol], df_4h['macro_regime'].iloc[-1], vol_dict, equity_curve)
-    df_4h['macro_risk_weight'] = calculate_macro_risk_weight(df_4h['macro_regime'].iloc[-1], vol, equity_curve)
+            elif enter_short:
+                sl = price + self.stop_loss_atr_multiplier * atr
+                tp = price - self.take_profit_atr_multiplier * atr
+                self.sell(size=self.size_fraction, sl=sl, tp=tp)
+                self._last_entry_bar = len(self.data) - 1
+                if self._log_trades:
+                    logger.info(
+                        f"{self.data.index[-1]} | SHORT @ {price:.2f} | SL={sl:.2f} | TP={tp:.2f}"
+                    )
 
-    # 回测
-    bt = Backtest(df_4h, FilteredTF_MR, cash=10000, commission=0.001)
-    stats = bt.run()
-    logger.info(f"{symbol} 回测完成，年化收益率: {stats['Return [%]']:.2f}%")
 
-    plot_macro_risk_heatmap(df_4h.tail(200))
-    return stats, df_4h, risk_allocation
-
-# ==============================
-# 🧪 示例运行（请替换为真实数据）
-# ==============================
+# ---------------------------
+# 主函数示例
+# ---------------------------
 if __name__ == "__main__":
-    logger.info(">>> 启动 V38.1 宏观风险加权引擎")
+    SYMBOL = "ETHUSDT"
+    INTERVAL = "1m"
+    START = "2024-01-01"
+    END = "2024-02-28"
 
-    # 模拟数据 (你可替换为 Binance 抓取数据)
-    np.random.seed(42)
-    dates = pd.date_range("2023-01-01", periods=800, freq="4H")
-    df_4h = pd.DataFrame({
-        "Open": np.random.rand(len(dates)) * 100 + 20000,
-        "High": np.random.rand(len(dates)) * 100 + 20100,
-        "Low": np.random.rand(len(dates)) * 100 + 19900,
-        "Close": np.random.rand(len(dates)) * 100 + 20000,
-        "Volume": np.random.rand(len(dates)) * 10
-    }, index=dates)
-    df_1d = df_4h.resample('1D').agg({'Open':'first','High':'max','Low':'min','Close':'last'})
+    # 参数配置
+    strat_params = {
+        "ema_fast": 10,
+        "ema_slow": 25,
+        "rsi_period": 14,
+        "rsi_oversold_base": 40,
+        "rsi_overbought_base": 60,
+        "adx_threshold": 20,
+        "stop_loss_atr_multiplier": 1.5,
+        "take_profit_atr_multiplier": 2.0,
+        "min_bars_between_entries": 5,
+        "size_fraction": 0.95,
+    }
 
-    stats, df_risk, alloc = run_backtest("BTC/USDT", df_4h, df_1d)
+    # 获取数据
+    df = fetch_binance_klines(SYMBOL, INTERVAL, START, END)
+    if df.empty:
+        raise RuntimeError("无法获取数据")
+
+    # 运行回测
+    bt = Backtest(
+        df,
+        EMA_RSI_Strategy_V2,
+        cash=10_000,
+        commission=0.0004,
+        margin=0.05,  # 20x leverage
+        trade_on_close=True,
+        exclusive_orders=True,
+    )
+
+    # 执行回测
+    stats = bt.run(**strat_params)
     print(stats)
-    print("风险分配:", alloc)
+
+    # 绘图
+    bt.plot(filename="EMA_RSI_Strategy_V2.html", open_browser=False)
+
+    # 可选：参数热力图优化
+    # params_grid = {
+    #     'ema_fast': range(8, 16, 2),
+    #     'ema_slow': range(20, 31, 5),
+    #     'rsi_period': [10, 14],
+    #     'adx_threshold': [15, 20, 25]
+    # }
+    # heatmap_stats, _ = bt.optimize(**params_grid, maximize='Equity Final [$]', return_heatmap=True)
+    # plot_heatmaps(heatmap_stats, filename="heatmap.html")

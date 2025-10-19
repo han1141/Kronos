@@ -100,14 +100,14 @@ def setup_csv_logger(name, log_file, fields):
 # --- 全局配置 (与第一个版本相同) ---
 REST_BASE = "https://www.okx.com"
 SYMBOLS = ["ETH-USDT-SWAP"]
-KLINE_INTERVAL = "1m"  # 可根据需要调整为 '15m' 等
+KLINE_INTERVAL = "15m"  # 可根据需要调整为 '15m' 等
 DESIRED_LEVERAGE = "20"
 HISTORY_LIMIT = 500
 POLL_INTERVAL_SECONDS = 20
 SIMULATED = True
 SIMULATED_EQUITY_START = 500000.0
 SCHEDULED_EXIT_ENABLED = False
-EXIT_TIME_UTC = "22:30"
+EXIT_TIME_UTC = "20:00"
 TSL_ENABLED = True
 TSL_ACTIVATION_ATR_MULT = 1.5
 TSL_TRAILING_ATR_MULT = 2.0

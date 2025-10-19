@@ -72,11 +72,11 @@ set_chinese_font()
 # --- 全局配置 ---
 CONFIG = {
     "symbols_to_test": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-    "interval": "4h",
-    "start_date": "2020-01-01",  # 恢复长周期回测以验证新框架的有效性
-    "end_date": "2025-10-08",
+    "interval": "30m",
+    "start_date": "2025-10-01",  # 恢复长周期回测以验证新框架的有效性
+    "end_date": "2025-10-16",
     "initial_cash": 500_000,
-    "commission": 0.0002,
+    "commission": 0.001,
     "spread": 0.0005,
     "run_monte_carlo": True,
     "show_plots": False,

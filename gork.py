@@ -67,11 +67,11 @@ import ta
 # --- 全局配置 ---
 CONFIG = {
     "symbols_to_test": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-    "interval": "1h",
-    "start_date": "2025-01-01",
-    "end_date": "2025-10-08",
+    "interval": "15m",
+    "start_date": "2025-10-01",
+    "end_date": "2025-10-16",
     "initial_cash": 500_000,
-    "commission": 0.0002,
+    "commission": 0.001,
     "spread": 0.0005,  # 滑点模拟 (0.05%)
     "run_monte_carlo": True,
     "show_plots": False,  # 确保不打开HTML界面
