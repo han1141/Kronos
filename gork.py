@@ -64,12 +64,12 @@ from backtesting import Backtest, Strategy
 from backtesting.lib import crossover
 import ta
 
-# --- 全局配置 ---
+# --- 全局配置 ---  "BTCUSDT", "ETHUSDT", "SOLUSDT"
 CONFIG = {
-    "symbols_to_test": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-    "interval": "15m",
+    "symbols_to_test": ["ETHUSDT"],
+    "interval": "1m",
     "start_date": "2025-10-01",
-    "end_date": "2025-10-16",
+    "end_date": "2025-10-15",
     "initial_cash": 500_000,
     "commission": 0.001,
     "spread": 0.0005,  # 滑点模拟 (0.05%)
@@ -132,8 +132,8 @@ STRATEGY_PARAMS = {
 
 # --- 资产个性化配置中心 ---
 ASSET_SPECIFIC_OVERRIDES = {
-    "BTCUSDT": {"regime_score_threshold": 0.45},
-    "SOLUSDT": {"regime_score_threshold": 0.45},
+    "BTCUSDT": {},
+    "SOLUSDT": {},
     "ETHUSDT": {},
 }
 
@@ -571,14 +571,7 @@ def run_monte_carlo(trades_df, initial_cash, symbol: str, n_simulations=1000):
         "5% VaR Equity": [f"${var_5_pct:,.2f}"],
         "95% Best Case Equity": [f"${best_95_pct:,.2f}"],
     }
-    results_df = pd.DataFrame(results_data)
-    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"monte_carlo_results_{symbol}_{timestamp_str}.csv"
-    try:
-        results_df.to_csv(filename, index=False, encoding="utf-8-sig")
-        logger.info(f"💾 蒙特卡洛模拟结果已保存至: {filename}")
-    except Exception as e:
-        logger.error(f"保存蒙特卡洛CSV文件时出错: {e}")
+    pd.DataFrame(results_data)
 
 
 def generate_dynamic_params(volatility: float, baseline_vol: float) -> dict:
