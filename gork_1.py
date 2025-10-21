@@ -67,7 +67,7 @@ import ta
 # --- 全局配置 ---
 CONFIG = {
     "symbols_to_test": ["ETHUSDT"],
-    "interval": "1m",
+    "interval": "5m",
     "start_date": "2025-08-01",
     "end_date": "2025-10-19",
     "initial_cash": 500_000,

@@ -69,12 +69,12 @@ def set_chinese_font():
 set_chinese_font()
 
 
-# --- 全局配置 ---
+# --- 全局配置 ---  "BTCUSDT", "ETHUSDT", "SOLUSDT"
 CONFIG = {
-    "symbols_to_test": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-    "interval": "30m",
-    "start_date": "2025-10-01",  # 恢复长周期回测以验证新框架的有效性
-    "end_date": "2025-10-16",
+    "symbols_to_test": ["ETHUSDT"],
+    "interval": "15m",
+    "start_date": "2025-08-01",  # 恢复长周期回测以验证新框架的有效性
+    "end_date": "2025-10-19",
     "initial_cash": 500_000,
     "commission": 0.001,
     "spread": 0.0005,

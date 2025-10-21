@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Kronos V50.1 — 模块化开关版
+Kronos V51.0 — XGBoost 核心版 (The Final Cut)
 功能摘要：
-- 新增功能: 在 CONFIG 中添加 "use_lstm_model" 开关，可一键启用或禁用 LSTM 模型。
-- 逻辑优化: main 函数会根据开关跳过 LSTM 训练、强制设定模型权重为 (0, 1)。
-- 性能优化: 策略类在预测时会检查 LSTM 权重，如果为0则跳过其预测，节省计算资源。
-- 继承 V50.0 的所有修复。
+- 终极简化: 完全移除 LSTM 模型和所有相关的 TensorFlow/Keras 依赖，使代码更轻量、更专注。
+- 核心聚焦: 策略现在完全由表现更优的 XGBoost 模型驱动，消除了模型融合的复杂性。
+- 代码清理: 删除了所有不再使用的函数、参数和逻辑，提高了代码的可读性和维护性。
+- 这是我们共同调试和优化之旅的最终、最精炼的版本。
 """
 import os
 import sys
@@ -21,23 +21,16 @@ import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
-# ML libs
+# ML libs - V51.0: Removed TensorFlow/Keras
 try:
     import xgboost as xgb
     from sklearn.preprocessing import RobustScaler
     from sklearn.metrics import accuracy_score
-    import tensorflow as tf
-    from tensorflow.keras.models import Sequential, load_model
-    from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
-    from tensorflow.keras.callbacks import EarlyStopping
-    from tensorflow.keras.regularizers import l2
 
     ML_LIBS = True
 except Exception as e:
     ML_LIBS = False
-    print(
-        "警告: 部分 ML 库不可用 (xgboost/tensorflow/scikit-learn)。ML模块将被跳过。", e
-    )
+    print("警告: 核心 ML 库 xgboost/scikit-learn 不可用。ML模块将被跳过。", e)
 
 # Backtest libs
 try:
@@ -67,20 +60,16 @@ CONFIG = {
     "initial_cash": 500_000,
     "commission": 0.001,
     "spread": 0.0005,
-    "show_plots": False,
-    "training_window_days": 365 * 1.5,
+    "show_plots": True,
+    "training_window_days": 180,
     "ml_training_gap_days": 90,
-    "use_pretrained_models": False,
     "model_dir": "models",
     "data_cache": "data_cache",
-    "train_once": False,
     "enabled_modules": {
         "trend_following": True,
         "mean_reversion": True,
         "ml_filter": True,
-        "lpr_mode": True,
     },
-    "use_lstm_model": False,  # V50.1 新增: 是否启用 LSTM 模型的开关
 }
 
 # --- STRATEGY_PARAMS ---
@@ -110,17 +99,11 @@ STRATEGY_PARAMS = {
     "mr_risk_multiplier": 0.8,
     "mr_take_profit_rr": 1.5,
     "ml_filter_enabled": True,
-    "lstm_sequence_length": 10,
-    "lstm_epochs": 12,
-    "lstm_batch_size": 128,
-    "lstm_l2_reg": 0.001,
-    "xgb_nrounds": 60,
+    "xgb_nrounds": 80,
     "xgb_gamma": 2.5,
     "xgb_lambda": 25.0,
     "xgb_alpha": 8.0,
-    "ensemble_w_lstm": 0.5,
-    "ensemble_w_xgb": 0.5,
-    "ml_confidence_threshold": 0.65,
+    "ml_confidence_threshold": 0.75,
     "label_look_forward": 180,
     "label_risk_reward_ratio": 1.8,
     "label_sl_atr_multiplier_base": 1.5,
@@ -139,7 +122,7 @@ SELECTED_FEATURES = [
 ]
 
 
-# --- (Utilities and Feature Engineering functions are unchanged from V50.0) ---
+# --- (Utilities and Feature Engineering functions are unchanged) ---
 def set_chinese_font():
     try:
         import matplotlib.font_manager as fm
@@ -407,17 +390,7 @@ def make_asymmetric_labels(df: pd.DataFrame) -> pd.Series:
     return labels
 
 
-def create_sequences(X, y, seq_len):
-    Xs, ys = [], []
-    for i in range(len(X) - seq_len):
-        Xs.append(X[i : i + seq_len])
-        ys.append(y[i + seq_len])
-    return np.array(Xs), np.array(ys)
-
-
 def safe_load_scaler(path, expected_dim):
-    from sklearn.preprocessing import RobustScaler
-
     if not os.path.exists(path):
         return RobustScaler()
     try:
@@ -431,75 +404,6 @@ def safe_load_scaler(path, expected_dim):
     except Exception as e:
         logger.warning(f"加载 scaler 失败 ({e})，将创建新 scaler。")
         return RobustScaler()
-
-
-def train_and_save_lstm(training_df, symbol, seq_len, epochs, batch_size):
-    logger.info(f"[LSTM] 为 {symbol} 训练 LSTM...")
-    split = int(len(training_df) * 0.8)
-    train_df, test_df = training_df.iloc[:split].copy(), training_df.iloc[split:].copy()
-    labels_train, labels_test = make_asymmetric_labels(
-        train_df
-    ), make_asymmetric_labels(test_df)
-    df_train, df_test = train_df.join(labels_train.rename("target")).dropna(
-        subset=["target"]
-    ), test_df.join(labels_test.rename("target")).dropna(subset=["target"])
-    if df_train.empty or df_test.empty:
-        logger.warning(f"[{symbol}] LSTM: 标签不足，跳过。")
-        return None
-    df_train.loc[:, "target"], df_test.loc[:, "target"] = df_train["target"].astype(
-        int
-    ), df_test["target"].astype(int)
-    features = SELECTED_FEATURES
-    X_train_df, y_train = df_train[features], df_train["target"].values
-    X_test_df, y_test = df_test[features], df_test["target"].values
-    scaler_path = os.path.join(CONFIG["model_dir"], f"lstm_scaler_{symbol}.pkl")
-    scaler = safe_load_scaler(scaler_path, X_train_df.shape[1])
-    scaler.fit(X_train_df)
-    X_train_s, X_test_s = scaler.transform(X_train_df), scaler.transform(X_test_df)
-    joblib.dump(scaler, scaler_path)
-    X_train_seq, y_train_seq = create_sequences(X_train_s, y_train, seq_len)
-    X_test_seq, y_test_seq = create_sequences(X_test_s, y_test, seq_len)
-    if len(X_train_seq) == 0 or np.unique(y_train_seq).size < 2:
-        logger.warning(f"[{symbol}] LSTM: 序列或类别不足，跳过。")
-        return None
-    unique, counts = np.unique(y_train_seq, return_counts=True)
-    class_weight = (
-        {int(unique[i]): counts.sum() / (2.0 * counts[i]) for i in range(len(unique))}
-        if len(unique) == 2
-        else None
-    )
-    l2_reg = STRATEGY_PARAMS.get("lstm_l2_reg", 0.001)
-    model = Sequential(
-        [
-            Input(shape=(seq_len, X_train_seq.shape[2])),
-            LSTM(
-                32, kernel_regularizer=l2(l2_reg), dropout=0.5, recurrent_dropout=0.25
-            ),
-            Dropout(0.4),
-            Dense(16, activation="relu", kernel_regularizer=l2(l2_reg)),
-            Dense(1, activation="sigmoid"),
-        ]
-    )
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005),
-        loss="binary_crossentropy",
-        metrics=["accuracy"],
-    )
-    es = EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
-    model.fit(
-        X_train_seq,
-        y_train_seq,
-        validation_data=(X_test_seq, y_test_seq),
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=[es],
-        verbose=0,
-        class_weight=class_weight,
-    )
-    loss, acc = model.evaluate(X_test_seq, y_test_seq, verbose=0)
-    logger.info(f"[LSTM] {symbol} OOS acc={acc:.4f}")
-    model.save(os.path.join(CONFIG["model_dir"], f"lstm_model_{symbol}.keras"))
-    return acc
 
 
 def train_and_save_xgb(training_df, symbol):
@@ -549,7 +453,8 @@ def train_and_save_xgb(training_df, symbol):
     return acc
 
 
-def analyze_trade_distribution(trades_df, filename="trade_dist_v50.1.png"):
+# --- Strategy Class ---
+def analyze_trade_distribution(trades_df, filename="trade_dist_v51.0.png"):
     if trades_df.empty:
         logger.info("无交易，跳过交易分布图。")
         return
@@ -572,36 +477,16 @@ def analyze_trade_distribution(trades_df, filename="trade_dist_v50.1.png"):
     logger.info(f"保存交易分布: {filename}")
 
 
-class BaseAssetStrategy:
-    def __init__(self, main_strategy: Strategy):
-        self.main = main_strategy
-
-    def _define_mr_entry_signal(self) -> int:
-        m = self.main
-        is_long = (
-            crossover(m.data.Close, m.mr_bb_lower) and m.mr_rsi[-1] < m.mr_rsi_oversold
-        )
-        is_short = (
-            crossover(m.mr_bb_upper, m.data.Close)
-            and m.mr_rsi[-1] > m.mr_rsi_overbought
-        )
-        return 1 if is_long else -1 if is_short else 0
-
-
 class UltimateStrategy(Strategy):
     symbol = None
-    w_lstm = 0.5
-    w_xgb = 0.5
     enabled_modules = {}
 
     def init(self, **kwargs):
         self.symbol = kwargs.get("symbol", None) or getattr(self, "symbol", None)
-        self.w_lstm, self.w_xgb = kwargs.get("w_lstm", 0.5), kwargs.get("w_xgb", 0.5)
         for k, v in STRATEGY_PARAMS.items():
             setattr(self, k, v)
         self.vol_weight = getattr(self, "vol_weight", 1.0)
         self.enabled_modules = CONFIG.get("enabled_modules", {})
-        self.asset_strategy = BaseAssetStrategy(self)
         c, h, l = (
             pd.Series(self.data.Close),
             pd.Series(self.data.High),
@@ -626,14 +511,7 @@ class UltimateStrategy(Strategy):
             lambda: ta.momentum.RSIIndicator(c, self.mr_rsi_period).rsi(), plot=False
         )
         self.reset_trade_state()
-        self.lstm, self.xgb, self.lstm_scaler, self.xgb_scaler = None, None, None, None
-        try:
-            self.lstm = load_model(
-                os.path.join(CONFIG["model_dir"], f"lstm_model_{self.symbol}.keras")
-            )
-            logger.info(f"[{self.symbol}] LSTM 模型加载成功。")
-        except:
-            logger.debug(f"[{self.symbol}] 无 LSTM 模型。")
+        self.xgb, self.xgb_scaler = None, None
         try:
             self.xgb = joblib.load(
                 os.path.join(CONFIG["model_dir"], f"xgb_model_{self.symbol}.joblib")
@@ -641,12 +519,6 @@ class UltimateStrategy(Strategy):
             logger.info(f"[{self.symbol}] XGB 模型加载成功。")
         except:
             logger.debug(f"[{self.symbol}] 无 XGB 模型。")
-        try:
-            self.lstm_scaler = joblib.load(
-                os.path.join(CONFIG["model_dir"], f"lstm_scaler_{self.symbol}.pkl")
-            )
-        except:
-            self.lstm_scaler = None
         try:
             self.xgb_scaler = joblib.load(
                 os.path.join(CONFIG["model_dir"], f"xgb_scaler_{self.symbol}.pkl")
@@ -669,45 +541,43 @@ class UltimateStrategy(Strategy):
                 self.run_mean_reversion_entry(self.data.Close[-1])
 
     def run_scoring_system_entry(self, price):
-        if not all([self.lstm_scaler, self.xgb, self.xgb_scaler]):
+        if not all([self.xgb, self.xgb_scaler]):
             return
-        prob_lstm, prob_xgb = 0.5, 0.5
-        features = SELECTED_FEATURES
-        if self.w_lstm > 0 and self.lstm:
-            if len(self.data.df) >= self.lstm_sequence_length:
-                seq_df = self.data.df[features].iloc[-self.lstm_sequence_length :]
-                if not seq_df.isna().any().any():
-                    scaled_seq = self.lstm_scaler.transform(seq_df)
-                    prob_lstm = float(
-                        self.lstm.predict(np.expand_dims(scaled_seq, 0), verbose=0)[0][
-                            0
-                        ]
-                    )
-        current_features_df = self.data.df[features].iloc[-1:].copy()
-        if not current_features_df.isna().any().any():
-            scaled_features = self.xgb_scaler.transform(current_features_df)
-            prob_xgb = float(self.xgb.predict_proba(scaled_features)[0, 1])
-        ensemble_prob = self.w_lstm * prob_lstm + self.w_xgb * prob_xgb
+        current_features_df = self.data.df[SELECTED_FEATURES].iloc[-1:].copy()
+        if current_features_df.isna().any().any():
+            return
+        scaled_features = self.xgb_scaler.transform(current_features_df)
+        prob_xgb = float(self.xgb.predict_proba(scaled_features)[0, 1])
         is_long_safe, is_short_safe = (
             price > self.tf_ema_fast[-1],
             price < self.tf_ema_fast[-1],
         )
         if (
             self.mtf_signal[-1] == 1
-            and ensemble_prob > self.ml_confidence_threshold
+            and prob_xgb > self.ml_confidence_threshold
             and is_long_safe
         ):
             self.open_tf_position(price, is_long=True, confidence_factor=1.0)
         elif (
             self.mtf_signal[-1] == -1
-            and (1 - ensemble_prob) > self.ml_confidence_threshold
+            and (1 - prob_xgb) > self.ml_confidence_threshold
             and is_short_safe
         ):
             self.open_tf_position(price, is_long=False, confidence_factor=1.0)
 
     def run_mean_reversion_entry(self, price):
-        signal = BaseAssetStrategy(self)._define_mr_entry_signal()
-        (self.open_mr_position(price, is_long=(signal > 0)) if signal != 0 else None)
+        m = self
+        is_long = (
+            crossover(m.data.Close, m.mr_bb_lower) and m.mr_rsi[-1] < m.mr_rsi_oversold
+        )
+        is_short = (
+            crossover(m.mr_bb_upper, m.data.Close)
+            and m.mr_rsi[-1] > m.mr_rsi_overbought
+        )
+        if is_long:
+            self.open_mr_position(price, True)
+        elif is_short:
+            self.open_mr_position(price, False)
 
     def open_mr_position(self, price, is_long):
         risk_per_share = (
@@ -754,9 +624,7 @@ class UltimateStrategy(Strategy):
             self.mr_stop_loss,
             self.mr_take_profit,
             self.tf_initial_stop_loss,
-            self.lpr_is_active,
-            self.lpr_trailing_stop,
-        ) = (None, 0.0, 0.0, float("inf"), 0.0, 0.0, 0.0, False, 0.0)
+        ) = (None, 0.0, 0.0, float("inf"), 0.0, 0.0, 0.0)
 
     def manage_open_position(self, price):
         if self.active_sub_strategy == "TF":
@@ -856,16 +724,16 @@ def main():
     ensure_dirs()
     backtest_start_dt = pd.to_datetime(CONFIG["backtest_start_date"], utc=True)
     backtest_end_dt = pd.to_datetime(CONFIG["backtest_end_date"], utc=True)
-    if CONFIG.get("use_pretrained_models", False):
-        overall_start_date = backtest_start_dt - timedelta(days=15)
-    else:
-        training_window = timedelta(days=CONFIG["training_window_days"])
-        first_training_start = (
-            backtest_start_dt
-            - timedelta(days=CONFIG["ml_training_gap_days"])
-            - training_window
-        )
-        overall_start_date = first_training_start
+    if "training_window_days" not in CONFIG:
+        logger.error("CONFIG 中缺少 'training_window_days'")
+        return
+    training_window = timedelta(days=CONFIG["training_window_days"])
+    first_training_start = (
+        backtest_start_dt
+        - timedelta(days=CONFIG["ml_training_gap_days"])
+        - training_window
+    )
+    overall_start_date = first_training_start
     mtf_warmup_days = 60
     data_fetch_start_date = overall_start_date - timedelta(days=mtf_warmup_days)
     logger.info(
@@ -900,7 +768,10 @@ def main():
     featured_data = add_all_features(symbol_data_effective)
 
     logger.info(
-        "\n" + "#" * 80 + "\n                 模式: 单次训练与回测\n" + "#" * 80
+        "\n"
+        + "#" * 80
+        + "\n                 模式: 单次训练与回测 (XGBoost Only)\n"
+        + "#" * 80
     )
     training_end_dt = backtest_start_dt - timedelta(days=CONFIG["ml_training_gap_days"])
     logger.info(
@@ -908,41 +779,13 @@ def main():
     )
     training_slice = featured_data.loc[:training_end_dt]
 
-    model_weights = (
-        STRATEGY_PARAMS["ensemble_w_lstm"],
-        STRATEGY_PARAMS["ensemble_w_xgb"],
-    )
     if (
         STRATEGY_PARAMS["ml_filter_enabled"]
         and CONFIG["enabled_modules"].get("ml_filter", False)
         and ML_LIBS
     ):
         if len(training_slice) > 1000:
-            acc_lstm = None
-            if CONFIG.get("use_lstm_model", True):
-                acc_lstm = train_and_save_lstm(
-                    training_slice,
-                    symbol,
-                    STRATEGY_PARAMS["lstm_sequence_length"],
-                    STRATEGY_PARAMS["lstm_epochs"],
-                    STRATEGY_PARAMS["lstm_batch_size"],
-                )
-            acc_xgb = train_and_save_xgb(training_slice, symbol)
-
-            if not CONFIG.get("use_lstm_model", True):
-                logger.info("LSTM 模型已被禁用。权重强制设置为: LSTM=0.0, XGB=1.0")
-                model_weights = (0.0, 1.0)
-            elif (
-                acc_lstm is not None
-                and acc_xgb is not None
-                and (acc_lstm + acc_xgb > 0)
-            ):
-                w_lstm = acc_lstm / (acc_lstm + acc_xgb)
-                w_xgb = 1 - w_lstm
-                model_weights = (w_lstm, w_xgb)
-                logger.info(
-                    f"[{symbol}] 自适应权重: LSTM={w_lstm:.2f}, XGB={w_xgb:.2f}"
-                )
+            train_and_save_xgb(training_slice, symbol)
         else:
             logger.warning(f"[{symbol}] 训练数据不足，跳过本次训练。")
 
@@ -962,7 +805,7 @@ def main():
         finalize_trades=True,
     )
     try:
-        stats = bt.run(symbol=symbol, w_lstm=model_weights[0], w_xgb=model_weights[1])
+        stats = bt.run(symbol=symbol)
         logger.info("回测完成，生成最终报告...")
         print(stats)
         if "_trades" in stats and not stats["_trades"].empty:
@@ -976,18 +819,88 @@ def main():
             logger.info(f"胜率: {stats['Win Rate [%]']:.2f}%")
             logger.info(f"盈亏因子: {stats['Profit Factor']:.2f}")
             if CONFIG["show_plots"]:
-                bt.plot(filename="backtest_v50.1.html", open_browser=False)
-                logger.info("保存详细回测图: backtest_v50.1.html")
+                bt.plot(filename="backtest_v51.0.html", open_browser=False)
+                logger.info("保存详细回测图: backtest_v51.0.html")
                 analyze_trade_distribution(
-                    stats["_trades"], filename="trade_dist_v50.1.png"
+                    stats["_trades"], filename="trade_dist_v51.0.png"
                 )
         else:
             logger.info("整个回测期间没有产生任何交易。")
     except Exception as e:
         logger.error(f"回测期间出现严重错误: {e}", exc_info=True)
 
-    logger.info("🚀 V50.1 运行结束。")
+    logger.info("🚀 V51.0 运行结束。")
 
 
 if __name__ == "__main__":
     main()
+
+
+(kronos)  ~/work/conda/Kronos/ [main*] python gpt1.py 
+2025-10-21 12:40:24 [INFO] 设置中文字体: Heiti TC
+2025-10-21 12:40:24 [INFO] 数据获取总时间段: 2024-08-05 -> 2025-10-01 (包含 60 天 MTF 预热)
+2025-10-21 12:40:24 [INFO] 有效训练/回测开始于: 2024-10-04
+2025-10-21 12:40:24 [INFO] ✅ 从有效缓存加载 BTCUSDT 数据: data_cache/BTCUSDT_5m.csv
+2025-10-21 12:40:24 [INFO] ✅ 从有效缓存加载 ETHUSDT 数据: data_cache/ETHUSDT_5m.csv
+2025-10-21 12:40:24 [INFO] 独立计算 MTF 信号...
+2025-10-21 12:40:24 [INFO] 为有效数据 (从 2024-10-04 开始) 添加特征...
+2025-10-21 12:43:01 [INFO] 
+################################################################################
+                 模式: 单次训练与回测 (XGBoost Only)
+################################################################################
+2025-10-21 12:43:01 [INFO] 训练期: 2024-10-04 -> 2025-04-02
+2025-10-21 12:43:01 [INFO] [XGB] 为 ETHUSDT 训练 XGBoost...
+2025-10-21 12:43:13 [INFO] [XGB] ETHUSDT OOS acc=0.6644
+2025-10-21 12:43:13 [INFO] 回测期: 2025-07-01 -> 2025-10-01
+2025-10-21 12:43:13 [INFO] [ETHUSDT] XGB 模型加载成功。
+2025-10-21 12:43:20 [INFO] 回测完成，生成最终报告...                       
+Start                     2025-07-01 00:00...
+End                       2025-10-01 00:00...
+Duration                     92 days 00:00:00
+Exposure Time [%]                     2.50594
+Equity Final [$]                 485011.58747
+Equity Peak [$]                      500000.0
+Commissions [$]                    4834.98253
+Return [%]                           -2.99768
+Buy & Hold Return [%]                 66.2659
+Return (Ann.) [%]                    -11.2592
+Volatility (Ann.) [%]                 4.39029
+CAGR [%]                            -11.37434
+Sharpe Ratio                         -2.56457
+Sortino Ratio                        -2.50392
+Calmar Ratio                         -2.22808
+Alpha [%]                            -3.66669
+Beta                                   0.0101
+Max. Drawdown [%]                    -5.05332
+Avg. Drawdown [%]                    -5.05332
+Max. Drawdown Duration       83 days 05:45:00
+Avg. Drawdown Duration       83 days 05:45:00
+# Trades                                    5
+Win Rate [%]                             20.0
+Best Trade [%]                        1.42437
+Worst Trade [%]                      -1.48333
+Avg. Trade [%]                       -0.61461
+Max. Trade Duration           1 days 03:00:00
+Avg. Trade Duration           0 days 10:59:00
+Profit Factor                         0.31864
+Expectancy [%]                       -0.60915
+SQN                                  -1.20231
+Kelly Criterion                      -0.44824
+_strategy                 UltimateStrategy...
+_equity_curve                             ...
+_trades                      Size  EntryBa...
+dtype: object
+2025-10-21 12:43:20 [INFO] 
+################################################################################
+                 回测表现总览
+################################################################################
+2025-10-21 12:43:20 [INFO] 初始资金: $500,000.00
+2025-10-21 12:43:20 [INFO] 最终权益: $485,011.59
+2025-10-21 12:43:20 [INFO] 总回报率: -3.00%
+2025-10-21 12:43:20 [INFO] 总交易次数: 5
+2025-10-21 12:43:20 [INFO] 胜率: 20.00%
+2025-10-21 12:43:20 [INFO] 盈亏因子: 0.32
+2025-10-21 12:43:22 [INFO] 保存详细回测图: backtest_v51.0.html
+2025-10-21 12:43:22 [INFO] 保存交易分布: trade_dist_v51.0.png
+2025-10-21 12:43:22 [INFO] 🚀 V51.0 运行结束。
+(kronos)  ~/work/conda/Kronos/ [main*] 
