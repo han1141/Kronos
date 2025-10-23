@@ -77,13 +77,13 @@ CONFIG = {
     "symbols_to_test": ["ETHUSDT"],
     "interval": "15m",
     "backtest_start_date": "2025-10-01",
-    "backtest_end_date": "2025-10-16",
+    "backtest_end_date": "2025-10-19",
     "initial_cash": 500_000,
     "commission": 0.0002,
     "spread": 0.0005,
     "show_plots": False,
     "training_window_days": 365 * 1.5,
-    "enable_ml_component": False,
+    "enable_ml_component": True,
 }
 ML_HORIZONS = [4, 8, 12]  # <-- 修复此行
 

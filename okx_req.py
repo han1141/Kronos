@@ -6,6 +6,10 @@ OKX REST API 輪詢版 (V3.1 盈利後追蹤止損版)
     - [代碼重構] 新增 manage_trailing_stop 函式，將 "移動停損的激活與調整" 邏輯從主循環中完全剝離，使其更清晰、更易於維護。
     - [提升健壯性] 移動停損調整時，採用 "先下新單，再撤舊單" 的安全策略，防止在調整過程中倉位短暫失去保護。
 - 繼承了 V3 的一致性與可讀性優化。
+
+- V3.1.1 (風控增強版):
+    - [風險控制] 增強狀態審計功能。當檢測到策略與交易所狀態嚴重不一致時，不再僅打印日誌，
+                 而是自動執行緊急平倉、取消所有掛單，並重置策略狀態，以防止意外虧損。
 """
 
 # --- 核心庫導入 (無變化) ---
@@ -93,7 +97,7 @@ def setup_csv_logger(name, log_file, fields):
     return logger_obj
 
 
-# --- 全局配置 ---
+# --- 全局配置 (無變化) ---
 REST_BASE = "https://www.okx.com"
 SYMBOLS = ["ETH-USDT-SWAP"]
 KLINE_INTERVAL = "5m"
@@ -105,7 +109,6 @@ SIMULATED_EQUITY_START = 500000.0
 SCHEDULED_EXIT_ENABLED = False
 EXIT_TIME_UTC = "20:00"
 
-### --- [新增/修改] --- ###
 # 移動停損 (Trailing Stop Loss) 相關設定
 TSL_ENABLED = True  # 是否啟用移動停損功能
 TSL_ACTIVATION_PROFIT_PCT = 1.0  # 盈利達到 1.0% 時，激活移動停損 (新功能)
@@ -120,7 +123,7 @@ STRATEGY_PARAMS = {
     "sl_atr_multiplier": 2.5,
     "tp_rr_ratio": 1.5,
     "kelly_trade_history": 20,
-    "default_risk_pct": 1.0,
+    "default_risk_pct": 30.0,
     "max_risk_pct": 0.04,
     "regime_adx_period": 14,
     "regime_atr_period": 14,
@@ -156,7 +159,7 @@ ASSET_SPECIFIC_OVERRIDES = {
         "strategy_class": "ETHStrategy",
         "ml_weights": {"4h": 0.15, "8h": 0.3, "12h": 0.55},
         "ml_weighted_threshold": 0.2,
-        "score_entry_threshold": 0.35,
+        "score_entry_threshold": 0.40,
     }
 }
 ML_HORIZONS = [4, 8, 12]
@@ -824,7 +827,7 @@ class UltimateStrategy:
                 )
 
 
-# --- 輔助函數 ---
+# --- 輔助函數 (無變化) ---
 def manage_position_exit_orders(
     trader: OKXTrader,
     symbol: str,
@@ -900,7 +903,6 @@ def manage_position_exit_orders(
     return True
 
 
-### --- [新增/修改] --- ###
 def manage_trailing_stop(
     trader: OKXTrader,
     symbol: str,
@@ -1012,7 +1014,7 @@ def main():
         ["timestamp", "symbol", "action", "size", "response"],
     )
 
-    logging.info("啟動 OKX REST API 輪詢交易程序 (V3.1 盈利後追蹤止損版)...")
+    logging.info("啟動 OKX REST API 輪詢交易程序 (V3.1.1 風控增強版)...")
     OKX_API_KEY = os.getenv("OKX_API_KEY")
     OKX_API_SECRET = os.getenv("OKX_API_SECRET")
     OKX_API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE")
@@ -1172,8 +1174,6 @@ def main():
 
                 real_position_data = trader.fetch_current_position(symbol)
 
-                ### --- [新增/修改] --- ###
-                # 如果策略有倉位且交易所有倉位，則檢查移動停損
                 if (
                     strategy.position is not None
                     and real_position_data
@@ -1252,6 +1252,8 @@ def main():
                         )
                         strategy.set_position(None)
                         clear_trade_state()
+                    # --- [MODIFIED CODE BLOCK START] ---
+                    # 這是本次修改的核心部分
                     elif real_position is not None:
                         real_pos_side = (
                             "LONG"
@@ -1259,9 +1261,57 @@ def main():
                             else "SHORT"
                         )
                         if strategy.position != real_pos_side:
+                            # 檢測到嚴重不一致，啟動風控
                             trade_flow_logger.critical(
                                 f"[{symbol}] [审计发现] 状态严重不一致！策略: {strategy.position} vs 交易所: {real_pos_side}。"
                             )
+                            trade_flow_logger.warning(
+                                f"[{symbol}] 進入緊急風控模式：將清空所有倉位和掛單..."
+                            )
+
+                            # 1. 取消所有現有掛單
+                            try:
+                                open_algos = trader.fetch_open_algo_orders(symbol)
+                                if open_algos:
+                                    algo_ids = [order["algoId"] for order in open_algos]
+                                    trader.cancel_algo_orders(symbol, algo_ids)
+                                    trade_flow_logger.info(
+                                        f"[{symbol}] [風控] 已取消 {len(algo_ids)} 個掛單。"
+                                    )
+                            except Exception as e:
+                                trade_flow_logger.error(
+                                    f"[{symbol}] [風控] 緊急取消掛單失敗: {e}"
+                                )
+
+                            # 2. 以市價單平掉交易所的意外倉位
+                            try:
+                                pos_size = abs(float(real_position.get("pos", "0")))
+                                # 如果實際是空頭(SHORT)，則需要買入(buy)來平倉
+                                close_side = (
+                                    "buy" if real_pos_side == "SHORT" else "sell"
+                                )
+                                trade_flow_logger.info(
+                                    f"[{symbol}] [風控] 正在以市價單平掉 {real_pos_side} 倉位，數量: {pos_size}..."
+                                )
+                                res = trader.place_market_order(
+                                    symbol, close_side, pos_size
+                                )
+                                trade_flow_logger.info(
+                                    f"[{symbol}] [風控] 平倉指令已發送, 響應: {res}"
+                                )
+                            except Exception as e:
+                                trade_flow_logger.error(
+                                    f"[{symbol}] [風控] 緊急平倉失敗: {e}"
+                                )
+
+                            # 3. 重置策略的內部狀態
+                            strategy.set_position(None)
+                            clear_trade_state()
+                            trade_flow_logger.info(
+                                f"[{symbol}] [風控] 策略狀態已強制重置。"
+                            )
+                    # --- [MODIFIED CODE BLOCK END] ---
+
                 trade_flow_logger.info("--- [状态审计结束] ---")
 
             logging.info(

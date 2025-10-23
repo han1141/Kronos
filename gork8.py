@@ -83,7 +83,7 @@ CONFIG = {
     "spread": 0.0005,
     "show_plots": False,
     "training_window_days": 365 * 1.5,
-    "enable_ml_component": False,
+    "enable_ml_component": True,
 }
 ML_HORIZONS = [4, 8, 12]
 
