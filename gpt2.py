@@ -162,8 +162,8 @@ class ContrarianSignalStrategy(Strategy):
 
 # --- 主执行程序 ---
 if __name__ == "__main__":
-    symbol = "BTCUSDT"
-    interval = "1h"
+    symbol = "ETHUSDT"
+    interval = "15m"
     backtest_start_date_str = "2024-01-01"
     backtest_end_date_str = "2024-05-01"
     model_path = "models/btc_lstm_model.keras"
