@@ -1,6 +1,0 @@
-feature_volume_oscillator
-feature_rsi_14
-feature_adx_14
-feature_bollinger_bandwidth
-feature_ichimoku_span
-feature_ema_trend_context
