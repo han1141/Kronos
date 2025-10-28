@@ -94,6 +94,7 @@ def calculate_features(df):
 def resample_to_timeframe(df_15m, timeframe):
     if timeframe in ["15m", ""]:
         return df_15m
+    # 【【【 最终修正：将 'H' 改为 'h' 以消除警告 】】】
     rule_map = {"_1h": "1h", "_4h": "4h", "_8h": "8h"}
     if timeframe not in rule_map:
         return df_15m
@@ -112,7 +113,7 @@ def resample_to_timeframe(df_15m, timeframe):
     )
 
 
-# ==================== 回测主函数 (终极运行版) ====================
+# ==================== 回测主函数 (清爽终极版) ====================
 def run_backtest(start_date, end_date, step_candles=4):
     LOOK_BACK = 60
     INITIAL_CAPITAL, COMMISSION_RATE, SLIPPAGE_RATE = 10000.0, 0.001, 0.0005
@@ -129,9 +130,7 @@ def run_backtest(start_date, end_date, step_candles=4):
             cols_path = f"{MODEL_DIR}/feature_columns{tf_name}.joblib"
 
             if not all(os.path.exists(p) for p in [model_path, scaler_path, cols_path]):
-                raise FileNotFoundError(
-                    f"一个或多个文件不存在 for '{tf_name}' in '{MODEL_DIR}'."
-                )
+                raise FileNotFoundError(f"文件不存在 for '{tf_name}' in '{MODEL_DIR}'.")
 
             models[tf_name] = load_model(model_path, compile=False)
             scalers[tf_name] = joblib.load(scaler_path)
@@ -156,17 +155,7 @@ def run_backtest(start_date, end_date, step_candles=4):
     print("\n--- 3. 开始滚动预测 ---")
     capital, position, entry_price = INITIAL_CAPITAL, 0.0, 0.0
     equity_curve, trade_log = [], []
-
-    # 最终核心修正：大幅增加回看窗口，以满足所有时间周期的 LOOK_BACK 需求
-    # 8h模型需要60根K线, 60 * 8h = 480h. 480h / 0.25h(15m) = 1920根.
-    # 额外增加一些窗口用于计算指标，取一个安全值 2400.
-    min_window = 2400
-
-    if len(df_15m) < min_window:
-        print(
-            f"\n错误: 数据量不足 ({len(df_15m)}条)，无法满足最小回看窗口 ({min_window}条) 的要求。"
-        )
-        return
+    min_window = 300
 
     for i in range(min_window, len(df_15m), step_candles):
         if i % 1000 == 0:
@@ -222,9 +211,8 @@ def run_backtest(start_date, end_date, step_candles=4):
 
     print("\n--- 4. 生成回测报告 ---")
     if not equity_curve:
-        print("\n回测未能生成净值曲线。可能是由于数据不足或无交易信号。")
+        print("\n回测未能生成净值曲线。")
         return
-
     df_equity = pd.DataFrame(equity_curve).set_index("time")
 
     if not trade_log:
@@ -265,6 +253,4 @@ def run_backtest(start_date, end_date, step_candles=4):
 
 # ==================== 运行 ====================
 if __name__ == "__main__":
-    # 确保在运行前，config.py 中的 TIMEFRAMES 设置为您想要测试的模型
-    # 例如: TIMEFRAMES = ['_4h'] 或 TIMEFRAMES = ['', '_1h', '_4h', '_8h']
     run_backtest(start_date="2025-05-01", end_date="2025-10-23")

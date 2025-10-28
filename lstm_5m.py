@@ -31,6 +31,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+SYMBOL = "ETHUSDT"
+INTERVAL = "4h"
+DATA_START_DATE = "2018-01-01"
+TRAIN_START_DATE = "2021-01-01"
+TRAIN_END_DATE = "2024-12-31"
+TEST_START_DATE = "2025-05-01"
+TEST_END_DATE = "2025-10-23"
+LOOK_BACK = 60
+
+TREND_CONFIG = {
+    "look_forward_steps": 5,
+    "ema_length": 8,
+}
+
+MODEL_SAVE_PATH = f"models/eth_trend_model_v1_{INTERVAL}.keras"
+SCALER_SAVE_PATH = f"models/eth_trend_scaler_v1_{INTERVAL}.joblib"
+
+DATA_CACHE_PATH = f"data/{SYMBOL.lower()}_{INTERVAL}_data.csv"
+
+
 def fetch_binance_klines(s, i, st, en=None, l=1000):
     url, cols = "https://api.binance.com/api/v3/klines", [
         "timestamp",
@@ -151,7 +171,7 @@ def train_and_evaluate(
     X_train_scaled = scaler.fit_transform(X_train_full_df)
     X_test_scaled = scaler.transform(X_test_df)
 
-    joblib.dump(X_train_full_df.columns, "models/feature_columns_5m.joblib")
+    joblib.dump(X_train_full_df.columns, f"models/feature_columns_{INTERVAL}.joblib")
 
     X_train, y_train = create_multivariate_sequences(
         X_train_scaled, y_train_full, look_back
@@ -185,17 +205,19 @@ def train_and_evaluate(
     class_weight_dict = dict(enumerate(class_weights))
     logger.info(f"类别权重: {class_weight_dict}")
 
-    L2_REG = 0.0005
+    L2_REG = 0.001
     model = Sequential(
         [
             Input(shape=(look_back, num_features)),
+            # 2. 【关键】简化模型结构 (减少神经元/记忆单元)
             Bidirectional(
-                LSTM(48, return_sequences=True, kernel_regularizer=l2(L2_REG))
+                LSTM(32, return_sequences=True, kernel_regularizer=l2(L2_REG))
             ),
-            Dropout(0.3),
-            Bidirectional(LSTM(48, kernel_regularizer=l2(L2_REG))),
-            Dropout(0.3),
-            Dense(24, activation="relu", kernel_regularizer=l2(L2_REG)),
+            # 3. 【关键】大幅加强Dropout (增加随机“遗忘”)
+            Dropout(0.5),
+            Bidirectional(LSTM(32, kernel_regularizer=l2(L2_REG))),
+            Dropout(0.5),
+            Dense(16, activation="relu", kernel_regularizer=l2(L2_REG)),
             Dense(1, activation="sigmoid"),
         ]
     )
@@ -262,7 +284,7 @@ def run_prediction_demo(
     try:
         loaded_model = load_model(model_path)
         loaded_scaler = joblib.load(scaler_path)
-        feature_columns = joblib.load("models/feature_columns_5m.joblib")
+        feature_columns = joblib.load(f"models/feature_columns_{INTERVAL}.joblib")
         logger.info("模型、Scaler和特征列加载成功。")
 
         prediction_end_date = raw_df.index[-1]
@@ -302,25 +324,6 @@ def run_prediction_demo(
 
 # --- 主流程 (已修改) ---
 if __name__ == "__main__":
-    SYMBOL = "ETHUSDT"
-    INTERVAL = "30m"
-    DATA_START_DATE = "2020-01-01"
-    TRAIN_START_DATE = "2021-01-01"
-    TRAIN_END_DATE = "2025-04-30"
-    TEST_START_DATE = "2025-05-01"
-    TEST_END_DATE = "2025-10-23"
-    LOOK_BACK = 60
-
-    TREND_CONFIG = {
-        "look_forward_steps": 5,
-        "ema_length": 8,
-    }
-
-    MODEL_SAVE_PATH = "models/eth_trend_model_v1_5m.keras"
-    SCALER_SAVE_PATH = "models/eth_trend_scaler_v1_5m.joblib"
-
-    DATA_CACHE_PATH = f"data/{SYMBOL.lower()}_{INTERVAL}_data_5m.csv"
-
     if os.path.exists(DATA_CACHE_PATH):
         logger.info(f"从缓存文件 {DATA_CACHE_PATH} 加载数据...")
         raw_df = pd.read_csv(DATA_CACHE_PATH, index_col=0, parse_dates=True)
