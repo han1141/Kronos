@@ -14,14 +14,7 @@ import joblib
 import os
 import glob
 
-try:
-    import lightgbm as lgb
-    from sklearn.metrics import classification_report
-
-    ML_LIBS_INSTALLED = True
-except ImportError:
-    ML_LIBS_INSTALLED = False
-
+# 检查TensorFlow是否已安装
 try:
     import tensorflow as tf
 
@@ -82,13 +75,22 @@ CONFIG = {
     "commission": 0.0002,
     "spread": 0.0005,
     "show_plots": False,
-    "training_window_days": 365 * 2,
+    "data_lookback_days": 60,
     "enable_ml_component": True,
 }
-ML_HORIZONS = [4, 8, 12]
 
-# --- 参数与类定义 ---
+# --- Keras模型文件路径配置 ---
+KERAS_MODEL_PATH = "models/eth_trend_model_v1.keras"
+SCALER_PATH = "models/eth_trend_scaler_v1.joblib"
+FEATURE_COLUMNS_PATH = "models/feature_columns.joblib"
+KERAS_SEQUENCE_LENGTH = 60
+
+# --- 策略参数 ---
 STRATEGY_PARAMS = {
+    "tsl_enabled": True,
+    "tsl_activation_profit_pct": 0.01,
+    "tsl_activation_atr_mult": 1.5,
+    "tsl_trailing_atr_mult": 2.0,
     "kelly_trade_history": 20,
     "default_risk_pct": 0.015,
     "max_risk_pct": 0.04,
@@ -124,30 +126,19 @@ STRATEGY_PARAMS = {
     "mtf_period": 50,
     "score_entry_threshold": 0.4,
     "score_weights_tf": {
-        "breakout": 0.2667,
-        "momentum": 0.20,
-        "mtf": 0.1333,
-        "ml": 0.2182,
-        "advanced_ml": 0.1818,
+        "breakout": 0.25,
+        "momentum": 0.18,
+        "mtf": 0.10,
+        "ml": 0.22,
+        "advanced_ml": 0.25,
     },
 }
 ASSET_SPECIFIC_OVERRIDES = {
-    "BTCUSDT": {
-        "strategy_class": "BTCStrategy",
-        "ml_weights": {"4h": 0.25, "8h": 0.35, "12h": 0.4},
-        "ml_weighted_threshold": 0.2,
-        "score_entry_threshold": 0.35,
-    },
-    "ETHUSDT": {
-        "strategy_class": "ETHStrategy",
-        "ml_weights": {"4h": 0.15, "8h": 0.3, "12h": 0.55},
-        "ml_weighted_threshold": 0.2,
-        "score_entry_threshold": 0.35,
-    },
+    "ETHUSDT": {"strategy_class": "ETHStrategy", "score_entry_threshold": 0.35},
 }
 
 
-# --- 函数定义 (无变动) ---
+# --- 函数定义 ---
 class StrategyMemory:
     def __init__(self, filepath="strategy_memory.csv"):
         self.filepath, self.columns = filepath, [
@@ -279,7 +270,7 @@ def compute_hurst(ts, max_lag=100):
 def run_advanced_model_inference(df):
     logger.info("正在运行高级模型推理 (模拟)...")
     if not ADVANCED_ML_LIBS_INSTALLED:
-        logger.warning("TensorFlow/PyTorch 未安装。")
+        logger.warning("TensorFlow 未安装, 跳过高级模型推理。")
         df["advanced_ml_signal"] = 0.0
         return df
     df["advanced_ml_signal"] = (
@@ -359,6 +350,58 @@ def add_market_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_features_for_keras_model(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    为 Keras 模型生成所有必需的特征。
+    - 确保同时计算并添加所有5个布林带相关指标。
+    - 修正了 MACD 列名的大小写以匹配模型期望。
+    """
+    logger.info("正在为 Keras 模型生成特定特征 (使用 'ta' 库)...")
+    high, low, close, volume = df["High"], df["Low"], df["Close"], df["Volume"]
+
+    # --- 基础指标 ---
+    df["EMA_8"] = ta.trend.EMAIndicator(close=close, window=8).ema_indicator()
+    df["RSI_14"] = ta.momentum.RSIIndicator(close=close, window=14).rsi()
+    adx_indicator = ta.trend.ADXIndicator(high=high, low=low, close=close, window=14)
+    df["ADX_14"] = adx_indicator.adx()
+    df["DMP_14"] = adx_indicator.adx_pos()
+    df["DMN_14"] = adx_indicator.adx_neg()
+    atr_raw = ta.volatility.AverageTrueRange(
+        high=high, low=low, close=close, window=14
+    ).average_true_range()
+    df["ATRr_14"] = (atr_raw / close) * 100
+
+    # --- 修正: 计算并添加所有5个必需的布林带指标 ---
+    bb_indicator = ta.volatility.BollingerBands(close=close, window=20, window_dev=2.0)
+    # 1. 上轨
+    df["BBU_20_2.0"] = bb_indicator.bollinger_hband()
+    # 2. 中轨
+    df["BBM_20_2.0"] = bb_indicator.bollinger_mavg()
+    # 3. 下轨
+    df["BBL_20_2.0"] = bb_indicator.bollinger_lband()
+    # 4. 宽度 (Bandwidth)
+    df["BBB_20_2.0"] = bb_indicator.bollinger_wband()
+    # 5. %B 指标 (Percentage)
+    df["BBP_20_2.0"] = bb_indicator.bollinger_pband()
+
+    # --- 修正: 统一 MACD 列名的大小写 ---
+    macd_indicator = ta.trend.MACD(
+        close=close, window_fast=12, window_slow=26, window_sign=9
+    )
+    df["MACD_12_26_9"] = macd_indicator.macd()
+    df["MACDs_12_26_9"] = macd_indicator.macd_signal()  # 修正: s小写
+    df["MACDh_12_26_9"] = macd_indicator.macd_diff()  # 修正: h小写
+
+    # --- 其它指标 ---
+    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(
+        close=close, volume=volume
+    ).on_balance_volume()
+    df["volume_change_rate"] = volume.pct_change()
+
+    logger.info("✅ 成功生成 Keras 模型所需的所有特定特征。")
+    return df
+
+
 def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataFrame:
     df = data_in.copy()
     logger.info(
@@ -372,6 +415,7 @@ def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataF
     )
     df = run_advanced_model_inference(df)
     df = add_ml_features(df)
+    df = add_features_for_keras_model(df)
     df = add_market_regime_features(df)
     daily_start = df.index.min().normalize() - pd.Timedelta(
         days=STRATEGY_PARAMS["mtf_period"] + 5
@@ -390,63 +434,27 @@ def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataF
         df["mtf_signal"] = mtf_signal_1d.reindex(df.index, method="ffill").fillna(0)
     else:
         df["mtf_signal"] = 0
+    logger.info(f"[{symbol}] 正在计算 4h 宏观趋势过滤器...")
+    df_4h = df["Close"].resample("4h").last().to_frame()
+    df_4h["macro_ema"] = ta.trend.EMAIndicator(
+        df_4h["Close"], window=50
+    ).ema_indicator()
+    df_4h["macro_trend"] = np.where(df_4h["Close"] > df_4h["macro_ema"], 1, -1)
+    df["macro_trend_filter"] = (
+        df_4h["macro_trend"].reindex(df.index, method="ffill").fillna(0)
+    )
+    logger.info(f"[{symbol}] 宏观趋势过滤器计算完成。")
     df.dropna(inplace=True)
     logger.info(f"[{symbol}] 数据预处理完成。数据行数: {len(df)}")
     return df
 
 
-def train_and_save_model(
-    training_data: pd.DataFrame, symbol: str, training_end_date: pd.Timestamp
-):
-    if not ML_LIBS_INSTALLED:
-        logger.warning("缺少 ML 库，跳过训练。")
-        return
-    logger.info(
-        f"--- 🤖 [单次训练] 开始为 {symbol} 训练模型 (数据截止于: {training_end_date.date()}) ---"
-    )
-    features = [col for col in training_data.columns if "feature_" in col]
-    if not features:
-        logger.error(f"[{symbol}] 找不到特征列。")
-        return
-    logger.info(f"[{symbol}] 使用以下特征进行训练: {features}")
-    for h in ML_HORIZONS:
-        logger.info(f"正在为 {h}h 预测窗口准备数据...")
-        data = training_data.copy()
-        data[f"target_{h}h"] = (data["Close"].shift(-h) > data["Close"]).astype(int)
-        df_train = data.dropna(subset=[f"target_{h}h"] + features)
-        X, y = df_train[features], df_train[f"target_{h}h"]
-        if len(X) < 200 or y.nunique() < 2:
-            logger.warning(f"[{symbol}-{h}h] 数据不足，跳过训练。")
-            continue
-        eval_size = int(len(X) * 0.1)
-        X_train, X_eval, y_train, y_eval = (
-            X[:-eval_size],
-            X[-eval_size:],
-            y[:-eval_size],
-            y[-eval_size:],
-        )
-        logger.info(f"开始训练 {symbol} 的 {h}h 模型...")
-        model = lgb.LGBMClassifier(
-            objective="binary",
-            n_estimators=200,
-            learning_rate=0.05,
-            num_leaves=31,
-            random_state=42,
-            n_jobs=-1,
-        )
-        model.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_eval, y_eval)],
-            callbacks=[lgb.early_stopping(10, verbose=False)],
-        )
-        y_pred = model.predict(X_eval)
-        logger.info(
-            f"[{symbol}-{h}h] 模型评估报告:\n{classification_report(y_eval, y_pred, zero_division=0)}"
-        )
-        model_filename = f"directional_model_{symbol}_{h}h.joblib"
-        joblib.dump(model, model_filename)
-        logger.info(f"✅ [{symbol}-{h}h] 模型训练完成并已保存至: {model_filename}")
+def create_sequences(data: np.ndarray, sequence_length: int) -> np.ndarray:
+    sequences = []
+    data_len = len(data)
+    for i in range(data_len - sequence_length + 1):
+        sequences.append(data[i : i + sequence_length])
+    return np.array(sequences)
 
 
 # --- 策略类定义 ---
@@ -462,54 +470,39 @@ class BaseAssetStrategy:
             else -1 if m.data.Low[-1] < m.tf_donchian_l[-1] else 0
         )
         mo_s = 1 if m.tf_ema_fast[-1] > m.tf_ema_slow[-1] else -1
-        if w is None:
-            w = STRATEGY_PARAMS["score_weights_tf"]
+        keras_ml_signal = m.keras_signal[-1] if hasattr(m, "keras_signal") else 0.0
         return (
             b_s * w.get("breakout", 0)
             + mo_s * w.get("momentum", 0)
             + m.mtf_signal[-1] * w.get("mtf", 0)
-            + m.get_ml_confidence_score() * w.get("ml", 0)
+            + keras_ml_signal * w.get("ml", 0)
             + m.advanced_ml_signal[-1] * w.get("advanced_ml", 0)
         )
 
-    # <<< 修改：使用增强版 “布林带回归 + Stoch RSI 确认” 逻辑 >>>
     def _define_mr_entry_signal(self) -> int:
         m = self.main
-
-        # --- 做多信号判断 ---
-        # 1. 回归确认：价格从布林带下轨之下，穿越回其之上
         long_reentry_condition = (
             m.data.Close[-2] < m.mr_bb_lower[-2]
             and m.data.Close[-1] > m.mr_bb_lower[-1]
         )
-
-        # 2. 动量确认：Stoch RSI 在超卖区发生金叉
         stoch_long_confirmation = (
             m.mr_stoch_rsi_k[-1] > m.mr_stoch_rsi_d[-1]
             and m.mr_stoch_rsi_k[-2] <= m.mr_stoch_rsi_d[-2]
             and m.mr_stoch_rsi_k[-1] < 40
-        )  # 放宽阈值以捕捉更多机会
-
+        )
         if long_reentry_condition and stoch_long_confirmation:
             return 1
-
-        # --- 做空信号判断 ---
-        # 1. 回归确认：价格从布lin带上轨之上，穿越回其之下
         short_reentry_condition = (
             m.data.Close[-2] > m.mr_bb_upper[-2]
             and m.data.Close[-1] < m.mr_bb_upper[-1]
         )
-
-        # 2. 动量确认：Stoch RSI 在超买区发生死叉
         stoch_short_confirmation = (
             m.mr_stoch_rsi_k[-1] < m.mr_stoch_rsi_d[-1]
             and m.mr_stoch_rsi_k[-2] >= m.mr_stoch_rsi_d[-2]
             and m.mr_stoch_rsi_k[-1] > 60
-        )  # 放宽阈值
-
+        )
         if short_reentry_condition and stoch_short_confirmation:
             return -1
-
         return 0
 
 
@@ -542,36 +535,26 @@ class UltimateStrategy(Strategy):
         for key, value in STRATEGY_PARAMS.items():
             setattr(self, key, value)
         asset_overrides = ASSET_SPECIFIC_OVERRIDES.get(self.symbol, {})
-        if self.score_entry_threshold_override is not None:
-            self.score_entry_threshold = self.score_entry_threshold_override
+        self.score_entry_threshold = asset_overrides.get(
+            "score_entry_threshold", self.score_entry_threshold
+        )
         if self.score_weights_tf_override is not None:
             self.score_weights_tf = self.score_weights_tf_override
-        self.ml_weights_dict = self.ml_weights_override or asset_overrides.get(
-            "ml_weights"
-        )
-        self.ml_weighted_threshold = (
-            self.ml_weighted_threshold_override
-            or asset_overrides.get("ml_weighted_threshold")
-        )
         strategy_class_name = self.strategy_class_override or asset_overrides.get(
             "strategy_class", "BaseAssetStrategy"
         )
         self.asset_strategy = STRATEGY_MAPPING.get(
             strategy_class_name, BaseAssetStrategy
         )(self)
-
-        close, high, low = (
-            pd.Series(self.data.Close),
-            pd.Series(self.data.High),
-            pd.Series(self.data.Low),
-        )
+        close = pd.Series(self.data.Close)
+        high = pd.Series(self.data.High)
+        low = pd.Series(self.data.Low)
         self.recent_trade_returns = deque(maxlen=self.kelly_trade_history)
         self.reset_trade_state()
-
         self.market_regime = self.I(lambda: self.data.market_regime)
         self.mtf_signal = self.I(lambda: self.data.mtf_signal)
         self.advanced_ml_signal = self.I(lambda: self.data.advanced_ml_signal)
-
+        self.macro_trend = self.I(lambda: self.data.macro_trend_filter)
         self.tf_atr = self.I(
             lambda: ta.volatility.AverageTrueRange(
                 high, low, close, self.tf_atr_period
@@ -598,102 +581,161 @@ class UltimateStrategy(Strategy):
                 high, low, close, self.tf_adx_confirm_period
             ).adx()
         )
-
         bb = ta.volatility.BollingerBands(close, self.mr_bb_period, self.mr_bb_std)
-        self.mr_bb_upper, self.mr_bb_lower, self.mr_bb_mid = (
-            self.I(lambda: bb.bollinger_hband()),
-            self.I(lambda: bb.bollinger_lband()),
-            self.I(lambda: bb.bollinger_mavg()),
-        )
-        # 原始的RSI指标仍然保留，以防其他地方可能用到，但震荡入场信号不再直接使用它
+        self.mr_bb_upper = self.I(lambda: bb.bollinger_hband())
+        self.mr_bb_lower = self.I(lambda: bb.bollinger_lband())
+        self.mr_bb_mid = self.I(lambda: bb.bollinger_mavg())
         self.mr_rsi = self.I(
             lambda: ta.momentum.RSIIndicator(
                 close, STRATEGY_PARAMS["regime_rsi_period"]
             ).rsi()
         )
-
-        # <<< 新增：为增强版震荡策略计算 Stoch RSI >>>
         stoch_rsi = ta.momentum.StochRSIIndicator(
             close, window=14, smooth1=3, smooth2=3
         )
         self.mr_stoch_rsi_k = self.I(lambda: stoch_rsi.stochrsi_k())
         self.mr_stoch_rsi_d = self.I(lambda: stoch_rsi.stochrsi_d())
-
-        self.ml_models = {}
-        self._load_models()
-
-    def _load_models(self):
-        if not self.symbol or not ML_LIBS_INSTALLED:
-            logger.warning(
-                f"[{self.symbol}] 缺少 ML 库 (scikit-learn, lightgbm)，跳过模型加载。"
-            )
-            return
-        backtest_start_str = pd.to_datetime(CONFIG["backtest_start_date"]).strftime(
-            "%Y%m%d"
+        self.keras_model, self.scaler, self.feature_columns = (
+            self._load_keras_model_and_dependencies()
         )
-        loaded_count = 0
-        for h in ML_HORIZONS:
-            model_files = glob.glob(f"directional_model_{self.symbol}_{h}h.joblib")
-            if model_files:
-                try:
-                    self.ml_models[h] = joblib.load(model_files[0])
-                    loaded_count += 1
-                except Exception as e:
-                    logger.error(f"加载模型 {model_files[0]} 失败: {e}")
-        if loaded_count > 0:
-            logger.info(f"✅ [{self.symbol}] 成功加载 {loaded_count} 个模型。")
-        else:
-            logger.warning(
-                f"[{self.symbol}] 未找到与日期 {backtest_start_str} 匹配的模型。"
-            )
+        self.keras_signal = self.I(self._calculate_keras_predictions)
 
+    def _load_keras_model_and_dependencies(self):
+        if not CONFIG["enable_ml_component"] or not ADVANCED_ML_LIBS_INSTALLED:
+            logger.warning(f"[{self.symbol}] Keras模型组件已禁用或TensorFlow未安装。")
+            return None, None, None
+        try:
+            model = tf.keras.models.load_model(KERAS_MODEL_PATH)
+            scaler = joblib.load(SCALER_PATH)
+            feature_columns = joblib.load(FEATURE_COLUMNS_PATH)
+            logger.info(f"✅ [{self.symbol}] 成功加载Keras模型、缩放器和特征列。")
+            return model, scaler, feature_columns
+        except Exception as e:
+            logger.error(f"[{self.symbol}] 加载Keras模型或依赖项失败: {e}")
+            return None, None, None
+
+    def _calculate_keras_predictions(self):
+        if self.keras_model is None or self.scaler is None:
+            return np.zeros(len(self.data.Close))
+        expected_features = set(self.feature_columns)
+        actual_features = set(self.data.df.columns)
+        if not expected_features.issubset(actual_features):
+            missing = expected_features - actual_features
+            logger.error(f"[{self.symbol}] 数据中缺少必要的特征列，无法进行模型预测。")
+            logger.error(f"  - 缺失的特征 ({len(missing)}): {sorted(list(missing))}")
+            return np.zeros(len(self.data.Close))
+        features_df = self.data.df[self.feature_columns]
+        if features_df.isnull().values.any():
+            logger.warning(f"[{self.symbol}] 特征数据中存在NaN值，将用0填充。")
+            features_df = features_df.fillna(0)
+        scaled_features_2d = self.scaler.transform(features_df)
+        logger.info(
+            f"[{self.symbol}] 正在将2D特征数据转换为 {KERAS_SEQUENCE_LENGTH} 步长的3D序列..."
+        )
+        scaled_features_3d = create_sequences(scaled_features_2d, KERAS_SEQUENCE_LENGTH)
+        logger.info(
+            f"[{self.symbol}] 3D序列数据创建完成，形状为: {scaled_features_3d.shape}"
+        )
+        predictions_proba = self.keras_model.predict(
+            scaled_features_3d, verbose=0
+        ).flatten()
+        num_predictions = len(predictions_proba)
+        padding_size = len(self.data.Close) - num_predictions
+        raw_signals = (predictions_proba - 0.5) * 2
+        final_signals = np.zeros(len(self.data.Close))
+        final_signals[padding_size:] = raw_signals
+        logger.info(f"[{self.symbol}] Keras模型信号计算完成。")
+        return final_signals
+
+    # <<< 核心修改：实现做多/做空双向逻辑 >>>
     def next(self):
         if self.position:
             self.manage_open_position(self.data.Close[-1])
         else:
-            if self.data.market_regime[-1] == 1:
-                self.run_scoring_system_entry(self.data.Close[-1])
-            else:
-                self.run_mean_reversion_entry(self.data.Close[-1])
+            # 宏观牛市，只寻找做多机会
+            if self.macro_trend[-1] == 1:
+                if self.data.market_regime[-1] == 1:  # 趋势市
+                    score = self.asset_strategy._calculate_entry_score()
+                    if score > self.score_entry_threshold:
+                        self.open_tf_position(
+                            self.data.Close[-1], is_long=True, confidence_factor=score
+                        )
+                else:  # 震荡市
+                    signal = self.asset_strategy._define_mr_entry_signal()
+                    if signal == 1:
+                        self.open_mr_position(self.data.Close[-1], is_long=True)
 
-    def get_ml_confidence_score(self) -> float:
-        if not self.ml_models or not self.ml_weights_dict:
-            return 0.0
-        features = [col for col in self.data.df.columns if "feature_" in col]
-        if self.data.df[features].iloc[-1].isnull().any():
-            return 0.0
-        current_features = self.data.df[features].iloc[-1:]
-        score = 0.0
-        for h, model in self.ml_models.items():
-            try:
-                pred = 1 if model.predict(current_features)[0] == 1 else -1
-                score += pred * self.ml_weights_dict.get(f"{h}h", 0)
-            except Exception:
-                pass
-        return score
-
-    def run_scoring_system_entry(self, price):
-        score = self.asset_strategy._calculate_entry_score()
-        if abs(score) > self.score_entry_threshold:
-            self.open_tf_position(
-                price, is_long=(score > 0), confidence_factor=abs(score)
-            )
-
-    def run_mean_reversion_entry(self, price):
-        signal = self.asset_strategy._define_mr_entry_signal()
-        if signal != 0:
-            self.open_mr_position(price, is_long=(signal == 1))
+            # 宏观熊市，只寻找做空机会
+            elif self.macro_trend[-1] == -1:
+                if self.data.market_regime[-1] == 1:  # 趋势市
+                    score = self.asset_strategy._calculate_entry_score()
+                    if score < -self.score_entry_threshold:
+                        self.open_tf_position(
+                            self.data.Close[-1],
+                            is_long=False,
+                            confidence_factor=abs(score),
+                        )
+                else:  # 震荡市
+                    signal = self.asset_strategy._define_mr_entry_signal()
+                    if signal == -1:
+                        self.open_mr_position(self.data.Close[-1], is_long=False)
 
     def reset_trade_state(self):
-        self.active_sub_strategy, self.chandelier_exit_level = None, 0.0
-        self.highest_high_in_trade, self.lowest_low_in_trade = 0, float("inf")
-        self.mr_stop_loss, self.tf_initial_stop_loss = 0.0, 0.0
+        self.active_sub_strategy = None
+        self.stop_loss_price = 0.0
+        self.trailing_stop_active = False
+        self.highest_high_in_trade = 0
+        self.lowest_low_in_trade = float("inf")
 
     def manage_open_position(self, p):
+        self._manage_trailing_stop_loss()
         if self.active_sub_strategy == "TF":
             self.manage_trend_following_exit(p)
         elif self.active_sub_strategy == "MR":
             self.manage_mean_reversion_exit(p)
+
+    def _manage_trailing_stop_loss(self):
+        if not self.tsl_enabled or not self.position:
+            return
+        is_active = self.trailing_stop_active
+        entry_price = self.trades[-1].entry_price
+        current_price = self.data.Close[-1]
+
+        if not is_active:
+            profit_pct_condition_met = (
+                self.position.pl_pct * 100
+            ) > self.tsl_activation_profit_pct
+            atr = self.tf_atr[-1]
+            activation_distance = atr * self.tsl_activation_atr_mult
+            price_move_condition_met = False
+            if (
+                self.position.is_long
+                and current_price >= entry_price + activation_distance
+            ):
+                price_move_condition_met = True
+            elif (
+                self.position.is_short
+                and current_price <= entry_price - activation_distance
+            ):
+                price_move_condition_met = True
+            if profit_pct_condition_met or price_move_condition_met:
+                self.trailing_stop_active = True
+                is_active = True
+
+        if is_active:
+            atr = self.tf_atr[-1]
+            trailing_distance = atr * self.tsl_trailing_atr_mult
+            new_stop_price = None
+            if self.position.is_long:
+                potential_stop = current_price - trailing_distance
+                if potential_stop > self.stop_loss_price:
+                    new_stop_price = potential_stop
+            else:
+                potential_stop = current_price + trailing_distance
+                if potential_stop < self.stop_loss_price:
+                    new_stop_price = potential_stop
+            if new_stop_price is not None:
+                self.stop_loss_price = new_stop_price
 
     def open_tf_position(self, p, is_long, confidence_factor, score=1.0):
         risk_ps = self.tf_atr[-1] * self.tf_stop_loss_atr_multiplier
@@ -708,45 +750,33 @@ class UltimateStrategy(Strategy):
         self.active_sub_strategy = "TF"
         if is_long:
             self.buy(size=size)
-            self.tf_initial_stop_loss = p - risk_ps
-            self.highest_high_in_trade = self.data.High[-1]
-            self.chandelier_exit_level = (
-                self.highest_high_in_trade
-                - self.tf_atr[-1] * self.tf_chandelier_atr_multiplier
-            )
+            self.stop_loss_price = p - risk_ps
         else:
             self.sell(size=size)
-            self.tf_initial_stop_loss = p + risk_ps
-            self.lowest_low_in_trade = self.data.Low[-1]
-            self.chandelier_exit_level = (
-                self.lowest_low_in_trade
-                + self.tf_atr[-1] * self.tf_chandelier_atr_multiplier
-            )
+            self.stop_loss_price = p + risk_ps
 
     def manage_trend_following_exit(self, p):
-        atr = self.tf_atr[-1]
+        chandelier_exit_level = 0
         if self.position.is_long:
-            if p < self.tf_initial_stop_loss:
-                self.close_position("TF_Initial_SL")
-                return
             self.highest_high_in_trade = max(
                 self.highest_high_in_trade, self.data.High[-1]
             )
-            self.chandelier_exit_level = (
-                self.highest_high_in_trade - atr * self.tf_chandelier_atr_multiplier
+            chandelier_exit_level = (
+                self.highest_high_in_trade
+                - self.tf_atr[-1] * self.tf_chandelier_atr_multiplier
             )
-            if p < self.chandelier_exit_level:
-                self.close_position("TF_Chandelier")
+            final_sl = max(self.stop_loss_price, chandelier_exit_level)
+            if p < final_sl:
+                self.close_position("TF_Exit")
         elif self.position.is_short:
-            if p > self.tf_initial_stop_loss:
-                self.close_position("TF_Initial_SL")
-                return
             self.lowest_low_in_trade = min(self.lowest_low_in_trade, self.data.Low[-1])
-            self.chandelier_exit_level = (
-                self.lowest_low_in_trade + atr * self.tf_chandelier_atr_multiplier
+            chandelier_exit_level = (
+                self.lowest_low_in_trade
+                + self.tf_atr[-1] * self.tf_chandelier_atr_multiplier
             )
-            if p > self.chandelier_exit_level:
-                self.close_position("TF_Chandelier")
+            final_sl = min(self.stop_loss_price, chandelier_exit_level)
+            if p > final_sl:
+                self.close_position("TF_Exit")
 
     def open_mr_position(self, p, is_long):
         risk_ps = self.tf_atr[-1] * self.mr_stop_loss_atr_multiplier
@@ -761,20 +791,20 @@ class UltimateStrategy(Strategy):
         self.active_sub_strategy = "MR"
         if is_long:
             self.buy(size=size)
-            self.mr_stop_loss = p - risk_ps
+            self.stop_loss_price = p - risk_ps
         else:
             self.sell(size=size)
-            self.mr_stop_loss = p + risk_ps
+            self.stop_loss_price = p + risk_ps
 
     def manage_mean_reversion_exit(self, p):
         if (
             self.position.is_long
-            and (p >= self.mr_bb_mid[-1] or p <= self.mr_stop_loss)
+            and (p >= self.mr_bb_mid[-1] or p <= self.stop_loss_price)
         ) or (
             self.position.is_short
-            and (p <= self.mr_bb_mid[-1] or p >= self.mr_stop_loss)
+            and (p <= self.mr_bb_mid[-1] or p >= self.stop_loss_price)
         ):
-            self.close_position("MR")
+            self.close_position("MR_Exit")
 
     def close_position(self, reason: str):
         eq_before = self.equity
@@ -804,18 +834,14 @@ class UltimateStrategy(Strategy):
 
 
 if __name__ == "__main__":
-    logger.info(f"🚀 (V41.05-MR-Enhanced) 开始运行...")
+    logger.info(f"🚀 (V41.05-MR-Enhanced with Keras Model) 开始运行...")
     backtest_start_dt = pd.to_datetime(CONFIG["backtest_start_date"])
-    data_fetch_start_date = CONFIG["backtest_start_date"]
-    if CONFIG["enable_ml_component"]:
-        training_window = timedelta(days=CONFIG["training_window_days"])
-        data_fetch_start_date = (backtest_start_dt - training_window).strftime(
-            "%Y-%m-%d"
-        )
+    data_lookback = timedelta(days=CONFIG["data_lookback_days"])
+    data_fetch_start_date = (backtest_start_dt - data_lookback).strftime("%Y-%m-%d")
     logger.info(
         f"回测时间段: {CONFIG['backtest_start_date']} to {CONFIG['backtest_end_date']}"
     )
-    logger.info(f"数据获取起始日期 (包含训练窗口): {data_fetch_start_date}")
+    logger.info(f"数据获取起始日期 (包含指标计算所需历史数据): {data_fetch_start_date}")
     raw_data = {
         s: fetch_binance_klines(
             s, CONFIG["interval"], data_fetch_start_date, CONFIG["backtest_end_date"]
@@ -826,42 +852,22 @@ if __name__ == "__main__":
     if not raw_data:
         logger.error("所有品种数据获取失败，程序终止。")
         exit()
-
-    if CONFIG.get("enable_ml_component", False):
-        logger.info("### 模式: 执行模型训练 (已启用) ###")
-        training_data_end_dt = backtest_start_dt - pd.Timedelta(seconds=1)
-        logger.info(
-            f"{'='*50}\n准备训练周期，训练数据截止于: {training_data_end_dt.date()}\n训练数据窗口: {data_fetch_start_date} -> {training_data_end_dt.date()}\n{'='*50}"
-        )
-        for symbol, data in raw_data.items():
-            training_slice = data.loc[data_fetch_start_date:training_data_end_dt].copy()
-            if training_slice.empty:
-                logger.warning(f"[{symbol}] 无训练数据，跳过。")
-                continue
-            processed_training_data = preprocess_data_for_strategy(
-                training_slice, symbol
-            )
-            if not processed_training_data.empty:
-                train_and_save_model(processed_training_data, symbol, backtest_start_dt)
-    else:
-        logger.info("### 模式: 跳过模型训练 (已禁用) ###")
-
-    logger.info(f"### 准备完整回测数据 (开始日期: {CONFIG['backtest_start_date']}) ###")
+    logger.info(f"### 准备回测数据 (开始日期: {CONFIG['backtest_start_date']}) ###")
     processed_backtest_data = {}
     for symbol, data in raw_data.items():
-        backtest_period_slice = data.loc[CONFIG["backtest_start_date"] :].copy()
+        logger.info(f"为 {symbol} 预处理完整时段数据...")
+        full_processed_data = preprocess_data_for_strategy(data, symbol)
+        backtest_period_slice = full_processed_data.loc[
+            CONFIG["backtest_start_date"] :
+        ].copy()
         if not backtest_period_slice.empty:
-            logger.info(f"为 {symbol} 预处理回测数据...")
-            processed_backtest_data[symbol] = preprocess_data_for_strategy(
-                backtest_period_slice, symbol
-            )
+            processed_backtest_data[symbol] = backtest_period_slice
     processed_backtest_data = {
         s: d for s, d in processed_backtest_data.items() if not d.empty
     }
     if not processed_backtest_data:
         logger.error("无回测数据，程序终止。")
         exit()
-
     logger.info(f"### 进入回测模式 ###")
     all_stats, total_equity = {}, 0
     vols = {
@@ -872,18 +878,11 @@ if __name__ == "__main__":
     vol_weights = {
         s: (iv / sum(inv_vols.values())) * len(inv_vols) for s, iv in inv_vols.items()
     }
-
     for symbol, data in processed_backtest_data.items():
         print(f"\n{'='*80}\n正在回测品种: {symbol}\n{'='*80}")
         asset_overrides = ASSET_SPECIFIC_OVERRIDES.get(symbol, {})
         bt_params = {"symbol": symbol, "vol_weight": vol_weights.get(symbol, 1.0)}
-        override_keys = [
-            "strategy_class",
-            "score_entry_threshold",
-            "score_weights_tf",
-            "ml_weights",
-            "ml_weighted_threshold",
-        ]
+        override_keys = ["strategy_class", "score_entry_threshold", "score_weights_tf"]
         for key in override_keys:
             if key in asset_overrides:
                 bt_params[f"{key}_override"] = asset_overrides[key]
@@ -895,14 +894,12 @@ if __name__ == "__main__":
             finalize_trades=True,
         )
         stats = bt.run(**bt_params)
-        all_stats[symbol], total_equity = (
-            stats,
-            total_equity + stats["Equity Final [$]"],
-        )
-        print(f"\n{'-'*40}\n          {symbol} 回测结果摘要\n{'-'*40}", stats)
+        all_stats[symbol] = stats
+        total_equity += stats["Equity Final [$]"]
+        print(f"\n{'-'*40}\n          {symbol} 回测结果摘要\n{'-'*40}")
+        print(stats)
         if CONFIG["show_plots"]:
             bt.plot()
-
     if all_stats:
         initial_total = CONFIG["initial_cash"] * len(all_stats)
         ret = ((total_equity - initial_total) / initial_total) * 100

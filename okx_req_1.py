@@ -1,7 +1,11 @@
-# okx_live_trading_v3.4_final_fix.py
+# okx_live_trading_v3.5_kelly_persistence.py
 """
-OKX REST API 轮询版 (V3.4 最终修复与对齐版)
+OKX REST API 轮询版 (V3.5 凯利持久化版)
 - 核心变更:
+    - [!!! 关键功能 !!!] 实现凯利公式交易历史持久化：
+        - 新增 'save_kelly_history' 和 'load_kelly_history' 函数，用于将各交易对的盈亏历史写入和读出 JSON 文件。
+        - 策略初始化时会自动加载历史记录，使凯利公式在程序重启后能立即基于历史数据进行风险计算，解决了“重启后退化为默认值”的问题。
+        - 每笔交易结果产生后，会自动更新并保存历史文件，确保数据始终为最新。
     - [!!! 关键修复 !!!] 修复模型输入形状错误：重写了 'get_ml_confidence_score' 函数，
                        现在会正确地截取最近60根K线数据，并将其重塑为 (1, 60, num_features)
                        的3D形状，以完全匹配LSTM模型的输入要求。
@@ -27,6 +31,7 @@ import csv
 import urllib.parse
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from collections import deque
 import pandas as pd
 import numpy as np
 import requests
@@ -122,16 +127,16 @@ def setup_csv_logger(name, log_file, fields):
 REST_BASE = "https://www.okx.com"
 SYMBOLS = ["ETH-USDT-SWAP"]
 KLINE_INTERVAL = "15m"
-DESIRED_LEVERAGE = "20"
+DESIRED_LEVERAGE = "10"
 HISTORY_LIMIT = 500
-POLL_INTERVAL_SECONDS = 20
+POLL_INTERVAL_SECONDS = 15
 SIMULATED = True
 SIMULATED_EQUITY_START = 500000.0
 TSL_ENABLED = True
 TSL_ACTIVATION_PROFIT_PCT = 1.0
 TSL_ACTIVATION_ATR_MULT = 1.5
 TSL_TRAILING_ATR_MULT = 2.0
-MAX_DAILY_DRAWDOWN_PCT = 0.05
+MAX_DAILY_DRAWDOWN_PCT = 0.03
 MAX_CONSECUTIVE_LOSSES = 5
 TRADING_PAUSE_HOURS = 4
 AUDIT_INTERVAL_MINUTES = 15
@@ -193,6 +198,43 @@ def clear_trade_state():
     if os.path.exists(state_file):
         os.remove(state_file)
         logging.info("交易状态文件已清除。")
+
+
+# --- [新增代码] 凯利历史持久化函数 ---
+def save_kelly_history(symbol, history_deque):
+    """保存指定交易对的凯利公式历史交易记录。"""
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    history_file = os.path.join(log_dir, f"{symbol}_kelly_history.json")
+    try:
+        with open(history_file, "w") as f:
+            # 将 deque 转换为 list 进行 JSON 序列化
+            json.dump(list(history_deque), f, indent=4)
+        logging.debug(f"[{symbol}] 已保存凯利公式交易历史。")
+    except Exception as e:
+        logging.error(f"[{symbol}] 保存凯利历史时出错: {e}")
+
+
+def load_kelly_history(symbol, maxlen):
+    """加载指定交易对的凯利公式历史交易记录。"""
+    log_dir = "logs"
+    history_file = os.path.join(log_dir, f"{symbol}_kelly_history.json")
+    if os.path.exists(history_file):
+        try:
+            with open(history_file, "r") as f:
+                history_list = json.load(f)
+                # 使用加载的历史记录初始化 deque，deque 会自动处理 maxlen
+                logging.info(
+                    f"[{symbol}] 成功加载 {len(history_list)} 条凯利历史记录。"
+                )
+                return deque(history_list, maxlen=maxlen)
+        except (json.JSONDecodeError, TypeError) as e:
+            logging.error(f"[{symbol}] 加载凯利历史文件失败，将使用空历史记录: {e}")
+    # 如果文件不存在或加载失败，返回一个空的 deque
+    return deque(maxlen=maxlen)
+
+
+# --- [新增代码结束] ---
 
 
 def run_advanced_model_inference(df):
@@ -541,9 +583,13 @@ class UltimateStrategy:
         self.data, self.position = df.copy(), None
         self.pos_logger, self.instrument_details = pos_logger, instrument_details
         logging.info(f"[{self.symbol}] 策略初始化...")
-        from collections import deque
 
-        self.recent_trade_returns = deque(maxlen=STRATEGY_PARAMS["kelly_trade_history"])
+        # --- [代码修改] 从文件加载历史交易记录，以实现持久化 ---
+        self.recent_trade_returns = load_kelly_history(
+            self.symbol, STRATEGY_PARAMS["kelly_trade_history"]
+        )
+        # --- [修改结束] ---
+
         self.keras_model, self.scaler, self.feature_columns = None, None, None
         self.score_entry_threshold = ASSET_SPECIFIC_OVERRIDES.get(symbol, {}).get(
             "score_entry_threshold", STRATEGY_PARAMS["score_entry_threshold"]
@@ -848,6 +894,9 @@ class UltimateStrategy:
 
     def register_trade_result(self, pnl_pct):
         self.recent_trade_returns.append(pnl_pct)
+        # --- [代码修改] 每次更新后，将新的交易历史保存到文件 ---
+        save_kelly_history(self.symbol, self.recent_trade_returns)
+        # --- [修改结束] ---
         self.register_loss() if pnl_pct < 0 else self.register_win()
 
     def set_position(self, new_position):
@@ -864,475 +913,439 @@ class UltimateStrategy:
 
 
 # --- Main Logic and Helper Functions ---
-def manage_position_exit_orders(trader, symbol, pos_data, strategy, exit_mode):
-    # (此函数内容未变，为简洁省略)
-    pass
+def manage_position_exit_orders(
+    trader: OKXTrader,
+    symbol: str,
+    pos_data: dict,
+    strategy: UltimateStrategy,
+    exit_mode: str,
+):
+    entry_px, pos_size, pos_side = (
+        float(pos_data.get("avgPx")),
+        abs(float(pos_data.get("pos"))),
+        "LONG" if float(pos_data.get("pos")) > 0 else "SHORT",
+    )
+    strategy.compute_all_features()
+    atr = strategy.data["tf_atr"].iloc[-1]
+    if pd.isna(atr):
+        trade_flow_logger.error(f"[{symbol}] ATR計算失敗，無法設置出場訂單。")
+        return False
+    close_side, sl_mult = "sell" if pos_side == "LONG" else "buy", STRATEGY_PARAMS[
+        "sl_atr_multiplier"
+    ]
+    sl_price = (
+        entry_px - (atr * sl_mult) if pos_side == "LONG" else entry_px + (atr * sl_mult)
+    )
+    trade_flow_logger.info(
+        f"[{symbol}] 為 {pos_side} 倉位 (均價: {entry_px:.4f}) 設置止損單... 訂單類型: {close_side.upper()}, 觸發價: {sl_price:.4f}"
+    )
+    sl_res = trader.place_trigger_order(
+        symbol, close_side, pos_size, sl_price, "Stop-Loss"
+    )
+    sl_id = None
+    if sl_res and sl_res.get("code") == "0" and sl_res["data"][0]["sCode"] == "0":
+        sl_id = sl_res["data"][0]["algoId"]
+        trade_flow_logger.info(f"[{symbol}] 止損單設置成功, Algo ID: {sl_id}")
+    else:
+        trade_flow_logger.error(f"[{symbol}] 設置止損單失敗！響應: {sl_res}")
+        return False
+    if exit_mode == "fixed_target":
+        tp_rr = STRATEGY_PARAMS["tp_rr_ratio"]
+        tp_price = (
+            entry_px + (atr * sl_mult * tp_rr)
+            if pos_side == "LONG"
+            else entry_px - (atr * sl_mult * tp_rr)
+        )
+        trade_flow_logger.info(
+            f"[{symbol}] (震盪市) 設置固定止盈單... 訂單類型: {close_side.upper()}, 觸發價: {tp_price:.4f}"
+        )
+        trader.place_trigger_order(
+            symbol, close_side, pos_size, tp_price, "Take-Profit"
+        )
+    if exit_mode == "trailing_stop":
+        trade_state = {
+            "entry_price": entry_px,
+            "initial_stop_price": sl_price,
+            "current_stop_price": sl_price,
+            "current_stop_id": sl_id,
+            "trailing_stop_active": False,
+            "exit_mode": "trailing_stop",
+        }
+        save_trade_state(trade_state)
+        trade_flow_logger.info(f"[{symbol}] 已成功保存交易狀態，準備進行移動止損。")
+    return True
 
 
-def manage_trailing_stop(trader, symbol, strategy, current_price, pos_data):
-    # (此函数内容未变，为简洁省略)
-    pass
+def manage_trailing_stop(
+    trader: OKXTrader,
+    symbol: str,
+    strategy: UltimateStrategy,
+    current_price: float,
+    pos_data: dict,
+):
+    if not TSL_ENABLED:
+        return
+    trade_state = load_trade_state()
+    if not trade_state or trade_state.get("exit_mode") != "trailing_stop":
+        return
+    pos_side, entry_price, current_stop_price, is_active = (
+        "LONG" if float(pos_data.get("pos", "0")) > 0 else "SHORT",
+        float(trade_state["entry_price"]),
+        float(trade_state["current_stop_price"]),
+        trade_state["trailing_stop_active"],
+    )
+    if not is_active:
+        unrealized_pnl_pct = 0
+        if entry_price > 0:
+            unrealized_pnl_pct = (
+                ((current_price - entry_price) / entry_price) * 100
+                if pos_side == "LONG"
+                else ((entry_price - current_price) / entry_price) * 100
+            )
+        profit_pct_condition_met = unrealized_pnl_pct >= TSL_ACTIVATION_PROFIT_PCT
+        atr = strategy.data["tf_atr"].iloc[-1]
+        activation_distance = atr * TSL_ACTIVATION_ATR_MULT
+        price_move_condition_met = (
+            pos_side == "LONG" and current_price >= entry_price + activation_distance
+        ) or (
+            pos_side == "SHORT" and current_price <= entry_price - activation_distance
+        )
+        if profit_pct_condition_met or price_move_condition_met:
+            trade_state["trailing_stop_active"] = True
+            is_active = True
+            reason = (
+                "利潤達到閾值" if profit_pct_condition_met else "價格移動達到ATR閾值"
+            )
+            trade_flow_logger.info(f"[{symbol}] 移動止損已激活! 原因: {reason}")
+            save_trade_state(trade_state)
+    if is_active:
+        atr = strategy.data["tf_atr"].iloc[-1]
+        trailing_distance = atr * TSL_TRAILING_ATR_MULT
+        new_stop_price = None
+        if pos_side == "LONG":
+            potential_stop = current_price - trailing_distance
+            if potential_stop > current_stop_price:
+                new_stop_price = potential_stop
+        else:
+            potential_stop = current_price + trailing_distance
+            if potential_stop < current_stop_price:
+                new_stop_price = potential_stop
+        if new_stop_price is not None:
+            trade_flow_logger.info(
+                f"[{symbol}] 調整移動止損: 舊={current_stop_price:.4f}, 新={new_stop_price:.4f}"
+            )
+            pos_size, close_side, old_stop_id = (
+                abs(float(pos_data.get("pos"))),
+                "sell" if pos_side == "LONG" else "buy",
+                trade_state.get("current_stop_id"),
+            )
+            res = trader.place_trigger_order(
+                symbol, close_side, pos_size, new_stop_price, "Trailing-Stop-Update"
+            )
+            if res and res.get("code") == "0" and res["data"][0]["sCode"] == "0":
+                new_stop_id = res["data"][0]["algoId"]
+                trade_flow_logger.info(
+                    f"[{symbol}] 新移動止損單設置成功, Algo ID: {new_stop_id}"
+                )
+                if old_stop_id:
+                    trader.cancel_algo_orders(symbol, [old_stop_id])
+                    trade_flow_logger.info(
+                        f"[{symbol}] 舊止損單 (ID: {old_stop_id}) 已取消。"
+                    )
+                (
+                    trade_state["current_stop_price"],
+                    trade_state["current_stop_id"],
+                ) = (new_stop_price, new_stop_id)
+                save_trade_state(trade_state)
+            else:
+                trade_flow_logger.error(f"[{symbol}] 調整移動止損失敗！響應: {res}")
 
 
 def main():
-    # (主函数内容未变，为简洁省略)
-    pass
-
-
-if __name__ == "__main__":
-    # 为了让代码块可以被直接复制，我将省略部分未改变的函数的具体实现
-    # 在您的实际文件中，请保留 manage_position_exit_orders, manage_trailing_stop 和 main 函数的完整内容
-
-    # Placeholder for functions to allow copying
-    def manage_position_exit_orders(
-        trader: OKXTrader,
-        symbol: str,
-        pos_data: dict,
-        strategy: UltimateStrategy,
-        exit_mode: str,
-    ):
-        entry_px, pos_size, pos_side = (
-            float(pos_data.get("avgPx")),
-            abs(float(pos_data.get("pos"))),
-            "LONG" if float(pos_data.get("pos")) > 0 else "SHORT",
+    global trade_flow_logger, trade_logger
+    trade_flow_logger = setup_logging()
+    position_logger = setup_csv_logger(
+        "position_logger", "positions.csv", ["timestamp", "symbol", "position"]
+    )
+    trade_logger = setup_csv_logger(
+        "trade_logger",
+        "trades.csv",
+        ["timestamp", "symbol", "action", "size", "response"],
+    )
+    logging.info("啟動 OKX REST API 輪詢交易程序 (V3.5 凯利持久化版)...")
+    OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE = (
+        os.getenv("OKX_API_KEY"),
+        os.getenv("OKX_API_SECRET"),
+        os.getenv("OKX_API_PASSPHRASE"),
+    )
+    if not all([OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE]):
+        logging.error("请设置环境变量: OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE")
+        return
+    trader = OKXTrader(
+        OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE, simulated=SIMULATED
+    )
+    initial_equity = trader.fetch_account_balance("USDT")
+    if initial_equity is None:
+        logging.error("无法获取初始账户余额，将使用默认启动资金。")
+        initial_equity = SIMULATED_EQUITY_START
+    else:
+        logging.info(f"查询成功，初始账户权益为: {initial_equity:.2f} USDT")
+    strategies = {}
+    for symbol in SYMBOLS:
+        trader.set_leverage(symbol, DESIRED_LEVERAGE, mgnMode="cross", posSide="net")
+        instrument_details = trader.fetch_instrument_details(symbol)
+        if not instrument_details:
+            logging.error(f"无法为 {symbol} 获获取合约详细信息，跳过。")
+            continue
+        initial_df = trader.fetch_history_klines(
+            symbol, bar=KLINE_INTERVAL, limit=HISTORY_LIMIT
         )
-        strategy.compute_all_features()
-        atr = strategy.data["tf_atr"].iloc[-1]
-        if pd.isna(atr):
-            trade_flow_logger.error(f"[{symbol}] ATR計算失敗，無法設置出場訂單。")
-            return False
-        close_side, sl_mult = "sell" if pos_side == "LONG" else "buy", STRATEGY_PARAMS[
-            "sl_atr_multiplier"
-        ]
-        sl_price = (
-            entry_px - (atr * sl_mult)
-            if pos_side == "LONG"
-            else entry_px + (atr * sl_mult)
-        )
-        trade_flow_logger.info(
-            f"[{symbol}] 為 {pos_side} 倉位 (均價: {entry_px:.4f}) 設置止損單... 訂單類型: {close_side.upper()}, 觸發價: {sl_price:.4f}"
-        )
-        sl_res = trader.place_trigger_order(
-            symbol, close_side, pos_size, sl_price, "Stop-Loss"
-        )
-        sl_id = None
-        if sl_res and sl_res.get("code") == "0" and sl_res["data"][0]["sCode"] == "0":
-            sl_id = sl_res["data"][0]["algoId"]
-            trade_flow_logger.info(f"[{symbol}] 止損單設置成功, Algo ID: {sl_id}")
-        else:
-            trade_flow_logger.error(f"[{symbol}] 設置止損單失敗！響應: {sl_res}")
-            return False
-        if exit_mode == "fixed_target":
-            tp_rr = STRATEGY_PARAMS["tp_rr_ratio"]
-            tp_price = (
-                entry_px + (atr * sl_mult * tp_rr)
-                if pos_side == "LONG"
-                else entry_px - (atr * sl_mult * tp_rr)
-            )
-            trade_flow_logger.info(
-                f"[{symbol}] (震盪市) 設置固定止盈單... 訂單類型: {close_side.upper()}, 觸發價: {tp_price:.4f}"
-            )
-            trader.place_trigger_order(
-                symbol, close_side, pos_size, tp_price, "Take-Profit"
-            )
-        if exit_mode == "trailing_stop":
-            trade_state = {
-                "entry_price": entry_px,
-                "initial_stop_price": sl_price,
-                "current_stop_price": sl_price,
-                "current_stop_id": sl_id,
-                "trailing_stop_active": False,
-                "exit_mode": "trailing_stop",
-            }
-            save_trade_state(trade_state)
-            trade_flow_logger.info(f"[{symbol}] 已成功保存交易狀態，準備進行移動止損。")
-        return True
-
-    def manage_trailing_stop(
-        trader: OKXTrader,
-        symbol: str,
-        strategy: UltimateStrategy,
-        current_price: float,
-        pos_data: dict,
-    ):
-        if not TSL_ENABLED:
+        if initial_df is None or initial_df.empty:
+            logging.error(f"无法为 {symbol} 获取初始数据，退出。")
             return
-        trade_state = load_trade_state()
-        if not trade_state or trade_state.get("exit_mode") != "trailing_stop":
-            return
-        pos_side, entry_price, current_stop_price, is_active = (
-            "LONG" if float(pos_data.get("pos", "0")) > 0 else "SHORT",
-            float(trade_state["entry_price"]),
-            float(trade_state["current_stop_price"]),
-            trade_state["trailing_stop_active"],
+        strategy = UltimateStrategy(
+            initial_df.copy(),
+            symbol,
+            trader,
+            pos_logger=position_logger,
+            instrument_details=instrument_details,
         )
-        if not is_active:
-            unrealized_pnl_pct = 0
-            if entry_price > 0:
-                unrealized_pnl_pct = (
-                    ((current_price - entry_price) / entry_price) * 100
-                    if pos_side == "LONG"
-                    else ((entry_price - current_price) / entry_price) * 100
-                )
-            profit_pct_condition_met = unrealized_pnl_pct >= TSL_ACTIVATION_PROFIT_PCT
-            atr = strategy.data["tf_atr"].iloc[-1]
-            activation_distance = atr * TSL_ACTIVATION_ATR_MULT
-            price_move_condition_met = (
-                pos_side == "LONG"
-                and current_price >= entry_price + activation_distance
-            ) or (
-                pos_side == "SHORT"
-                and current_price <= entry_price - activation_distance
+        strategy.equity = initial_equity
+        strategies[symbol] = strategy
+        initial_position_data = trader.fetch_current_position(symbol)
+        clear_trade_state()
+        if initial_position_data and initial_position_data is not False:
+            trade_flow_logger.warning(f"[{symbol}] 检测到已有仓位，尝试智能接管...")
+            pos_side = (
+                "LONG" if float(initial_position_data.get("pos", "0")) > 0 else "SHORT"
             )
-            if profit_pct_condition_met or price_move_condition_met:
-                trade_state["trailing_stop_active"] = True
-                is_active = True
-                reason = (
-                    "利潤達到閾值"
-                    if profit_pct_condition_met
-                    else "價格移動達到ATR閾值"
-                )
-                trade_flow_logger.info(f"[{symbol}] 移動止損已激活! 原因: {reason}")
-                save_trade_state(trade_state)
-        if is_active:
-            atr = strategy.data["tf_atr"].iloc[-1]
-            trailing_distance = atr * TSL_TRAILING_ATR_MULT
-            new_stop_price = None
-            if pos_side == "LONG":
-                potential_stop = current_price - trailing_distance
-                if potential_stop > current_stop_price:
-                    new_stop_price = potential_stop
-            else:
-                potential_stop = current_price + trailing_distance
-                if potential_stop < current_stop_price:
-                    new_stop_price = potential_stop
-            if new_stop_price is not None:
-                trade_flow_logger.info(
-                    f"[{symbol}] 調整移動止損: 舊={current_stop_price:.4f}, 新={new_stop_price:.4f}"
-                )
-                pos_size, close_side, old_stop_id = (
-                    abs(float(pos_data.get("pos"))),
-                    "sell" if pos_side == "LONG" else "buy",
-                    trade_state.get("current_stop_id"),
-                )
-                res = trader.place_trigger_order(
-                    symbol, close_side, pos_size, new_stop_price, "Trailing-Stop-Update"
-                )
-                if res and res.get("code") == "0" and res["data"][0]["sCode"] == "0":
-                    new_stop_id = res["data"][0]["algoId"]
-                    trade_flow_logger.info(
-                        f"[{symbol}] 新移動止損單設置成功, Algo ID: {new_stop_id}"
-                    )
-                    if old_stop_id:
-                        trader.cancel_algo_orders(symbol, [old_stop_id])
-                        trade_flow_logger.info(
-                            f"[{symbol}] 舊止損單 (ID: {old_stop_id}) 已取消。"
-                        )
-                    (
-                        trade_state["current_stop_price"],
-                        trade_state["current_stop_id"],
-                    ) = (new_stop_price, new_stop_id)
-                    save_trade_state(trade_state)
-                else:
-                    trade_flow_logger.error(f"[{symbol}] 調整移動止損失敗！響應: {res}")
-
-    def main():
-        global trade_flow_logger, trade_logger
-        trade_flow_logger = setup_logging()
-        position_logger = setup_csv_logger(
-            "position_logger", "positions.csv", ["timestamp", "symbol", "position"]
-        )
-        trade_logger = setup_csv_logger(
-            "trade_logger",
-            "trades.csv",
-            ["timestamp", "symbol", "action", "size", "response"],
-        )
-        logging.info("啟動 OKX REST API 輪詢交易程序 (V3.4 最终修复与对齐版)...")
-        OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE = (
-            os.getenv("OKX_API_KEY"),
-            os.getenv("OKX_API_SECRET"),
-            os.getenv("OKX_API_PASSPHRASE"),
-        )
-        if not all([OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE]):
-            logging.error(
-                "请设置环境变量: OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE"
-            )
-            return
-        trader = OKXTrader(
-            OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE, simulated=SIMULATED
-        )
-        initial_equity = trader.fetch_account_balance("USDT")
-        if initial_equity is None:
-            logging.error("无法获取初始账户余额，将使用默认启动资金。")
-            initial_equity = SIMULATED_EQUITY_START
-        else:
-            logging.info(f"查询成功，初始账户权益为: {initial_equity:.2f} USDT")
-        strategies = {}
-        for symbol in SYMBOLS:
-            trader.set_leverage(
-                symbol, DESIRED_LEVERAGE, mgnMode="cross", posSide="net"
-            )
-            instrument_details = trader.fetch_instrument_details(symbol)
-            if not instrument_details:
-                logging.error(f"无法为 {symbol} 获获取合约详细信息，跳过。")
-                continue
-            initial_df = trader.fetch_history_klines(
-                symbol, bar=KLINE_INTERVAL, limit=HISTORY_LIMIT
-            )
-            if initial_df is None or initial_df.empty:
-                logging.error(f"无法为 {symbol} 获取初始数据，退出。")
-                return
-            strategy = UltimateStrategy(
-                initial_df.copy(),
-                symbol,
-                trader,
-                pos_logger=position_logger,
-                instrument_details=instrument_details,
-            )
-            strategy.equity = initial_equity
-            strategies[symbol] = strategy
-            initial_position_data = trader.fetch_current_position(symbol)
-            clear_trade_state()
-            if initial_position_data and initial_position_data is not False:
-                trade_flow_logger.warning(f"[{symbol}] 检测到已有仓位，尝试智能接管...")
-                pos_side = (
-                    "LONG"
-                    if float(initial_position_data.get("pos", "0")) > 0
-                    else "SHORT"
-                )
-                strategy.set_position(pos_side)
-                for i in range(3):
-                    open_algos = trader.fetch_open_algo_orders(symbol)
-                    if not open_algos:
-                        break
-                    trader.cancel_algo_orders(
-                        symbol, [order["algoId"] for order in open_algos]
-                    )
-                    time.sleep(1)
-                manage_position_exit_orders(
-                    trader, symbol, initial_position_data, strategy, "trailing_stop"
-                )
-            logging.info(
-                f"策略 {symbol} 初始化成功，最新K線時間: {strategy.data.index[-1]}"
-            )
-        last_audit_time = datetime.utcnow()
-        while True:
-            try:
-                current_equity = trader.fetch_account_balance("USDT")
-                if current_equity is not None and current_equity < initial_equity * (
-                    1 - MAX_DAILY_DRAWDOWN_PCT
-                ):
-                    trade_flow_logger.critical(
-                        f"全局熔断！当前权益 {current_equity:.2f} USDT 已低于最大回撤限制。停止！"
-                    )
+            strategy.set_position(pos_side)
+            for i in range(3):
+                open_algos = trader.fetch_open_algo_orders(symbol)
+                if not open_algos:
                     break
+                trader.cancel_algo_orders(
+                    symbol, [order["algoId"] for order in open_algos]
+                )
+                time.sleep(1)
+            manage_position_exit_orders(
+                trader, symbol, initial_position_data, strategy, "trailing_stop"
+            )
+        logging.info(
+            f"策略 {symbol} 初始化成功，最新K線時間: {strategy.data.index[-1]}"
+        )
+    last_audit_time = datetime.utcnow()
+    while True:
+        try:
+            current_equity = trader.fetch_account_balance("USDT")
+            if current_equity is not None and current_equity < initial_equity * (
+                1 - MAX_DAILY_DRAWDOWN_PCT
+            ):
+                trade_flow_logger.critical(
+                    f"全局熔断！当前权益 {current_equity:.2f} USDT 已低于最大回撤限制。停止！"
+                )
+                break
+            for symbol in SYMBOLS:
+                if symbol not in strategies:
+                    continue
+                strategy = strategies[symbol]
+                if current_equity is not None:
+                    strategy.equity = current_equity
+                latest_candles_df = trader.fetch_history_klines(
+                    symbol, bar=KLINE_INTERVAL, limit=2
+                )
+                if latest_candles_df is None or latest_candles_df.empty:
+                    logging.warning(f"无法获取 {symbol} 的最新K线数据。")
+                    continue
+                latest_candle = latest_candles_df.iloc[-1]
+                last_known_ts = strategy.data.index[-1]
+                if latest_candle.name > last_known_ts:
+                    logging.info(
+                        f"[{symbol}] 新K線 {latest_candle.name} close={latest_candle.Close:.4f} | 倉位: {strategy.position}"
+                    )
+                    strategy.update_with_candle(latest_candle)
+                    if strategy.position is None:
+                        if strategy.is_trading_paused:
+                            logging.warning(f"[{symbol}] 策略因连续亏损暂停交易中...")
+                            continue
+                        action, score = strategy.next_on_candle_close()
+                        if action:
+                            exit_mode = (
+                                "trailing_stop"
+                                if strategy.data.iloc[-1]["market_regime"] == 1
+                                else "fixed_target"
+                            )
+                            trade_flow_logger.info(
+                                f"[{symbol}] 策略決策: {action} | 觸發權重值: {score:.4f} | 出場模式: {exit_mode}"
+                            )
+                            side = "buy" if action["action"] == "BUY" else "sell"
+                            res = trader.place_market_order(
+                                symbol, side, action["size"]
+                            )
+                            if (
+                                res
+                                and res.get("code") == "0"
+                                and res.get("data")[0].get("sCode") == "0"
+                            ):
+                                pos_data = None
+                                for i in range(8):
+                                    time.sleep(2.5)
+                                    pos_data = trader.fetch_current_position(symbol)
+                                    if pos_data and pos_data is not False:
+                                        break
+                                if pos_data:
+                                    intended_size, actual_size = float(
+                                        action["size"]
+                                    ), abs(float(pos_data.get("pos", "0")))
+                                    if actual_size >= intended_size * 0.9:
+                                        trade_flow_logger.info(
+                                            f"[{symbol}] 仓位建立已确认并验证通过。意图: {intended_size}, 实际: {actual_size}"
+                                        )
+                                        new_pos_side = (
+                                            "LONG"
+                                            if float(pos_data.get("pos")) > 0
+                                            else "SHORT"
+                                        )
+                                        strategy.set_position(new_pos_side)
+                                        manage_position_exit_orders(
+                                            trader,
+                                            symbol,
+                                            pos_data,
+                                            strategy,
+                                            exit_mode,
+                                        )
+                                    else:
+                                        trade_flow_logger.critical(
+                                            f"[{symbol}] [!!严重错误!!] 开仓验证失败！成交量严重不足！意图开仓: {intended_size}, 实际成交: {actual_size}。策略状态将不被更新。"
+                                        )
+                                else:
+                                    logging.error(
+                                        f"[{symbol}] 下单请求已发送，但在多次尝试后仍未能查询到仓位建立！"
+                                    )
+                            else:
+                                logging.error(
+                                    f"[{symbol}] 下单请求失败或被交易所拒绝，响应: {json.dumps(res)}"
+                                )
+                real_position_data = trader.fetch_current_position(symbol)
+                if (
+                    strategy.position is not None
+                    and real_position_data
+                    and real_position_data is not False
+                ):
+                    current_price = trader.fetch_ticker_price(symbol)
+                    if current_price:
+                        manage_trailing_stop(
+                            trader,
+                            symbol,
+                            strategy,
+                            current_price,
+                            real_position_data,
+                        )
+                    else:
+                        logging.warning(
+                            f"[{symbol}] 無法獲取當前價格，跳過移動止損檢查。"
+                        )
+                elif strategy.position is not None and real_position_data is None:
+                    trade_flow_logger.info(f"[{symbol}] 檢測到倉位已被平倉。")
+                    closed_trade_state = load_trade_state()
+                    if closed_trade_state and "entry_price" in closed_trade_state:
+                        entry_price = closed_trade_state["entry_price"]
+                        exit_price = strategy.data.iloc[-1].Close
+                        pnl_pct = (
+                            (
+                                (exit_price - entry_price) / entry_price
+                                if strategy.position == "LONG"
+                                else (entry_price - exit_price) / entry_price
+                            )
+                            if entry_price != 0
+                            else 0.0
+                        )
+                        trade_flow_logger.info(
+                            f"[{symbol}] 交易结束: 入场价={entry_price:.4f}, 出场价(约)={exit_price:.4f}, PnL %={pnl_pct:.4%}"
+                        )
+                        strategy.register_trade_result(pnl_pct)
+                    strategy.set_position(None)
+                    clear_trade_state()
+                    trade_flow_logger.info(f"[{symbol}] 策略狀態已重置。")
+                current_price = trader.fetch_ticker_price(symbol)
+                price_str, equity_str = (
+                    f"{current_price:.4f}" if current_price is not None else "N/A"
+                ), (f"{strategy.equity:.2f}" if strategy.equity is not None else "N/A")
+                logging.info(
+                    f"[{symbol}] 等待新K線... 倉位: {strategy.position} | 權益: {equity_str} USDT | 價格: {price_str} | K線: {strategy.data.index[-1]}"
+                )
+            if datetime.utcnow() - last_audit_time >= pd.Timedelta(
+                minutes=AUDIT_INTERVAL_MINUTES
+            ):
+                last_audit_time = datetime.utcnow()
+                trade_flow_logger.info(
+                    f"--- [状态审计开始 (每 {AUDIT_INTERVAL_MINUTES} 分钟)] ---"
+                )
                 for symbol in SYMBOLS:
                     if symbol not in strategies:
                         continue
                     strategy = strategies[symbol]
-                    if current_equity is not None:
-                        strategy.equity = current_equity
-                    latest_candles_df = trader.fetch_history_klines(
-                        symbol, bar=KLINE_INTERVAL, limit=2
-                    )
-                    if latest_candles_df is None or latest_candles_df.empty:
-                        logging.warning(f"无法获取 {symbol} 的最新K线数据。")
+                    real_position = trader.fetch_current_position(symbol)
+                    if real_position is False:
+                        logging.warning(f"[{symbol}] [审计跳过] 无法获取仓位。")
                         continue
-                    latest_candle = latest_candles_df.iloc[-1]
-                    last_known_ts = strategy.data.index[-1]
-                    if latest_candle.name > last_known_ts:
-                        logging.info(
-                            f"[{symbol}] 新K線 {latest_candle.name} close={latest_candle.Close:.4f} | 倉位: {strategy.position}"
+                    if strategy.position is None and real_position is not None:
+                        trade_flow_logger.critical(
+                            f"[{symbol}] [审计发现] 状态不一致！策略无仓位，但交易所存在仓位。需手动干预！"
                         )
-                        strategy.update_with_candle(latest_candle)
-                        if strategy.position is None:
-                            if strategy.is_trading_paused:
-                                logging.warning(
-                                    f"[{symbol}] 策略因连续亏损暂停交易中..."
-                                )
-                                continue
-                            action, score = strategy.next_on_candle_close()
-                            if action:
-                                exit_mode = (
-                                    "trailing_stop"
-                                    if strategy.data.iloc[-1]["market_regime"] == 1
-                                    else "fixed_target"
-                                )
-                                trade_flow_logger.info(
-                                    f"[{symbol}] 策略決策: {action} | 觸發權重值: {score:.4f} | 出場模式: {exit_mode}"
-                                )
-                                side = "buy" if action["action"] == "BUY" else "sell"
-                                res = trader.place_market_order(
-                                    symbol, side, action["size"]
-                                )
-                                if (
-                                    res
-                                    and res.get("code") == "0"
-                                    and res.get("data")[0].get("sCode") == "0"
-                                ):
-                                    pos_data = None
-                                    for i in range(8):
-                                        time.sleep(2.5)
-                                        pos_data = trader.fetch_current_position(symbol)
-                                        if pos_data and pos_data is not False:
-                                            break
-                                    if pos_data:
-                                        intended_size, actual_size = float(
-                                            action["size"]
-                                        ), abs(float(pos_data.get("pos", "0")))
-                                        if actual_size >= intended_size * 0.9:
-                                            trade_flow_logger.info(
-                                                f"[{symbol}] 仓位建立已确认并验证通过。意图: {intended_size}, 实际: {actual_size}"
-                                            )
-                                            new_pos_side = (
-                                                "LONG"
-                                                if float(pos_data.get("pos")) > 0
-                                                else "SHORT"
-                                            )
-                                            strategy.set_position(new_pos_side)
-                                            manage_position_exit_orders(
-                                                trader,
-                                                symbol,
-                                                pos_data,
-                                                strategy,
-                                                exit_mode,
-                                            )
-                                        else:
-                                            trade_flow_logger.critical(
-                                                f"[{symbol}] [!!严重错误!!] 开仓验证失败！成交量严重不足！意图开仓: {intended_size}, 实际成交: {actual_size}。策略状态将不被更新。"
-                                            )
-                                    else:
-                                        logging.error(
-                                            f"[{symbol}] 下单请求已发送，但在多次尝试后仍未能查询到仓位建立！"
-                                        )
-                                else:
-                                    logging.error(
-                                        f"[{symbol}] 下单请求失败或被交易所拒绝，响应: {json.dumps(res)}"
-                                    )
-                    real_position_data = trader.fetch_current_position(symbol)
-                    if (
-                        strategy.position is not None
-                        and real_position_data
-                        and real_position_data is not False
-                    ):
-                        current_price = trader.fetch_ticker_price(symbol)
-                        if current_price:
-                            manage_trailing_stop(
-                                trader,
-                                symbol,
-                                strategy,
-                                current_price,
-                                real_position_data,
-                            )
-                        else:
-                            logging.warning(
-                                f"[{symbol}] 無法獲取當前價格，跳過移動止損檢查。"
-                            )
-                    elif strategy.position is not None and real_position_data is None:
-                        trade_flow_logger.info(f"[{symbol}] 檢測到倉位已被平倉。")
-                        closed_trade_state = load_trade_state()
-                        if closed_trade_state and "entry_price" in closed_trade_state:
-                            entry_price = closed_trade_state["entry_price"]
-                            exit_price = strategy.data.iloc[-1].Close
-                            pnl_pct = (
-                                (
-                                    (exit_price - entry_price) / entry_price
-                                    if strategy.position == "LONG"
-                                    else (entry_price - exit_price) / entry_price
-                                )
-                                if entry_price != 0
-                                else 0.0
-                            )
-                            trade_flow_logger.info(
-                                f"[{symbol}] 交易结束: 入场价={entry_price:.4f}, 出场价(约)={exit_price:.4f}, PnL %={pnl_pct:.4%}"
-                            )
-                            strategy.register_trade_result(pnl_pct)
+                    elif strategy.position is not None and real_position is None:
+                        trade_flow_logger.warning(
+                            f"[{symbol}] [审计发现] 状态不一致！策略有仓位，但交易所无。自动重置。"
+                        )
                         strategy.set_position(None)
                         clear_trade_state()
-                        trade_flow_logger.info(f"[{symbol}] 策略狀態已重置。")
-                    current_price = trader.fetch_ticker_price(symbol)
-                    price_str, equity_str = (
-                        f"{current_price:.4f}" if current_price is not None else "N/A"
-                    ), (
-                        f"{strategy.equity:.2f}"
-                        if strategy.equity is not None
-                        else "N/A"
-                    )
-                    logging.info(
-                        f"[{symbol}] 等待新K線... 倉位: {strategy.position} | 權益: {equity_str} USDT | 價格: {price_str} | K線: {strategy.data.index[-1]}"
-                    )
-                if datetime.utcnow() - last_audit_time >= pd.Timedelta(
-                    minutes=AUDIT_INTERVAL_MINUTES
-                ):
-                    last_audit_time = datetime.utcnow()
-                    trade_flow_logger.info(
-                        f"--- [状态审计开始 (每 {AUDIT_INTERVAL_MINUTES} 分钟)] ---"
-                    )
-                    for symbol in SYMBOLS:
-                        if symbol not in strategies:
-                            continue
-                        strategy = strategies[symbol]
-                        real_position = trader.fetch_current_position(symbol)
-                        if real_position is False:
-                            logging.warning(f"[{symbol}] [审计跳过] 无法获取仓位。")
-                            continue
-                        if strategy.position is None and real_position is not None:
+                    elif real_position is not None:
+                        real_pos_side = (
+                            "LONG"
+                            if float(real_position.get("pos", "0")) > 0
+                            else "SHORT"
+                        )
+                        if strategy.position != real_pos_side:
                             trade_flow_logger.critical(
-                                f"[{symbol}] [审计发现] 状态不一致！策略无仓位，但交易所存在仓位。需手动干预！"
+                                f"[{symbol}] [审计发现] 状态严重不一致！策略: {strategy.position} vs 交易所: {real_pos_side}。"
                             )
-                        elif strategy.position is not None and real_position is None:
                             trade_flow_logger.warning(
-                                f"[{symbol}] [审计发现] 状态不一致！策略有仓位，但交易所无。自动重置。"
+                                f"[{symbol}] 進入緊急風控模式：將清空所有倉位和掛單..."
                             )
+                            try:
+                                open_algos = trader.fetch_open_algo_orders(symbol)
+                                if open_algos:
+                                    trader.cancel_algo_orders(
+                                        symbol, [o["algoId"] for o in open_algos]
+                                    )
+                                pos_size = abs(float(real_position.get("pos", "0")))
+                                close_side = (
+                                    "buy" if real_pos_side == "SHORT" else "sell"
+                                )
+                                trader.place_market_order(symbol, close_side, pos_size)
+                            except Exception as e:
+                                trade_flow_logger.error(
+                                    f"[{symbol}] [風控] 緊急平仓/撤单失败: {e}"
+                                )
                             strategy.set_position(None)
                             clear_trade_state()
-                        elif real_position is not None:
-                            real_pos_side = (
-                                "LONG"
-                                if float(real_position.get("pos", "0")) > 0
-                                else "SHORT"
+                            trade_flow_logger.info(
+                                f"[{symbol}] [風控] 策略狀態已強制重置。"
                             )
-                            if strategy.position != real_pos_side:
-                                trade_flow_logger.critical(
-                                    f"[{symbol}] [审计发现] 状态严重不一致！策略: {strategy.position} vs 交易所: {real_pos_side}。"
-                                )
-                                trade_flow_logger.warning(
-                                    f"[{symbol}] 進入緊急風控模式：將清空所有倉位和掛單..."
-                                )
-                                try:
-                                    open_algos = trader.fetch_open_algo_orders(symbol)
-                                    if open_algos:
-                                        trader.cancel_algo_orders(
-                                            symbol, [o["algoId"] for o in open_algos]
-                                        )
-                                    pos_size = abs(float(real_position.get("pos", "0")))
-                                    close_side = (
-                                        "buy" if real_pos_side == "SHORT" else "sell"
-                                    )
-                                    trader.place_market_order(
-                                        symbol, close_side, pos_size
-                                    )
-                                except Exception as e:
-                                    trade_flow_logger.error(
-                                        f"[{symbol}] [風控] 緊急平仓/撤单失败: {e}"
-                                    )
-                                strategy.set_position(None)
-                                clear_trade_state()
-                                trade_flow_logger.info(
-                                    f"[{symbol}] [風控] 策略狀態已強制重置。"
-                                )
-                    trade_flow_logger.info("--- [状态审计结束] ---")
-                logging.info(
-                    f"所有交易對檢查完畢，將在 {POLL_INTERVAL_SECONDS} 秒後再次輪詢..."
-                )
-                time.sleep(POLL_INTERVAL_SECONDS)
-            except KeyboardInterrupt:
-                logging.info("程序被手動中斷...")
-                break
-            except Exception as e:
-                logging.exception(f"主循環發生未知錯誤: {e}")
-                time.sleep(POLL_INTERVAL_SECONDS)
-        logging.info("程序正在退出。")
-        clear_trade_state()
+                trade_flow_logger.info("--- [状态审计结束] ---")
+            logging.info(
+                f"所有交易對檢查完畢，將在 {POLL_INTERVAL_SECONDS} 秒後再次輪詢..."
+            )
+            time.sleep(POLL_INTERVAL_SECONDS)
+        except KeyboardInterrupt:
+            logging.info("程序被手動中斷...")
+            break
+        except Exception as e:
+            logging.exception(f"主循環發生未知錯誤: {e}")
+            time.sleep(POLL_INTERVAL_SECONDS)
+    logging.info("程序正在退出。")
+    clear_trade_state()
 
+
+if __name__ == "__main__":
     main()
