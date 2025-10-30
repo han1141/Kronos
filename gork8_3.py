@@ -72,8 +72,8 @@ CONFIG = {
     "backtest_start_date": "2025-01-01",
     "backtest_end_date": "2025-10-29",
     "initial_cash": 500_000,
-    "commission": 0.001,
-    "spread": 0.0005,
+    "commission": 0.00075,
+    "spread": 0.0002,
     "show_plots": False,
     "data_lookback_days": 60,
     "enable_ml_component": True,
@@ -88,7 +88,7 @@ KERAS_SEQUENCE_LENGTH = 60
 # --- 策略参数 ---
 STRATEGY_PARAMS = {
     "tsl_enabled": True,
-    "tsl_activation_profit_pct": 0.01,
+    "tsl_activation_profit_pct": 0.005,
     "tsl_activation_atr_mult": 1.5,
     "tsl_trailing_atr_mult": 2.0,
     "kelly_trade_history": 20,
@@ -134,7 +134,7 @@ STRATEGY_PARAMS = {
     },
 }
 ASSET_SPECIFIC_OVERRIDES = {
-    "ETHUSDT": {"strategy_class": "ETHStrategy", "score_entry_threshold": 0.40},
+    "ETHUSDT": {"strategy_class": "ETHStrategy", "score_entry_threshold": 0.45},
 }
 
 
@@ -356,7 +356,7 @@ def add_features_for_keras_model(df: pd.DataFrame) -> pd.DataFrame:
     - 确保同时计算并添加所有5个布林带相关指标。
     - 修正了 MACD 列名的大小写以匹配模型期望。
     """
-    logger.info("正在为 Keras 模型生成特定特征 (使用 'ta' 库)...")
+    logger.info("正在为 Kras 模型生成特定特征 (使用 'ta' 库)...")
     high, low, close, volume = df["High"], df["Low"], df["Close"], df["Volume"]
 
     # --- 基础指标 ---
@@ -744,7 +744,9 @@ class UltimateStrategy(Strategy):
         size = self._calculate_position_size(
             p, risk_ps, self._calculate_dynamic_risk() * score * confidence_factor
         )
-        if not 0 < size < 0.98:
+        # <<< 修改: 移除错误的检查，替换为更合理的检查 >>>
+        # 原来的检查 `if not 0 < size < 0.98:` 在计算单位数量时是错误的
+        if size <= 0:
             return
         self.reset_trade_state()
         self.active_sub_strategy = "TF"
@@ -785,7 +787,8 @@ class UltimateStrategy(Strategy):
         size = self._calculate_position_size(
             p, risk_ps, self._calculate_dynamic_risk() * self.mr_risk_multiplier
         )
-        if not 0 < size < 0.98:
+        # <<< 修改: 移除错误的检查，替换为更合理的检查 >>>
+        if size <= 0:
             return
         self.reset_trade_state()
         self.active_sub_strategy = "MR"
@@ -812,10 +815,31 @@ class UltimateStrategy(Strategy):
         self.recent_trade_returns.append(self.equity / eq_before - 1)
         self.reset_trade_state()
 
+    # <<< 修改: 仓位管理核心逻辑修正 >>>
     def _calculate_position_size(self, p, rps, risk_pct):
+        """
+        根据风险百分比计算头寸的【单位数量】。
+        这是一个更稳健的方法，避免了分数与单位数量之间的混淆。
+        p: 当前价格
+        rps: 每单位风险 (Risk Per Share/Unit)，即止损距离
+        risk_pct: 愿意承担的风险百分比
+        """
         if rps <= 0 or p <= 0:
             return 0
-        return (risk_pct * self.equity) / (rps / p) / self.equity
+
+        # 1. 计算本次交易愿意承担的风险金额（美元）
+        risk_amount_dollars = self.equity * risk_pct
+
+        # 2. 计算可以购买多少单位的资产
+        units = risk_amount_dollars / rps
+
+        # 3. (安全检查) 确保购买这些单位的钱足够
+        cash_needed = units * p
+        if cash_needed > self.equity:
+            # 如果所需现金超过全部资产，则用95%的资产来购买，以防万一
+            units = (self.equity * 0.95) / p
+
+        return int(units)
 
     def _calculate_dynamic_risk(self):
         if len(self.recent_trade_returns) < self.kelly_trade_history:
@@ -826,7 +850,11 @@ class UltimateStrategy(Strategy):
         if not wins or not losses:
             return self.default_risk_pct * self.vol_weight
         win_rate = len(wins) / len(self.recent_trade_returns)
-        reward_ratio = (sum(wins) / len(wins)) / (abs(sum(losses) / len(losses)))
+        avg_win = sum(wins) / len(wins)
+        avg_loss = abs(sum(losses) / len(losses))
+        if avg_loss == 0:
+            return self.default_risk_pct * self.vol_weight
+        reward_ratio = avg_win / avg_loss
         if reward_ratio == 0:
             return self.default_risk_pct * self.vol_weight
         kelly = win_rate - (1 - win_rate) / reward_ratio
@@ -886,11 +914,15 @@ if __name__ == "__main__":
         for key in override_keys:
             if key in asset_overrides:
                 bt_params[f"{key}_override"] = asset_overrides[key]
+
+        # <<< 修改: 正确添加滑点参数 margin >>>
+        # margin 代表单边滑点，通常是 spread (买卖价差) 的一半。
         bt = Backtest(
             data,
             UltimateStrategy,
             cash=CONFIG["initial_cash"],
             commission=CONFIG["commission"],
+            margin=CONFIG["spread"] / 2,
             finalize_trades=True,
         )
         stats = bt.run(**bt_params)
