@@ -32,9 +32,9 @@ logger = logging.getLogger(__name__)
 
 
 SYMBOL = "ETHUSDT"
-INTERVAL = "15m"
-DATA_START_DATE = "2018-01-01"
-TRAIN_START_DATE = "2019-01-01"
+INTERVAL = "5m"
+DATA_START_DATE = "2021-01-01"
+TRAIN_START_DATE = "2022-01-01"
 TRAIN_END_DATE = "2025-09-30"
 TEST_START_DATE = "2025-10-01"
 TEST_END_DATE = "2025-10-29"
@@ -209,11 +209,9 @@ def train_and_evaluate(
     model = Sequential(
         [
             Input(shape=(look_back, num_features)),
-            # 2. 【关键】简化模型结构 (减少神经元/记忆单元)
             Bidirectional(
                 LSTM(32, return_sequences=True, kernel_regularizer=l2(L2_REG))
             ),
-            # 3. 【关键】大幅加强Dropout (增加随机“遗忘”)
             Dropout(0.5),
             Bidirectional(LSTM(32, kernel_regularizer=l2(L2_REG))),
             Dropout(0.5),
