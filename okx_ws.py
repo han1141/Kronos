@@ -1,12 +1,11 @@
-# okx_ws.py (Final Corrected Version V3.11)
+# okx_live_trading_v4.19_timeout_compat_fix.py
 """
-OKX WebSocket & REST 混合高频交易机器人框架 (V3.11 - Training_Fix)
-- 特性:
-    - [V3.11] 修复了模型训练函数中因变量引用顺序不当导致的 'UnboundLocalError'。
-    - [V3.10] 策略智能化升级: 引入自适应因子归一化（Z-score）和动态入场阈值（滚动百分位）。
-    - [V3.9] 新增功能: 策略逻辑完全重构，增加独立的做空信号判断，实现了双向交易能力。
-    - [V3.8] 修复了WebSocket私有频道登录时的编程错误。
-    - [V3.7] 新增功能: 程序启动时动态获取账户初始资金。
+OKX WebSocket API 订阅版 (V4.19 - 最终兼容性修正版)
+- 核心变更:
+    - [!!! 关键崩溃修复 !!!] 解决了 `TypeError` on `socket_timeout` 的问题。
+        - 移除 `run_forever` 中的 `socket_timeout` 参数，因为它仅在最新版的 websocket-client 中可用。
+        - 改用 `websocket.setdefaulttimeout(30)` 这一全局设置，它兼容所有版本，并同样能解决网络连接超时问题。
+    - [继承] 此版本是建立在之前所有修复（双连接架构、正确的频道订阅、稳定的 SSL 连接）之上的最终完整版本。
 """
 
 # --- 核心库导入 ---
@@ -19,40 +18,48 @@ import hashlib
 import logging
 import math
 import csv
-import threading
 import urllib.parse
-from datetime import datetime
+import ssl
+import threading
+from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
-from requests.models import PreparedRequest
 from collections import deque
-from scipy.stats import norm  # V3.10 新增：用于Z-score的CDF转换
-
 import pandas as pd
 import numpy as np
 import requests
 import ta
 import warnings
+from requests.models import PreparedRequest
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import websocket
-import xgboost as xgb
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+import certifi  # <-- 必需: pip install certifi
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
+try:
+    import joblib
+    import tensorflow as tf
 
-# --- 日志系统 ---
+    ML_LIBS_INSTALLED = True
+except ImportError:
+    ML_LIBS_INSTALLED = False
+    print("警告: tensorflow 或 joblib 未安装，机器学习相关功能将不可用。")
+
+
+# --- 日志系统设置 ---
 def setup_logging():
-    """配置日志系统，同时输出到控制台和文件"""
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(logging.INFO)
     if root_logger.hasHandlers():
         root_logger.handlers.clear()
-    log_file_path = os.path.join(log_dir, "hft_ml_bot.log")
+    log_file_path = os.path.join(log_dir, "trading_bot.log")
     file_handler = RotatingFileHandler(
         log_file_path, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
+    file_handler.setLevel(logging.DEBUG)
     file_formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] [%(name)s:%(lineno)d] - %(message)s",
         "%Y-%m-%d %H:%M:%S",
@@ -66,48 +73,110 @@ def setup_logging():
     )
     console_handler.setFormatter(console_formatter)
     root_logger.addHandler(console_handler)
-    return logging.getLogger("HFT-ML-Flow")
+    trade_flow_logger = logging.getLogger("TradeFlow")
+    trade_flow_logger.setLevel(logging.INFO)
+    trade_flow_logger.propagate = False
+    trade_flow_path = os.path.join(log_dir, "trades_flow.log")
+    trade_flow_handler = RotatingFileHandler(
+        trade_flow_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    trade_flow_handler.setLevel(logging.INFO)
+    trade_flow_formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"
+    )
+    trade_flow_handler.setFormatter(trade_flow_formatter)
+    trade_flow_logger.addHandler(trade_flow_handler)
+    trade_flow_logger.addHandler(console_handler)
+    return trade_flow_logger
 
 
-# --- 全局配置 (V3.10 - 自适应版本) ---
-REST_BASE = "https://www.okx.com"
-SYMBOL = "ETH-USDT-SWAP"
-KLINE_INTERVAL = "1m"
-DESIRED_LEVERAGE = "10"
-HISTORY_LIMIT = 300
-SIMULATED = True
-if SIMULATED:
-    WS_PUBLIC_URL = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
-    WS_PRIVATE_URL = "wss://wspap.okx.com:8443/ws/v5/private?brokerId=9999"
-else:
-    WS_PUBLIC_URL = "wss://ws.okx.com:8443/ws/v5/public"
-    WS_PRIVATE_URL = "wss://ws.okx.com:8443/ws/v5/private"
-
-STRATEGY_PARAMS = {
-    "volume_avg_period": 21,
-    "volatility_period": 14,
-    "obi_levels": 10,
-    "obi_threshold": 0.6,
-    "sl_lookback": 1,
-    "tp_rr_ratio": 2.0,
-    "risk_per_trade_pct": 0.01,
-    "allow_shorting": True,
-    "weights": {"volume": 0.25, "volatility": 0.10, "obi": 0.25, "xgb": 0.40},
-    "z_score_period": 120,
-    "dynamic_threshold_period": 240,
-    "threshold_percentile": 90,
-    "min_signal_history": 50,
-    "backup_fixed_threshold": 0.65,
-}
-
-
-# --- 辅助函数：交易状态管理 ---
-def save_trade_state(state):
+def setup_csv_logger(name, log_file, fields):
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
-    state_file = os.path.join(log_dir, "trade_state.json")
-    with open(state_file, "w") as f:
-        json.dump(state, f)
+    csv_path = os.path.join(log_dir, log_file)
+    logger_obj = logging.getLogger(name)
+    logger_obj.setLevel(logging.INFO)
+    logger_obj.propagate = False
+    if logger_obj.hasHandlers():
+        return logger_obj
+    handler = logging.FileHandler(csv_path, mode="a", encoding="utf-8")
+    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(fields)
+
+    def emit_csv(record):
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writerow(record.msg)
+
+    handler.emit = emit_csv
+    logger_obj.addHandler(handler)
+    return logger_obj
+
+
+# --- 全局配置 ---
+REST_BASE, SYMBOLS, KLINE_INTERVAL = "https://www.okx.com", ["ETH-USDT-SWAP"], "15m"
+DESIRED_LEVERAGE, HISTORY_LIMIT, POLL_INTERVAL_SECONDS = "1", 500, 5
+SIMULATED, SIMULATED_EQUITY_START = True, 500000.0
+MAX_DAILY_DRAWDOWN_PCT, MAX_CONSECUTIVE_LOSSES = 0.03, 5
+TRADING_PAUSE_HOURS, COOL_DOWN_PERIOD_MINUTES = 4, 1
+KERAS_MODEL_PATH = "models/eth_trend_model_v1_15m.keras"
+SCALER_PATH, FEATURE_COLUMNS_PATH = (
+    "models/eth_trend_scaler_v1_15m.joblib",
+    "models/feature_columns_15m.joblib",
+)
+KERAS_SEQUENCE_LENGTH = 60
+
+# --- 策略参数 ---
+STRATEGY_PARAMS = {
+    "tsl_enabled": True,
+    "tsl_activation_profit_pct": 0.5,
+    "tsl_activation_atr_mult": 1.5,
+    "tsl_trailing_atr_mult": 2.0,
+    "kelly_trade_history": 20,
+    "default_risk_pct": 0.015,
+    "max_risk_pct": 0.04,
+    "regime_adx_period": 14,
+    "regime_atr_period": 14,
+    "regime_atr_slope_period": 5,
+    "regime_rsi_period": 14,
+    "regime_rsi_vol_period": 14,
+    "regime_norm_period": 252,
+    "regime_hurst_period": 100,
+    "regime_score_weight_adx": 0.6,
+    "regime_score_weight_atr": 0.3,
+    "regime_score_weight_rsi": 0.05,
+    "regime_score_weight_hurst": 0.05,
+    "regime_score_threshold": 0.45,
+    "tf_donchian_period": 30,
+    "tf_ema_fast_period": 20,
+    "tf_ema_slow_period": 75,
+    "tf_chandelier_atr_multiplier": 3.0,
+    "tf_atr_period": 14,
+    "tf_stop_loss_atr_multiplier": 2.5,
+    "mr_bb_period": 20,
+    "mr_bb_std": 2.0,
+    "mr_stop_loss_atr_multiplier": 1.5,
+    "mr_risk_multiplier": 0.5,
+    "mtf_period": 50,
+    "score_entry_threshold": 0.4,
+    "score_weights_tf": {
+        "breakout": 0.25,
+        "momentum": 0.18,
+        "mtf": 0.10,
+        "ml": 0.22,
+        "advanced_ml": 0.25,
+    },
+}
+ASSET_SPECIFIC_OVERRIDES = {"ETH-USDT-SWAP": {"score_entry_threshold": 0.45}}
+
+
+# --- 状态管理 & 辅助函数 ---
+def save_trade_state(state):
+    with open(os.path.join("logs", "trade_state.json"), "w") as f:
+        json.dump(state, f, indent=4)
+    logging.debug(f"已保存交易状态: {state}")
 
 
 def load_trade_state():
@@ -125,123 +194,316 @@ def clear_trade_state():
     state_file = os.path.join("logs", "trade_state.json")
     if os.path.exists(state_file):
         os.remove(state_file)
+        logging.info("交易状态文件已清除。")
+
+
+def save_kelly_history(symbol, history_deque):
+    with open(os.path.join("logs", f"{symbol}_kelly_history.json"), "w") as f:
+        json.dump(list(history_deque), f, indent=4)
+    logging.debug(f"[{symbol}] 已保存凯利公式交易历史。")
+
+
+def load_kelly_history(symbol, maxlen):
+    history_file = os.path.join("logs", f"{symbol}_kelly_history.json")
+    if os.path.exists(history_file):
+        try:
+            with open(history_file, "r") as f:
+                return deque(json.load(f), maxlen=maxlen)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return deque(maxlen=maxlen)
+
+
+# --- 特征工程函数 ---
+def compute_hurst(ts, max_lag=100):
+    if len(ts) < 10:
+        return 0.5
+    lags, tau = range(2, min(max_lag, len(ts) // 2 + 1)), []
+    for lag in lags:
+        std_dev = np.std(np.subtract(ts[lag:], ts[:-lag]))
+        if std_dev > 0:
+            tau.append(std_dev)
+    if len(tau) < 2:
+        return 0.5
+    try:
+        return max(
+            0.0, min(1.0, np.polyfit(np.log(lags[: len(tau)]), np.log(tau), 1)[0])
+        )
+    except:
+        return 0.5
+
+
+def add_ml_features_ported(df: pd.DataFrame) -> pd.DataFrame:
+    p = STRATEGY_PARAMS
+    norm = lambda s: (
+        (s - s.rolling(p["regime_norm_period"]).min())
+        / (
+            s.rolling(p["regime_norm_period"]).max()
+            - s.rolling(p["regime_norm_period"]).min()
+        )
+    ).fillna(0.5)
+    atr = ta.volatility.AverageTrueRange(
+        df.High, df.Low, df.Close, p["regime_atr_period"]
+    ).average_true_range()
+    df["feature_adx_norm"] = norm(
+        ta.trend.ADXIndicator(df.High, df.Low, df.Close, p["regime_adx_period"]).adx()
+    )
+    df["feature_atr_slope_norm"] = norm(
+        (atr - atr.shift(p["regime_atr_slope_period"]))
+        / atr.shift(p["regime_atr_slope_period"])
+    )
+    df["feature_rsi_vol_norm"] = 1 - norm(
+        ta.momentum.RSIIndicator(df.Close, p["regime_rsi_period"])
+        .rsi()
+        .rolling(p["regime_rsi_vol_period"])
+        .std()
+    )
+    df["feature_hurst"] = (
+        df.Close.rolling(p["regime_hurst_period"])
+        .apply(lambda x: compute_hurst(np.log(x + 1e-9)), raw=False)
+        .fillna(0.5)
+    )
+    df["feature_regime_score"] = (
+        df["feature_adx_norm"] * p["regime_score_weight_adx"]
+        + df["feature_atr_slope_norm"] * p["regime_score_weight_atr"]
+        + df["feature_rsi_vol_norm"] * p["regime_score_weight_rsi"]
+        + np.clip((df["feature_hurst"] - 0.3) / 0.7, 0, 1)
+        * p["regime_score_weight_hurst"]
+    )
+    return df
+
+
+def add_market_regime_features(df: pd.DataFrame) -> pd.DataFrame:
+    df["regime_score"] = df["feature_regime_score"]
+    df["trend_regime"] = np.where(
+        df["regime_score"] > STRATEGY_PARAMS["regime_score_threshold"],
+        "Trending",
+        "Mean-Reverting",
+    )
+    df["market_regime"] = np.where(df["trend_regime"] == "Trending", 1, -1)
+    return df
+
+
+def add_features_for_keras_model(df: pd.DataFrame) -> pd.DataFrame:
+    if not ML_LIBS_INSTALLED:
+        return df
+    close = df["Close"]
+    adx = ta.trend.ADXIndicator(df["High"], df["Low"], close, 14)
+    bb = ta.volatility.BollingerBands(close, 20, 2.0)
+    macd = ta.trend.MACD(close, 12, 26, 9)
+    df["EMA_8"] = ta.trend.EMAIndicator(close=close, window=8).ema_indicator()
+    df["RSI_14"] = ta.momentum.RSIIndicator(close=close, window=14).rsi()
+    df["ADX_14"], df["DMP_14"], df["DMN_14"] = adx.adx(), adx.adx_pos(), adx.adx_neg()
+    df["BBP_20_2.0"] = bb.bollinger_pband()
+    df["MACDh_12_26_9"] = macd.macd_diff()
+    return df
 
 
 # --- OKX 交易接口类 ---
 class OKXTrader:
     def __init__(self, api_key, api_secret, passphrase, simulated=True):
-        self.base = REST_BASE
-        self.api_key, self.api_secret, self.passphrase = api_key, api_secret, passphrase
-        self.simulated = simulated
-        self.instrument_info = {}
-        self.common_headers = {
+        self.base, self.api_key, self.api_secret, self.passphrase, self.simulated = (
+            REST_BASE,
+            api_key,
+            api_secret,
+            passphrase,
+            simulated,
+        )
+        self.instrument_info, self.common_headers = {}, {
             "Content-Type": "application/json",
             "OK-ACCESS-KEY": self.api_key,
             "OK-ACCESS-PASSPHRASE": self.passphrase,
         }
+        if self.simulated:
+            self.common_headers["x-simulated-trading"] = "1"
+        self.session = requests.Session()
+        self.session.mount(
+            "https://",
+            HTTPAdapter(
+                max_retries=Retry(
+                    total=5,
+                    backoff_factor=1,
+                    status_forcelist=[500, 502, 503, 504],
+                    allowed_methods=["GET", "POST"],
+                )
+            ),
+        )
 
     def _now(self):
         return datetime.utcnow().isoformat("T", "milliseconds") + "Z"
 
     def _sign(self, ts, method, path, body_str=""):
-        message = f"{ts}{method}{path}{body_str}"
-        mac = hmac.new(self.api_secret.encode(), message.encode(), hashlib.sha256)
+        mac = hmac.new(
+            self.api_secret.encode(),
+            f"{ts}{method}{path}{body_str}".encode(),
+            hashlib.sha256,
+        )
         return base64.b64encode(mac.digest()).decode()
 
-    def _request(self, method, path, body=None, params=None, max_retries=3):
+    def _request(self, method, path, body=None, params=None, max_retries=7):
         ts, body_str = self._now(), "" if body is None else json.dumps(body)
         prepped = PreparedRequest()
         prepped.prepare_url(self.base + path, params)
         path_for_signing = urllib.parse.urlparse(prepped.url).path
-        if urllib.parse.urlparse(prepped.url).query:
-            path_for_signing += "?" + urllib.parse.urlparse(prepped.url).query
-        path_for_signing = path_for_signing.replace(self.base, "")
-        sign = self._sign(ts, method.upper(), path_for_signing, body_str)
+        if query := urllib.parse.urlparse(prepped.url).query:
+            path_for_signing += "?" + query
         headers = self.common_headers.copy()
-        if self.simulated:
-            headers["x-simulated-trading"] = "1"
-        headers.update({"OK-ACCESS-SIGN": sign, "OK-ACCESS-TIMESTAMP": ts})
-        url = self.base + path
+        headers.update(
+            {
+                "OK-ACCESS-SIGN": self._sign(
+                    ts,
+                    method.upper(),
+                    path_for_signing.replace(self.base, ""),
+                    body_str,
+                ),
+                "OK-ACCESS-TIMESTAMP": ts,
+            }
+        )
         for attempt in range(max_retries):
             try:
-                if method.upper() == "GET":
-                    r = requests.get(url, headers=headers, params=params, timeout=10)
-                else:
-                    r = requests.post(url, headers=headers, data=body_str, timeout=10)
+                r = self.session.request(
+                    method,
+                    self.base + path,
+                    headers=headers,
+                    data=body_str,
+                    params=params,
+                    timeout=(5, 15),
+                )
+                if r.status_code == 404 and "cancel-algo-order" in path:
+                    return {"code": "0", "data": [{"sCode": "0"}]}
                 r.raise_for_status()
                 return r.json()
             except requests.exceptions.RequestException as e:
-                logging.error(f"发生REST请求错误 (尝试 {attempt+1}/{max_retries}): {e}")
-                if attempt + 1 == max_retries:
-                    return {"error": str(e)}
-                time.sleep(2)
-        return None
+                logging.error(f"HTTP请求错误 (尝试 {attempt+1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    return {"code": "-1", "msg": f"Max retries exceeded: {e}"}
+                time.sleep(min(2**attempt, 30))
+        return {"code": "-1", "msg": "Max retries exceeded"}
 
-    def set_leverage(self, instId, lever, mgnMode="cross"):
-        path = "/api/v5/account/set-leverage"
-        body = {
-            "instId": instId,
-            "lever": str(lever),
-            "mgnMode": mgnMode,
-            "posSide": "net",
-        }
-        res = self._request("POST", path, body=body)
-        return res and res.get("code") == "0"
-
-    def fetch_account_balance(self, ccy="USDT"):
-        path = "/api/v5/account/balance"
-        params = {"ccy": ccy}
-        res = self._request("GET", path, params=params)
-        if res and res.get("code") == "0" and res.get("data"):
-            details = res["data"][0].get("details", [])
-            if details:
-                return float(details[0].get("eq", 0))
-        logging.error(f"获取账户余额失败: {res}")
-        return None
-
-    def fetch_instrument_details(self, instId, instType="SWAP"):
-        if instId in self.instrument_info:
-            return self.instrument_info[instId]
-        path = "/api/v5/public/instruments"
-        params = {"instType": instType, "instId": instId}
-        try:
-            headers = {"x-simulated-trading": "1"} if self.simulated else {}
-            res = requests.get(
-                self.base + path, params=params, headers=headers, timeout=10
-            )
-            res.raise_for_status()
-            j = res.json()
-            if j.get("code") == "0" and j.get("data"):
-                self.instrument_info[instId] = j["data"][0]
-                return j["data"][0]
-        except Exception as e:
-            logging.error(f"获取合约信息时发生网络错误 for {instId}: {e}")
-        return None
-
-    def place_market_order(self, instId, side, sz, posSide="net"):
-        path = "/api/v5/trade/order"
+    def place_trigger_order(self, instId, side, sz, trigger_price, posSide="net"):
         body = {
             "instId": instId,
             "tdMode": "cross",
             "side": side,
             "posSide": posSide,
-            "ordType": "market",
+            "ordType": "trigger",
             "sz": str(sz),
+            "triggerPx": f"{trigger_price:.8f}".rstrip("0").rstrip("."),
+            "orderPx": "-1",
         }
-        return self._request("POST", path, body=body)
+        return self._request("POST", "/api/v5/trade/order-algo", body=body)
+
+    def fetch_open_algo_orders(self, instId):
+        res = self._request(
+            "GET",
+            "/api/v5/trade/orders-algo-pending",
+            params={"instType": "SWAP", "instId": instId, "ordType": "trigger"},
+        )
+        return res.get("data", []) if res and res.get("code") == "0" else []
+
+    def cancel_algo_orders(self, instId, algoIds):
+        if not algoIds:
+            return True
+        return (
+            res := self._request(
+                "POST",
+                "/api/v5/trade/cancel-algo-order",
+                body=[{"instId": instId, "algoId": str(aid)} for aid in algoIds],
+            )
+        ) and res.get("code") == "0"
+
+    def set_leverage(self, instId, lever, mgnMode="cross", posSide="net"):
+        return (
+            self._request(
+                "POST",
+                "/api/v5/account/set-leverage",
+                body={
+                    "instId": instId,
+                    "lever": str(lever),
+                    "mgnMode": mgnMode,
+                    "posSide": posSide,
+                },
+            ).get("code")
+            == "0"
+        )
+
+    def fetch_account_balance(self, ccy="USDT"):
+        if (
+            res := self._request("GET", "/api/v5/account/balance", params={"ccy": ccy})
+        ) and res.get("code") == "0":
+            if (data := res.get("data", [])) and "details" in data[0]:
+                return next(
+                    (
+                        float(d.get("eq", 0))
+                        for d in data[0]["details"]
+                        if d.get("ccy") == ccy
+                    ),
+                    None,
+                )
+        return None
+
+    def fetch_current_position(self, instId):
+        if (
+            res := self._request(
+                "GET", "/api/v5/account/positions", params={"instId": instId}
+            )
+        ) and res.get("code") == "0":
+            return next(
+                (pos for pos in res.get("data", []) if float(pos.get("pos", "0")) != 0),
+                None,
+            )
+        return False
+
+    def fetch_instrument_details(self, instId):
+        if instId in self.instrument_info:
+            return self.instrument_info[instId]
+        if (
+            (
+                res := self._request(
+                    "GET",
+                    "/api/v5/public/instruments",
+                    params={"instType": "SWAP", "instId": instId},
+                )
+            )
+            and res.get("code") == "0"
+            and res.get("data")
+        ):
+            return self.instrument_info.setdefault(instId, res["data"][0])
+        return None
+
+    def place_market_order(self, instId, side, sz):
+        res = self._request(
+            "POST",
+            "/api/v5/trade/order",
+            body={
+                "instId": instId,
+                "tdMode": "cross",
+                "side": side,
+                "ordType": "market",
+                "sz": str(sz),
+            },
+        )
+        if res:
+            trade_logger.info(
+                {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "symbol": instId,
+                    "action": side.upper(),
+                    "size": sz,
+                    "response": json.dumps(res),
+                }
+            )
+        return res
 
     def fetch_history_klines(self, instId, bar="1m", limit=200):
-        path = "/api/v5/market/history-candles"
-        params = {"instId": instId, "bar": bar, "limit": str(limit)}
-        try:
-            headers = {"x-simulated-trading": "1"} if self.simulated else {}
-            r = requests.get(
-                self.base + path, params=params, headers=headers, timeout=10
+        if (
+            res := self._request(
+                "GET",
+                "/api/v5/market/history-candles",
+                params={"instId": instId, "bar": bar, "limit": limit},
             )
-            r.raise_for_status()
-            j = r.json()
-            data = j.get("data", [])
-            if not data:
+        ) and res.get("code") == "0":
+            if not (data := res.get("data", [])):
                 return pd.DataFrame()
             df = pd.DataFrame(
                 data,
@@ -257,7 +519,8 @@ class OKXTrader:
                     "confirm",
                 ],
             )
-            df["timestamp"] = pd.to_datetime(pd.to_numeric(df["ts"]), unit="ms")
+            for col in ["o", "h", "l", "c", "vol"]:
+                df[col] = pd.to_numeric(df[col])
             df = df.rename(
                 columns={
                     "o": "Open",
@@ -267,591 +530,832 @@ class OKXTrader:
                     "vol": "Volume",
                 }
             )
-            for col in ["Open", "High", "Low", "Close", "Volume"]:
-                df[col] = pd.to_numeric(df[col])
-            return (
-                df[["timestamp", "Open", "High", "Low", "Close", "Volume"]]
-                .set_index("timestamp")
-                .sort_index()
-            )
-        except Exception as e:
-            logging.error(f"获取历史K线数据错误: {e}")
-            return None
-
-    def fetch_current_position(self, instId):
-        path = "/api/v5/account/positions"
-        params = {"instId": instId}
-        res = self._request("GET", path, params=params)
-        if res and res.get("code") == "0" and res.get("data"):
-            for pos in res["data"]:
-                if pos.get("instId") == instId and float(pos.get("pos", "0")) != 0:
-                    return pos
+            df["timestamp"] = pd.to_datetime(df["ts"], unit="ms")
+            return df.set_index("timestamp").sort_index()
         return None
 
-
-# --- 模型与特征工程 ---
-def create_features(df):
-    df["feature_rsi"] = ta.momentum.RSIIndicator(df.Close, 14).rsi()
-    df["feature_atr_pct"] = (
-        ta.volatility.AverageTrueRange(
-            df.High, df.Low, df.Close, 14
-        ).average_true_range()
-        / df.Close
-    )
-    df["feature_volume_ma_ratio"] = df.Volume / df.Volume.rolling(21).mean()
-    df["target"] = (df.Close.shift(-1) > df.Close).astype(int)
-    return df.dropna()
-
-
-def train_and_save_model(symbol, trader):
-    """[V3.11修复] 修正了UnboundLocalError的bug"""
-    logging.info("开始模型训练流程...")
-    df_train = trader.fetch_history_klines(symbol, bar="1m", limit=1000)
-    if df_train is None or df_train.empty or len(df_train) < 200:
-        logging.error("用于训练的数据不足或获取失败。")
-        return False
-    df_featured = create_features(df_train)
-    features = [col for col in df_featured.columns if "feature_" in col]
-    X, y = df_featured[features], df_featured["target"]
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-    model = xgb.XGBClassifier(
-        objective="binary:logistic",
-        eval_metric="logloss",
-        n_estimators=100,
-        learning_rate=0.1,
-        max_depth=3,
-    )
-    logging.info("正在训练XGBoost模型...")
-    model.fit(X_train, y_train)
-
-    # 修复：将单行赋值拆分为两行
-    y_pred = model.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
-
-    logging.info(f"模型在测试集上的准确率: {accuracy:.4f}")
-    model.save_model("xgb_model.json")
-    logging.info("✅ XGBoost模型已成功训练并保存为 xgb_model.json")
-    return True
-
-
-# --- 策略逻辑类 (V3.10 - 自适应版本) ---
-class HFStrategy:
-    def __init__(self, symbol: str, initial_df: pd.DataFrame):
-        self.symbol, self.params = symbol, STRATEGY_PARAMS
-        self.data = initial_df.copy()
-        self.last_candle_ts = self.data.index[-1] if not self.data.empty else None
-        self.current_obi = 0.5
-        self.model = xgb.XGBClassifier()
-        self.model.load_model("xgb_model.json")
-        self.recent_scores = deque(maxlen=self.params["dynamic_threshold_period"])
-        self.compute_all_features()
-        logging.info(f"[{self.symbol}] 高级自适应策略初始化完成。")
-
-    def _normalize_z_score(self, series: pd.Series, period: int) -> pd.Series:
-        mean = series.rolling(window=period, min_periods=max(10, period // 4)).mean()
-        std = series.rolling(window=period, min_periods=max(10, period // 4)).std()
-        std.replace(0, np.nan, inplace=True)
-        z_scores = (series - mean) / std
-        return pd.Series(norm.cdf(z_scores), index=series.index).fillna(0.5)
-
-    def compute_all_features(self):
-        required_length = self.params["z_score_period"] + 5
-        if len(self.data) < required_length:
-            logging.debug(
-                f"数据量不足({len(self.data)})以计算Z-score因子(需要{required_length})"
-            )
-            return
-        self.data["volume_ma"] = self.data.Volume.rolling(
-            self.params["volume_avg_period"]
-        ).mean()
-        self.data["atr"] = ta.volatility.AverageTrueRange(
-            self.data.High,
-            self.data.Low,
-            self.data.Close,
-            self.params["volatility_period"],
-        ).average_true_range()
-        self.data["raw_vol_factor"] = self.data.Volume / self.data.volume_ma
-        self.data["raw_atr_factor"] = (
-            self.data.atr
-            / self.data.atr.rolling(self.params["volatility_period"]).mean()
-        )
-        z_period = self.params["z_score_period"]
-        self.data["volume_factor"] = self._normalize_z_score(
-            self.data["raw_vol_factor"], z_period
-        )
-        self.data["volatility_factor"] = self._normalize_z_score(
-            self.data["raw_atr_factor"], z_period
-        )
-        self.data = create_features(self.data.copy())
-
-    def update_order_book(self, asks, bids):
-        ask_levels, bid_levels = min(len(asks), self.params["obi_levels"]), min(
-            len(bids), self.params["obi_levels"]
-        )
-        ask_volume, bid_volume = sum(
-            [float(level[1]) for level in asks[:ask_levels]]
-        ), sum([float(level[1]) for level in bids[:bid_levels]])
-        total_volume = ask_volume + bid_volume
-        if total_volume == 0:
-            self.current_obi = 0.5
-            return
-        self.current_obi = bid_volume / total_volume
-
-    def on_new_candle(self, new_candle_df: pd.DataFrame):
-        new_candle, candle_dt = new_candle_df.iloc[0], new_candle_df.iloc[0].name
-        if self.last_candle_ts is not None and candle_dt <= self.last_candle_ts:
-            return None
-        logging.info(
-            f"[{self.symbol}] 新1M K线获取: {candle_dt} | C={new_candle.Close}"
-        )
-        self.data = pd.concat([self.data, new_candle_df])
-        if len(self.data) > HISTORY_LIMIT * 2:
-            self.data = self.data.iloc[-(HISTORY_LIMIT * 2) :]
-        self.compute_all_features()
-        self.last_candle_ts = candle_dt
-        return self.check_entry_signal()
-
-    def check_entry_signal(self):
-        required_cols = ["volume_factor", "volatility_factor"]
-        if not all(col in self.data.columns for col in required_cols):
-            return None
-        last = self.data.iloc[-1]
-        if pd.isna(last.volume_factor) or pd.isna(last.volatility_factor):
-            return None
-        volume_factor, volatility_factor = last.volume_factor, last.volatility_factor
-        obi_buy_factor = min(self.current_obi / self.params["obi_threshold"], 1.0)
-        obi_sell_factor = min(
-            (1 - self.current_obi) / (1 - self.params["obi_threshold"]), 1.0
-        )
-        features = [col for col in self.data.columns if "feature_" in col]
-        current_features = (
-            self.data[features].iloc[-1:].drop(columns=["target"], errors="ignore")
-        )
-        if current_features.isnull().values.any():
-            return None
-        xgb_probs = self.model.predict_proba(current_features)[0]
-        xgb_long_factor, xgb_short_factor = xgb_probs[1], xgb_probs[0]
-        weights = self.params["weights"]
-        long_score = (
-            volume_factor * weights["volume"]
-            + volatility_factor * weights["volatility"]
-            + obi_buy_factor * weights["obi"]
-            + xgb_long_factor * weights["xgb"]
-        )
-        short_score = (
-            volume_factor * weights["volume"]
-            + volatility_factor * weights["volatility"]
-            + obi_sell_factor * weights["obi"]
-            + xgb_short_factor * weights["xgb"]
-        )
-        self.recent_scores.append(long_score)
-        if self.params.get("allow_shorting", False):
-            self.recent_scores.append(short_score)
-        if len(self.recent_scores) < self.params["min_signal_history"]:
-            dynamic_threshold = self.params["backup_fixed_threshold"]
-        else:
-            dynamic_threshold = np.percentile(
-                self.recent_scores, self.params["threshold_percentile"]
-            )
-        logging.info(
-            f"[{self.symbol}] 信号评分: [多]分={long_score:.4f} | [空]分={short_score:.4f} | 动态阈值={dynamic_threshold:.4f}"
-        )
-        if long_score > dynamic_threshold:
-            logging.info(
-                f"[{self.symbol}] ✅ 做多信号确认！得分 {long_score:.4f} > 动态阈值 {dynamic_threshold:.4f}"
-            )
-            entry_price = last.Close
-            sl_price = self.data.Low.iloc[-1 - self.params["sl_lookback"] : -1].min()
-            if sl_price >= entry_price:
-                logging.warning(
-                    f"信号过滤 (多头): 止损价({sl_price})高于入场价({entry_price})"
+    def fetch_ticker_price(self, instId):
+        if (
+            (
+                res := self._request(
+                    "GET", "/api/v5/market/ticker", params={"instId": instId}
                 )
-                return None
-            tp_price = (
-                entry_price + (entry_price - sl_price) * self.params["tp_rr_ratio"]
             )
-            return {"side": "buy", "sl_price": sl_price, "tp_price": tp_price}
-        elif short_score > dynamic_threshold and self.params.get(
-            "allow_shorting", False
+            and res.get("code") == "0"
+            and res.get("data")
         ):
-            logging.info(
-                f"[{self.symbol}] ✅ 做空信号确认！得分 {short_score:.4f} > 动态阈值 {dynamic_threshold:.4f}"
-            )
-            entry_price = last.Close
-            sl_price = self.data.High.iloc[-1 - self.params["sl_lookback"] : -1].max()
-            if sl_price <= entry_price:
-                logging.warning(
-                    f"信号过滤 (空头): 止损价({sl_price})低于入场价({entry_price})"
-                )
-                return None
-            tp_price = (
-                entry_price - (sl_price - entry_price) * self.params["tp_rr_ratio"]
-            )
-            return {"side": "sell", "sl_price": sl_price, "tp_price": tp_price}
+            return float(res["data"][0].get("last"))
         return None
 
 
-# --- WebSocket 与主程序 ---
-class OKXWebSocketManager:
-    def __init__(self, api_key, api_secret, passphrase):
+# --- [ 新增 ] 公共数据 WebSocket 管理器 ---
+class OKXPublicWebSocketManager:
+    def __init__(self, symbols, strategies, trader):
+        self._WS_BASE = (
+            "wss://ws.okx.com:8443/ws/v5/public"
+            if not SIMULATED
+            else "wss://ws.okx.com:8443/ws/v5/public?brokerId=9999"
+        )
+        self.symbols, self.strategies, self.trader = symbols, strategies, trader
+        self.should_run, self.ws_thread, self.ws_app = True, None, None
+
+    def _on_open(self, ws):
+        logging.info("Public WebSocket connection opened. Subscribing to channels...")
+        self._subscribe_to_channels(ws)
+
+    def _on_message(self, ws, message):
+        if message == "pong":
+            return logging.debug("Public WS received pong.")
+        data = json.loads(message)
+
+        if "event" in data:
+            if data.get("event") == "error":
+                logging.error(
+                    f"Public WS Error: {data.get('msg')} (Code: {data.get('code')})"
+                )
+            elif data.get("event") == "subscribe":
+                logging.info(
+                    f"Public WS subscribed to: {data.get('arg', {}).get('channel')}"
+                )
+            return
+
+        if "arg" in data and "data" in data:
+            channel, instId = data["arg"]["channel"], data["arg"]["instId"]
+            if (
+                channel == f"candles{KLINE_INTERVAL}"
+            ):  # Note: OKX channel name is plural
+                self._handle_candle_data(instId, data["data"])
+
+    def _subscribe_to_channels(self, ws):
+        # [!!! V4.19 修正 !!!] 恢复为正确的频道名称 `candles{bar}` (复数)
+        subscriptions = [
+            {"channel": f"candles{KLINE_INTERVAL}", "instId": symbol}
+            for symbol in self.symbols
+        ]
+        payload = {"op": "subscribe", "args": subscriptions}
+        ws.send(json.dumps(payload))
+        logging.info(f"Public WS subscription sent: {json.dumps(payload)}")
+
+    def _handle_candle_data(self, symbol, candle_data_list):
+        if symbol not in self.strategies:
+            return
+        for ts, o, h, l, c, vol, _, _, confirm in candle_data_list:
+            if confirm == "1":
+                strategy, candle_ts = self.strategies[symbol], pd.to_datetime(
+                    int(ts), unit="ms"
+                )
+                if candle_ts <= strategy.data.index[-1]:
+                    continue
+                trade_flow_logger.info(f"[{symbol}] 新K线收盘: {candle_ts} | C={c}")
+                new_candle = pd.Series(
+                    {
+                        "Open": float(o),
+                        "High": float(h),
+                        "Low": float(l),
+                        "Close": float(c),
+                        "Volume": float(vol),
+                    },
+                    name=candle_ts,
+                )
+                strategy.update_with_candle(new_candle)
+                strategy.compute_all_features(self.trader)
+                if (
+                    strategy.position is None
+                    and not (
+                        strategy.cool_down_until
+                        and datetime.utcnow() < strategy.cool_down_until
+                    )
+                    and not strategy.is_trading_paused
+                ):
+                    if action := strategy.next_on_candle_close():
+                        trade_flow_logger.info(f"[{symbol}] 策略决策: {action}")
+                        manage_position_entry(self.trader, symbol, strategy, action)
+
+    def _on_error(self, ws, error):
+        logging.error(f"Public WS Error: {error}")
+
+    def _on_close(self, ws, status, msg):
+        logging.warning("Public WS connection closed.")
+
+    def connect(self):
+        def run_ws():
+            reconnect_wait = 5
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            sslopt = {"ssl_context": ssl_context}
+
+            while self.should_run:
+                logging.info("Attempting to connect to Public WebSocket...")
+                self.ws_app = websocket.WebSocketApp(
+                    self._WS_BASE,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                self.ws_app.run_forever(
+                    ping_interval=20, ping_timeout=10, sslopt=sslopt
+                )
+                if not self.should_run:
+                    break
+                logging.error(
+                    f"Public WS disconnected. Reconnecting in {reconnect_wait}s..."
+                )
+                time.sleep(reconnect_wait)
+                reconnect_wait = min(reconnect_wait * 2, 60)
+
+        self.ws_thread = threading.Thread(target=run_ws)
+        self.ws_thread.daemon = True
+        self.ws_thread.start()
+
+    def close(self):
+        logging.info("Closing Public WebSocket connection...")
+        self.should_run = False
+        if self.ws_app:
+            self.ws_app.close()
+
+
+# --- [ 重构 ] 私有数据 WebSocket 管理器 ---
+class OKXPrivateWebSocketManager:
+    def __init__(
+        self, api_key, api_secret, passphrase, strategies, trader, initial_equity
+    ):
+        self._WS_BASE = (
+            "wss://ws.okx.com:8443/ws/v5/private"
+            if not SIMULATED
+            else "wss://ws.okx.com:8443/ws/v5/private?brokerId=9999"
+        )
         self.api_key, self.api_secret, self.passphrase = api_key, api_secret, passphrase
-        self.should_reconnect = True
-        (
-            self.public_ws,
-            self.private_ws,
-            self.heartbeat_thread,
-            self.on_message_callback,
-        ) = (None, None, None, None)
+        self.strategies, self.trader = strategies, trader
+        self.should_run, self.is_globally_paused = True, False
+        self.initial_equity = initial_equity
+        self.ws_thread, self.ws_app = None, None
 
-    def start(self, on_message_callback):
-        self.on_message_callback = on_message_callback
-        threading.Thread(target=self.run_public, daemon=True).start()
-        threading.Thread(target=self.run_private, daemon=True).start()
-        self._start_heartbeat()
-
-    def _start_heartbeat(self):
-        self.heartbeat_thread = threading.Thread(
-            target=self._send_heartbeat, daemon=True
-        )
-        self.heartbeat_thread.start()
-
-    def _send_heartbeat(self):
-        while self.should_reconnect:
-            try:
-                if (
-                    self.public_ws
-                    and self.public_ws.sock
-                    and self.public_ws.sock.connected
-                ):
-                    self.public_ws.send("ping")
-                if (
-                    self.private_ws
-                    and self.private_ws.sock
-                    and self.private_ws.sock.connected
-                ):
-                    self.private_ws.send("ping")
-            except Exception as e:
-                logging.warning(f"发送心跳时出错: {e}")
-            time.sleep(25)
-
-    def run_public(self):
-        while self.should_reconnect:
-            logging.info("正在连接到 OKX 公共 WebSocket...")
-            self.public_ws = websocket.WebSocketApp(
-                WS_PUBLIC_URL,
-                on_open=self.on_public_open,
-                on_message=self.on_message,
-                on_error=self.on_error,
-                on_close=self.on_close,
-            )
-            self.public_ws.run_forever()
-            time.sleep(5)
-
-    def run_private(self):
-        while self.should_reconnect:
-            logging.info("正在连接到 OKX 私有 WebSocket...")
-            self.private_ws = websocket.WebSocketApp(
-                WS_PRIVATE_URL,
-                on_open=self.on_private_open,
-                on_message=self.on_message,
-                on_error=self.on_error,
-                on_close=self.on_close,
-            )
-            self.private_ws.run_forever()
-            time.sleep(5)
-
-    def on_public_open(self, ws):
-        logging.info("公共 WebSocket 连接成功！正在订阅公共频道...")
-        ws.send(
-            json.dumps(
-                {
-                    "op": "subscribe",
-                    "args": [
-                        {"channel": "tickers", "instId": SYMBOL},
-                        {"channel": "books", "instId": SYMBOL},
-                    ],
-                }
-            )
-        )
-
-    def on_private_open(self, ws):
-        logging.info("私有 WebSocket 连接成功！正在进行认证...")
+    def _get_auth_args(self):
         ts = str(int(time.time()))
         message = ts + "GET" + "/users/self/verify"
         mac = hmac.new(self.api_secret.encode(), message.encode(), hashlib.sha256)
-        sign = base64.b64encode(mac.digest()).decode()
-        ws.send(
-            json.dumps(
-                {
-                    "op": "login",
-                    "args": [
-                        {
-                            "apiKey": self.api_key,
-                            "passphrase": self.passphrase,
-                            "timestamp": ts,
-                            "sign": sign,
-                        }
-                    ],
-                }
-            )
-        )
-
-    def on_error(self, ws, error):
-        logging.error(f"WebSocket 错误: {error}")
-
-    def on_close(self, ws, close_status_code, close_msg):
-        logging.warning(f"WebSocket 连接已关闭。")
-
-    def on_message(self, ws, message):
-        if self.on_message_callback:
-            self.on_message_callback(message, ws)
-
-    def stop(self):
-        self.should_reconnect = False
-        if self.public_ws:
-            self.public_ws.close()
-        if self.private_ws:
-            self.private_ws.close()
-
-
-class TradingBot:
-    def __init__(self, trader: OKXTrader, strategy: HFStrategy):
-        self.trader, self.strategy = trader, strategy
-        self.bot_state = {"position": None, "current_price": None}
-        self.equity = None
-
-    def on_ws_message(self, message, ws_instance):
-        if message == "pong":
-            return
-        try:
-            msg_json = json.loads(message)
-            if "event" in msg_json:
-                if msg_json["event"] == "login" and msg_json["code"] == "0":
-                    logging.info("WebSocket 认证成功！正在订阅私有频道...")
-                    ws_instance.send(
-                        json.dumps(
-                            {
-                                "op": "subscribe",
-                                "args": [
-                                    {
-                                        "channel": "positions",
-                                        "instType": "SWAP",
-                                        "instId": self.strategy.symbol,
-                                    }
-                                ],
-                            }
-                        )
-                    )
-                elif msg_json["event"] == "error":
-                    logging.error(f"WebSocket API 错误: {msg_json.get('msg')}")
-                elif msg_json["event"] == "subscribe":
-                    logging.info(f"成功订阅频道: {msg_json.get('arg')}")
-                return
-            if "arg" in msg_json and "data" in msg_json and msg_json["data"]:
-                channel, data = msg_json["arg"]["channel"], msg_json["data"][0]
-                if channel == "tickers":
-                    self.bot_state["current_price"] = float(data["last"])
-                elif channel == "positions":
-                    pos_size = float(data.get("pos", "0"))
-                    if pos_size != 0:
-                        self.bot_state["position"] = "LONG" if pos_size > 0 else "SHORT"
-                    else:
-                        if self.bot_state["position"] is not None:
-                            logging.info(f"[{self.strategy.symbol}] 仓位已平仓。")
-                            clear_trade_state()
-                        self.bot_state["position"] = None
-                elif channel == "books":
-                    self.strategy.update_order_book(data["asks"], data["bids"])
-        except Exception as e:
-            logging.exception(f"处理消息时发生致命错误: {message}")
-
-    def calculate_position_size(self, entry_price, sl_price):
-        instrument = self.trader.fetch_instrument_details(self.strategy.symbol)
-        if not instrument or not entry_price or not sl_price:
-            return "0"
-        if self.equity is None:
-            logging.error("账户权益未知，无法计算头寸大小。")
-            return "0"
-        risk_per_unit, risk_amount = (
-            abs(entry_price - sl_price),
-            self.equity * STRATEGY_PARAMS["risk_per_trade_pct"],
-        )
-        if risk_per_unit == 0:
-            return "0"
-        size_in_coin, lot_sz_str = risk_amount / risk_per_unit, instrument.get(
-            "lotSz", "1"
-        )
-        lot_sz = float(lot_sz_str)
-        if size_in_coin < lot_sz:
-            logging.warning(
-                f"计算出的理论仓位 {size_in_coin:.6f} 小于最小下单单位 {lot_sz}。无法下单。"
-            )
-            return "0"
-        precision = len(lot_sz_str.split(".")[1]) if "." in lot_sz_str else 0
-        final_size = math.floor(size_in_coin / lot_sz) * lot_sz
-        if final_size == 0:
-            logging.warning("计算出的仓位大小向下取整后为0，无法下单。")
-            return "0"
-        return f"{final_size:.{precision}f}"
-
-    def execute_trade_signal(self, signal):
-        logging.info(f"[{self.strategy.symbol}] 收到交易信号: {signal}")
-        current_price = self.bot_state["current_price"]
-        if current_price is None:
-            logging.error("无法获取当前价格，无法下单。")
-            return
-        size = self.calculate_position_size(current_price, signal["sl_price"])
-        if float(size) == 0:
-            return
-        res = self.trader.place_market_order(self.strategy.symbol, signal["side"], size)
-        logging.info(f"[{self.strategy.symbol}] 开仓下单响应: {res}")
-        if res and res.get("code") == "0" and res.get("data")[0].get("sCode") == "0":
-            logging.info("下单成功，等待成交信息以保存状态...")
-            time.sleep(3)
-            pos_data = self.trader.fetch_current_position(self.strategy.symbol)
-            if not pos_data:
-                logging.error("无法获取成交后的仓位信息！")
-                return
-            entry_price, pos_size = float(pos_data.get("avgPx")), float(
-                pos_data.get("pos")
-            )
-            trade_state = {
-                "side": "LONG" if signal["side"] == "buy" else "SHORT",
-                "entry_price": entry_price,
-                "size": abs(pos_size),
-                "sl_price": signal["sl_price"],
-                "tp_price": signal["tp_price"],
+        return [
+            {
+                "apiKey": self.api_key,
+                "passphrase": self.passphrase,
+                "timestamp": ts,
+                "sign": base64.b64encode(mac.digest()).decode(),
             }
-            save_trade_state(trade_state)
-            logging.info(
-                f"[{self.strategy.symbol}] 仓位已建立并保存状态: {trade_state}"
-            )
+        ]
 
-    def manage_position(self):
-        if (
-            self.bot_state["position"] is None
-            or self.bot_state["current_price"] is None
-        ):
-            return
-        trade_state = load_trade_state()
-        if not trade_state:
-            return
-        price = self.bot_state["current_price"]
-        side, sl_price, tp_price, size = (
-            trade_state["side"],
-            trade_state["sl_price"],
-            trade_state["tp_price"],
-            trade_state["size"],
-        )
-        close_side, reason = None, ""
-        if side == "LONG":
-            if price <= sl_price:
-                close_side, reason = "sell", "止损"
-            elif price >= tp_price:
-                close_side, reason = "sell", "止盈"
-        elif side == "SHORT":
-            if price >= sl_price:
-                close_side, reason = "buy", "止损"
-            elif price <= tp_price:
-                close_side, reason = "buy", "止盈"
-        if close_side:
-            logging.info(f"[{self.strategy.symbol}] {reason}触发 at {price:.4f}")
-            res = self.trader.place_market_order(
-                self.strategy.symbol, close_side, str(size)
-            )
-            logging.info(f"[{self.strategy.symbol}] 平仓响应: {res}")
-            clear_trade_state()
-            self.bot_state["position"] = None
+    def _on_open(self, ws):
+        logging.info("Private WebSocket connection opened. Authenticating...")
+        ws.send(json.dumps({"op": "login", "args": self._get_auth_args()}))
 
-    def run(self):
-        self.ws_manager = OKXWebSocketManager(
-            self.trader.api_key, self.trader.api_secret, self.trader.passphrase
+    def _on_message(self, ws, message):
+        if message == "pong":
+            return logging.debug("Private WS received pong.")
+        data = json.loads(message)
+
+        if "event" in data:
+            event, msg, code = data.get("event"), data.get("msg", ""), data.get("code")
+            if event == "login" and code == "0":
+                logging.info("Private WS authenticated. Subscribing...")
+                self._subscribe_to_channels(ws)
+            elif event == "subscribe":
+                logging.info(
+                    f"Private WS subscribed to: {data.get('arg', {}).get('channel')}"
+                )
+            elif event == "error":
+                logging.error(f"Private WS Error: {msg} (Code: {code})")
+            return
+
+        if "arg" in data and "data" in data:
+            channel = data["arg"]["channel"]
+            if channel == "positions":
+                self._handle_position_data(data["data"])
+            elif channel == "account":
+                self._handle_account_data(data["data"])
+
+    def _subscribe_to_channels(self, ws):
+        subscriptions = [
+            {"channel": "account", "ccy": "USDT"},
+            {"channel": "positions", "instType": "SWAP"},
+        ]
+        payload = {"op": "subscribe", "args": subscriptions}
+        ws.send(json.dumps(payload))
+        logging.info(f"Private WS subscription sent: {json.dumps(payload)}")
+
+    def _handle_position_data(self, position_data_list):
+        active_symbols = {
+            pos.get("instId")
+            for pos in position_data_list
+            if float(pos.get("pos", "0")) != 0
+        }
+        for symbol, strategy in self.strategies.items():
+            if strategy.position is not None and symbol not in active_symbols:
+                trade_flow_logger.info(f"[{symbol}] WebSocket确认仓位已平仓。")
+                self._handle_position_closure(symbol)
+
+    def _handle_position_closure(self, symbol):
+        strategy = self.strategies[symbol]
+        strategy.cool_down_until = datetime.utcnow() + timedelta(
+            minutes=COOL_DOWN_PERIOD_MINUTES
         )
-        self.ws_manager.start(on_message_callback=self.on_ws_message)
+        trade_flow_logger.warning(
+            f"[{symbol}] 交易结束，启动 {COOL_DOWN_PERIOD_MINUTES} 分钟冷静期。"
+        )
+        if (trade_state := load_trade_state()) and "entry_price" in trade_state:
+            entry_price, pos_side = trade_state["entry_price"], strategy.position
+            exit_price = (
+                self.trader.fetch_ticker_price(symbol)
+                or strategy.data["Close"].iloc[-1]
+            )
+            if entry_price != 0:
+                pnl_pct = (
+                    (exit_price - entry_price) / entry_price
+                    if pos_side == "LONG"
+                    else (entry_price - exit_price) / entry_price
+                )
+                trade_flow_logger.info(
+                    f"[{symbol}] 交易结果: 入场={entry_price:.4f}, 出场≈{exit_price:.4f}, PnL %≈{pnl_pct:.4%}"
+                )
+                strategy.register_trade_result(pnl_pct)
+        strategy.set_position(None)
         clear_trade_state()
-        last_check_minute, last_equity_check_time = -1, 0
+        trade_flow_logger.info(f"[{symbol}] 策略状态已重置。")
+
+    def _handle_account_data(self, account_data_list):
+        for acc in account_data_list:
+            if "details" in acc:
+                for detail in acc["details"]:
+                    if detail.get("ccy") == "USDT":
+                        equity = float(detail.get("eq", 0))
+                        for strategy in self.strategies.values():
+                            strategy.equity = equity
+                        if (
+                            not self.is_globally_paused
+                            and equity
+                            < self.initial_equity * (1 - MAX_DAILY_DRAWDOWN_PCT)
+                        ):
+                            self.is_globally_paused = True
+                            trade_flow_logger.critical(
+                                f"全局熔断！当前权益 {equity:.2f} USDT 已低于最大回撤限制。"
+                            )
+                        return
+
+    def _on_error(self, ws, error):
+        logging.error(f"Private WS Error: {error}")
+
+    def _on_close(self, ws, status, msg):
+        logging.warning("Private WS connection closed.")
+
+    def connect(self):
+        def run_ws():
+            reconnect_wait = 5
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            sslopt = {"ssl_context": ssl_context}
+
+            while self.should_run:
+                logging.info("Attempting to connect to Private WebSocket...")
+                self.ws_app = websocket.WebSocketApp(
+                    self._WS_BASE,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                self.ws_app.run_forever(
+                    ping_interval=20, ping_timeout=10, sslopt=sslopt
+                )
+                if not self.should_run:
+                    break
+                logging.error(
+                    f"Private WS disconnected. Reconnecting in {reconnect_wait}s..."
+                )
+                time.sleep(reconnect_wait)
+                reconnect_wait = min(reconnect_wait * 2, 60)
+
+        self.ws_thread = threading.Thread(target=run_ws)
+        self.ws_thread.daemon = True
+        self.ws_thread.start()
+
+    def close(self):
+        logging.info("Closing Private WebSocket connection...")
+        self.should_run = False
+        if self.ws_app:
+            self.ws_app.close()
+
+
+# --- 策略核心类 ---
+class UltimateStrategy:
+    def __init__(self, df, symbol, trader, pos_logger, instrument_details):
+        self.symbol, self.trader, self.data, self.position = (
+            symbol,
+            trader,
+            df.copy(),
+            None,
+        )
+        self.pos_logger, self.instrument_details = pos_logger, instrument_details
+        for key, value in STRATEGY_PARAMS.items():
+            setattr(self, key, value)
+        asset_overrides = ASSET_SPECIFIC_OVERRIDES.get(symbol, {})
+        self.score_entry_threshold = asset_overrides.get(
+            "score_entry_threshold", self.score_entry_threshold
+        )
+        self.recent_trade_returns = load_kelly_history(symbol, self.kelly_trade_history)
+        self.equity, self.consecutive_losses, self.trading_paused_until = (
+            SIMULATED_EQUITY_START,
+            0,
+            None,
+        )
+        self._load_models()
+
+    @property
+    def is_trading_paused(self):
+        if self.trading_paused_until and datetime.utcnow() < self.trading_paused_until:
+            return True
+        self.trading_paused_until = None
+        return False
+
+    def register_loss(self):
+        self.consecutive_losses += 1
+        trade_flow_logger.warning(
+            f"[{self.symbol}] 录得亏损，连亏: {self.consecutive_losses}"
+        )
+        if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+            self.trading_paused_until = datetime.utcnow() + pd.Timedelta(
+                hours=TRADING_PAUSE_HOURS
+            )
+            trade_flow_logger.critical(
+                f"[{self.symbol}] 达到最大连亏({MAX_CONSECUTIVE_LOSSES})！暂停交易{TRADING_PAUSE_HOURS}小时。"
+            )
+
+    def register_win(self):
+        if self.consecutive_losses > 0:
+            trade_flow_logger.info(f"[{self.symbol}] 录得盈利，连亏计数重置。")
+            self.consecutive_losses = 0
+
+    def _load_models(self):
+        if not ML_LIBS_INSTALLED:
+            return
         try:
-            while True:
-                self.manage_position()
-                now, current_time = datetime.utcnow(), time.time()
-                if current_time - last_equity_check_time > 60:
-                    current_equity = self.trader.fetch_account_balance("USDT")
-                    if current_equity is not None:
-                        self.equity = current_equity
-                        logging.info(f"账户权益已更新: {self.equity:.2f} USDT")
-                    last_equity_check_time = current_time
-                if now.second == 5 and now.minute != last_check_minute:
-                    last_check_minute = now.minute
-                    if self.bot_state["position"] is None:
-                        latest_candle_df = self.trader.fetch_history_klines(
-                            self.strategy.symbol, bar=KLINE_INTERVAL, limit=1
-                        )
-                        if latest_candle_df is not None and not latest_candle_df.empty:
-                            signal = self.strategy.on_new_candle(latest_candle_df)
-                            if signal:
-                                self.execute_trade_signal(signal)
-                time.sleep(0.1)
-        except KeyboardInterrupt:
-            logging.info("程序被手动中断...")
-        finally:
-            self.ws_manager.stop()
-            logging.info("程序已安全退出。")
+            self.keras_model = tf.keras.models.load_model(KERAS_MODEL_PATH)
+            self.scaler = joblib.load(SCALER_PATH)
+            self.feature_columns = joblib.load(FEATURE_COLUMNS_PATH)
+            logging.info(f"[{self.symbol}] 成功加载所有ML模型及组件。")
+        except Exception as e:
+            logging.error(f"加载ML模型时出错: {e}")
+            self.keras_model, self.scaler, self.feature_columns = None, None, None
+
+    def _calculate_dynamic_risk(self):
+        if len(self.recent_trade_returns) < self.kelly_trade_history:
+            return self.default_risk_pct
+        wins, losses = [r for r in self.recent_trade_returns if r > 0], [
+            r for r in self.recent_trade_returns if r < 0
+        ]
+        if not wins or not losses:
+            return self.default_risk_pct
+        win_rate, avg_win, avg_loss = (
+            len(wins) / len(self.recent_trade_returns),
+            np.mean(wins),
+            abs(np.mean(losses)),
+        )
+        if avg_loss == 0 or (reward_ratio := avg_win / avg_loss) == 0:
+            return self.default_risk_pct
+        return min(
+            max(0.005, (win_rate - (1 - win_rate) / reward_ratio) * 0.5),
+            self.max_risk_pct,
+        )
+
+    def get_ml_confidence_score(self):
+        if not all([self.keras_model, self.scaler, self.feature_columns]):
+            return 0.0
+        if len(self.data) < KERAS_SEQUENCE_LENGTH:
+            return 0.0
+        try:
+            features = (
+                self.data[self.feature_columns]
+                .iloc[-KERAS_SEQUENCE_LENGTH:]
+                .copy()
+                .fillna(method="ffill")
+                .fillna(0)
+            )
+            scaled = self.scaler.transform(features)
+            pred = self.keras_model.predict(np.expand_dims(scaled, axis=0), verbose=0)
+            return float((pred[0][0] - 0.5) * 2.0)
+        except Exception as e:
+            logging.error(f"Keras模型预测出错: {e}", exc_info=True)
+            return 0.0
+
+    def update_with_candle(self, row: pd.Series):
+        self.data.loc[row.name] = row
+        if not self.data.index.is_monotonic_increasing:
+            self.data.sort_index(inplace=True)
+        if len(self.data) > 5000:
+            self.data = self.data.iloc[-5000:]
+
+    def compute_all_features(self, trader):
+        if len(self.data) < self.tf_donchian_period:
+            return
+        self.data = add_ml_features_ported(self.data)
+        self.data = add_market_regime_features(self.data)
+        self.data = add_features_for_keras_model(self.data)
+        if (
+            data_1d := trader.fetch_history_klines(
+                self.symbol, bar="1D", limit=self.mtf_period + 10
+            )
+        ) is not None and not data_1d.empty:
+            sma = ta.trend.SMAIndicator(
+                data_1d["Close"], self.mtf_period
+            ).sma_indicator()
+            self.data["mtf_signal"] = (
+                pd.Series(np.where(data_1d["Close"] > sma, 1, -1), index=data_1d.index)
+                .reindex(self.data.index, method="ffill")
+                .fillna(0)
+            )
+        else:
+            self.data["mtf_signal"] = 0
+        df_4h = self.data["Close"].resample("4H").last().to_frame()
+        df_4h["macro_ema"] = ta.trend.EMAIndicator(df_4h["Close"], 50).ema_indicator()
+        df_4h["macro_trend"] = np.where(df_4h["Close"] > df_4h["macro_ema"], 1, -1)
+        self.data["macro_trend_filter"] = (
+            df_4h["macro_trend"].reindex(self.data.index, method="ffill").fillna(0)
+        )
+        self.data["tf_atr"] = ta.volatility.AverageTrueRange(
+            self.data.High, self.data.Low, self.data.Close, self.tf_atr_period
+        ).average_true_range()
+        self.data["tf_donchian_h"], self.data["tf_donchian_l"] = self.data.High.rolling(
+            self.tf_donchian_period
+        ).max().shift(1), self.data.Low.rolling(self.tf_donchian_period).min().shift(1)
+        self.data["tf_ema_fast"], self.data["tf_ema_slow"] = (
+            ta.trend.EMAIndicator(
+                self.data.Close, self.tf_ema_fast_period
+            ).ema_indicator(),
+            ta.trend.EMAIndicator(
+                self.data.Close, self.tf_ema_slow_period
+            ).ema_indicator(),
+        )
+        bb = ta.volatility.BollingerBands(
+            self.data.Close, self.mr_bb_period, self.mr_bb_std
+        )
+        self.data["mr_bb_mid"] = bb.bollinger_mavg()
+        self.data.fillna(method="ffill", inplace=True)
+        self.data.fillna(method="bfill", inplace=True)
+
+    def _calculate_entry_score(self):
+        w, last = self.score_weights_tf, self.data.iloc[-1]
+        b_s = (
+            1
+            if last.High > last.tf_donchian_h
+            else -1 if last.Low < last.tf_donchian_l else 0
+        )
+        mo_s = 1 if last.tf_ema_fast > last.tf_ema_slow else -1
+        return (
+            b_s * w.get("breakout", 0)
+            + mo_s * w.get("momentum", 0)
+            + last.get("mtf_signal", 0) * w.get("mtf", 0)
+            + self.get_ml_confidence_score() * w.get("ml", 0)
+        )
+
+    def next_on_candle_close(self):
+        last = self.data.iloc[-1]
+        if pd.isna(last.get("market_regime")) or pd.isna(
+            last.get("macro_trend_filter")
+        ):
+            return None
+        action = None
+        if (
+            last.macro_trend_filter == 1
+            and last.market_regime == 1
+            and (score := self._calculate_entry_score()) > self.score_entry_threshold
+        ):
+            action = {"action": "BUY", "sub_strategy": "TF", "confidence": score}
+        elif (
+            last.macro_trend_filter == -1
+            and last.market_regime == 1
+            and (score := self._calculate_entry_score()) < -self.score_entry_threshold
+        ):
+            action = {"action": "SELL", "sub_strategy": "TF", "confidence": abs(score)}
+        if action:
+            risk_pct = self._calculate_dynamic_risk() * action["confidence"]
+            if (
+                size_and_sl := self._determine_position_size(
+                    last.Close,
+                    risk_pct,
+                    self.tf_stop_loss_atr_multiplier,
+                    action["action"] == "BUY",
+                )
+            ) and float(size_and_sl[0]) > 0:
+                action["size"], action["stop_loss_price"] = size_and_sl
+                return action
+        return None
+
+    def _adjust_size_to_lot_size(self, size):
+        if not (details := self.instrument_details) or not (
+            lot_sz_str := details.get("lotSz")
+        ):
+            return str(size)
+        try:
+            lot_sz = float(lot_sz_str)
+            adjusted_size = math.floor(float(size) / lot_sz) * lot_sz
+            return f"{adjusted_size:.{len(lot_sz_str.split('.')[1]) if '.' in lot_sz_str else 0}f}"
+        except:
+            return str(size)
+
+    def _determine_position_size(self, price, risk_pct, sl_atr_mult, is_long):
+        atr, ct_val = self.data["tf_atr"].iloc[-1], float(
+            self.instrument_details.get("ctVal", 1)
+        )
+        if (
+            price <= 0
+            or pd.isna(atr)
+            or (risk_per_unit := atr * sl_atr_mult) <= 0
+            or ct_val <= 0
+        ):
+            return "0", 0.0
+        units = (self.equity * risk_pct) / (risk_per_unit * ct_val)
+        if (units * ct_val * price) / int(DESIRED_LEVERAGE) > self.equity * 0.95:
+            trade_flow_logger.warning(
+                f"[{self.symbol}] 仓位计算警告：所需保证金过高。跳过交易。"
+            )
+            return "0", 0.0
+        return self._adjust_size_to_lot_size(units), (
+            price - risk_per_unit if is_long else price + risk_per_unit
+        )
+
+    def register_trade_result(self, pnl_pct):
+        self.recent_trade_returns.append(pnl_pct)
+        save_kelly_history(self.symbol, self.recent_trade_returns)
+        self.register_loss() if pnl_pct < 0 else self.register_win()
+
+    def set_position(self, new_position):
+        if self.position != new_position:
+            self.position = new_position
+            if self.pos_logger:
+                self.pos_logger.info(
+                    {
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "symbol": self.symbol,
+                        "position": new_position,
+                    }
+                )
 
 
+# --- 主逻辑 & 辅助函数 ---
+def manage_position_entry(
+    trader: OKXTrader, symbol: str, strategy: UltimateStrategy, action: dict
+):
+    res = trader.place_market_order(
+        symbol, "buy" if action["action"] == "BUY" else "sell", action["size"]
+    )
+    if res and res.get("code") == "0" and res.get("data")[0].get("sCode") == "0":
+        time.sleep(5)
+        if pos_data := trader.fetch_current_position(symbol):
+            actual_size, avgPx = abs(float(pos_data.get("pos", "0"))), float(
+                pos_data.get("avgPx")
+            )
+            if actual_size >= float(action["size"]) * 0.9:
+                pos_side = "LONG" if float(pos_data.get("pos")) > 0 else "SHORT"
+                strategy.set_position(pos_side)
+                sl_res = trader.place_trigger_order(
+                    symbol,
+                    "sell" if pos_side == "LONG" else "buy",
+                    actual_size,
+                    action["stop_loss_price"],
+                )
+                sl_id = (
+                    sl_res.get("data", [{}])[0].get("algoId")
+                    if sl_res.get("code") == "0"
+                    else None
+                )
+                trade_state = {
+                    "entry_price": avgPx,
+                    "current_stop_price": action["stop_loss_price"],
+                    "current_stop_id": sl_id,
+                    "trailing_stop_active": False,
+                    "highest_high_in_trade": avgPx,
+                    "lowest_low_in_trade": avgPx,
+                }
+                save_trade_state(trade_state)
+                trade_flow_logger.info(f"[{symbol}] 仓位建立并成功保存状态。")
+            else:
+                trade_flow_logger.critical(f"[{symbol}] 开仓验证失败！成交量不足！")
+        else:
+            logging.error(f"[{symbol}] 下单后未能查询到仓位！")
+    else:
+        logging.error(f"[{symbol}] 下单请求失败: {res}")
+
+
+def check_for_exit_signal(
+    trader: OKXTrader, strategy: UltimateStrategy, pos_data: dict, current_price: float
+):
+    if not (trade_state := load_trade_state()):
+        return
+    pos_side, pos_size = (
+        "LONG" if float(pos_data.get("pos", "0")) > 0 else "SHORT"
+    ), abs(float(pos_data.get("pos", "0")))
+    if pos_side == "LONG":
+        trade_state["highest_high_in_trade"] = max(
+            trade_state.get("highest_high_in_trade", current_price), current_price
+        )
+    else:
+        trade_state["lowest_low_in_trade"] = min(
+            trade_state.get("lowest_low_in_trade", current_price), current_price
+        )
+    save_trade_state(trade_state)
+    atr = strategy.data["tf_atr"].iloc[-1]
+    if pd.isna(atr):
+        return
+    if (
+        pos_side == "LONG"
+        and current_price
+        < (
+            lvl := trade_state["highest_high_in_trade"]
+            - atr * strategy.tf_chandelier_atr_multiplier
+        )
+    ) or (
+        pos_side == "SHORT"
+        and current_price
+        > (
+            lvl := trade_state["lowest_low_in_trade"]
+            + atr * strategy.tf_chandelier_atr_multiplier
+        )
+    ):
+        trade_flow_logger.info(
+            f"[{strategy.symbol}] Chandelier Exit triggered at {current_price:.4f}. 市价平仓..."
+        )
+        trader.place_market_order(
+            strategy.symbol, "sell" if pos_side == "LONG" else "buy", pos_size
+        )
+        if open_algos := trader.fetch_open_algo_orders(strategy.symbol):
+            trader.cancel_algo_orders(
+                strategy.symbol, [o["algoId"] for o in open_algos]
+            )
+
+
+def manage_trailing_stop(
+    trader: OKXTrader, strategy: UltimateStrategy, current_price: float, pos_data: dict
+):
+    if not strategy.tsl_enabled or not (trade_state := load_trade_state()):
+        return
+    pos_side, entry_price, current_stop_price, is_active = (
+        ("LONG" if float(pos_data.get("pos", "0")) > 0 else "SHORT"),
+        float(trade_state["entry_price"]),
+        float(trade_state["current_stop_price"]),
+        trade_state["trailing_stop_active"],
+    )
+    atr = strategy.data["tf_atr"].iloc[-1]
+    if pd.isna(atr):
+        return
+    if not is_active:
+        pnl_pct = (
+            ((current_price - entry_price) / entry_price)
+            if pos_side == "LONG"
+            else ((entry_price - current_price) / entry_price)
+        )
+        if (
+            pnl_pct >= strategy.tsl_activation_profit_pct
+            or abs(current_price - entry_price)
+            >= atr * strategy.tsl_activation_atr_mult
+        ):
+            trade_state["trailing_stop_active"] = is_active = True
+            trade_flow_logger.info(f"[{strategy.symbol}] 移动止损已激活!")
+            save_trade_state(trade_state)
+    if is_active:
+        new_stop_price = None
+        if (
+            pos_side == "LONG"
+            and (potential_stop := current_price - atr * strategy.tsl_trailing_atr_mult)
+            > current_stop_price
+        ):
+            new_stop_price = potential_stop
+        elif (
+            pos_side == "SHORT"
+            and (potential_stop := current_price + atr * strategy.tsl_trailing_atr_mult)
+            < current_stop_price
+        ):
+            new_stop_price = potential_stop
+        if new_stop_price is not None:
+            trade_flow_logger.info(
+                f"[{strategy.symbol}] 调整移动止损: 旧={current_stop_price:.4f}, 新={new_stop_price:.4f}"
+            )
+            pos_size, old_stop_id = abs(float(pos_data.get("pos"))), trade_state.get(
+                "current_stop_id"
+            )
+            res = trader.place_trigger_order(
+                strategy.symbol,
+                "sell" if pos_side == "LONG" else "buy",
+                pos_size,
+                new_stop_price,
+            )
+            if res and res.get("code") == "0" and res["data"][0]["sCode"] == "0":
+                if old_stop_id:
+                    trader.cancel_algo_orders(strategy.symbol, [old_stop_id])
+                trade_state.update(
+                    {
+                        "current_stop_price": new_stop_price,
+                        "current_stop_id": res["data"][0]["algoId"],
+                    }
+                )
+                save_trade_state(trade_state)
+            else:
+                trade_flow_logger.error(f"[{strategy.symbol}] 调整移动止损失败: {res}")
+
+
+# --- 主函数 Main ---
 def main():
-    hf_logger = setup_logging()
-    hf_logger.info("启动 OKX WebSocket 高频交易程序 (V3.11 - Training_Fix)...")
+    global trade_flow_logger, trade_logger, position_logger, __version__
+    __version__ = "4.19"
+    trade_flow_logger = setup_logging()
+    trade_logger = setup_csv_logger(
+        "trade_logger",
+        "trades.csv",
+        ["timestamp", "symbol", "action", "size", "response"],
+    )
+    position_logger = setup_csv_logger(
+        "position_logger", "positions.csv", ["timestamp", "symbol", "position"]
+    )
+
+    logging.info(f"启动 OKX WebSocket API 交易程序 (V{__version__})...")
+
+    # [!!! V4.19 修正 !!!] 增加全局超时设置
+    websocket.setdefaulttimeout(30)
+
     OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE = (
         os.getenv("OKX_API_KEY"),
         os.getenv("OKX_API_SECRET"),
         os.getenv("OKX_API_PASSPHRASE"),
     )
     if not all([OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE]):
-        hf_logger.error(
+        return logging.error(
             "请设置环境变量: OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE"
         )
-        return
+
     trader = OKXTrader(
         OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE, simulated=SIMULATED
     )
-    if not os.path.exists("xgb_model.json"):
-        hf_logger.warning(
-            "未找到 XGBoost 模型文件 (xgb_model.json)。正在启动一次性训练流程..."
-        )
-        if not train_and_save_model(SYMBOL, trader):
-            hf_logger.error("模型训练失败，程序退出。")
-            return
-    hf_logger.info("正在查询初始账户余额 (USDT)...")
-    initial_equity = trader.fetch_account_balance("USDT")
-    if SIMULATED and (initial_equity is None or initial_equity == 0):
-        hf_logger.warning(
-            "无法获取模拟盘账户余额或余额为0，将使用默认启动资金 10000 USDT。"
-        )
-        initial_equity = 10000.0
-    elif initial_equity is None:
-        hf_logger.error("无法获取账户余额，程序退出。请检查API密钥权限或网络连接。")
-        return
-    else:
-        hf_logger.info(f"查询成功，当前账户权益为: {initial_equity:.2f} USDT")
-    hf_logger.info(f"正在为 {SYMBOL} 设置全仓杠杆为 {DESIRED_LEVERAGE}x...")
-    trader.set_leverage(SYMBOL, DESIRED_LEVERAGE)
-    hf_logger.info(f"正在为 {SYMBOL} 获取初始历史数据 (需要 {HISTORY_LIMIT} 条)...")
-    initial_df = trader.fetch_history_klines(
-        SYMBOL, bar=KLINE_INTERVAL, limit=HISTORY_LIMIT
+    initial_equity = trader.fetch_account_balance("USDT") or SIMULATED_EQUITY_START
+    logging.info(f"初始账户权益为: {initial_equity:.2f} USDT")
+
+    strategies = {}
+    for symbol in SYMBOLS:
+        details = trader.fetch_instrument_details(symbol)
+        if not details:
+            logging.error(f"无法为 {symbol} 获取合约信息。")
+            continue
+        if (
+            df := trader.fetch_history_klines(
+                symbol, bar=KLINE_INTERVAL, limit=HISTORY_LIMIT
+            )
+        ) is None or df.empty:
+            return logging.error(f"无法为 {symbol} 获取初始数据。")
+        strategy = UltimateStrategy(df, symbol, trader, position_logger, details)
+        strategy.equity = initial_equity
+        strategies[symbol] = strategy
+        strategy.compute_all_features(trader)
+        logging.info(f"策略 {symbol} 初始化完成。最新K线: {strategy.data.index[-1]}")
+
+    clear_trade_state()
+    for symbol, strategy in strategies.items():
+        if pos_data := trader.fetch_current_position(symbol):
+            trade_flow_logger.warning(f"[{symbol}] 检测到已有仓位，启动智能接管流程...")
+            strategy.set_position(
+                "LONG" if float(pos_data.get("pos", "0")) > 0 else "SHORT"
+            )
+
+    # --- 启动双 WebSocket 连接 ---
+    public_ws = OKXPublicWebSocketManager(SYMBOLS, strategies, trader)
+    public_ws.connect()
+
+    private_ws = OKXPrivateWebSocketManager(
+        OKX_API_KEY,
+        OKX_API_SECRET,
+        OKX_API_PASSPHRASE,
+        strategies,
+        trader,
+        initial_equity,
     )
-    if initial_df is None or len(initial_df) < STRATEGY_PARAMS["z_score_period"] + 5:
-        hf_logger.error(
-            f"为 {SYMBOL} 获取的初始数据不足({len(initial_df)})，程序退出。"
-        )
-        return
-    strategy = HFStrategy(SYMBOL, initial_df)
-    bot = TradingBot(trader, strategy)
-    bot.equity = initial_equity
-    bot.run()
+    private_ws.connect()
+
+    logging.info("双 WebSocket Managers 已启动。机器人上线。按 Ctrl+C 停止。")
+
+    try:
+        while True:
+            for symbol, strategy in strategies.items():
+                if (
+                    strategy.position
+                    and (price := trader.fetch_ticker_price(symbol))
+                    and (pos := trader.fetch_current_position(symbol))
+                ):
+                    check_for_exit_signal(trader, strategy, pos, price)
+                    manage_trailing_stop(trader, strategy, price, pos)
+            time.sleep(POLL_INTERVAL_SECONDS)
+    except KeyboardInterrupt:
+        logging.info("程序被手动中断...")
+    except Exception as e:
+        logging.exception(f"主线程发生未知错误: {e}")
+    finally:
+        public_ws.close()
+        private_ws.close()
+        clear_trade_state()
+        logging.info("程序已退出。")
 
 
 if __name__ == "__main__":
     main()
-xa
