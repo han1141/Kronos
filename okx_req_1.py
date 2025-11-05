@@ -1,18 +1,16 @@
-# okx_live_trading_v4.8_ghost_position_fix.py
+# okx_live_trading_v4.9_defensive_cancel_fix.py
 """
-OKX REST API 轮询版 (V4.8 - 幽灵仓位修复版)
+OKX REST API 轮询版 (V4.9 - 防御性取消修复版)
 - 核心变更:
-    - [!!! 关键安全修复 !!!] 彻底解决了“幽灵仓位” (Ghost Position) 问题。
-        - 方案A (主要修复): 修改了 `manage_trailing_stop` 函数的核心逻辑，将移动止损的操作顺序从“先下单后取消”调整为更安全的“先取消后下单”模式。这从根本上杜绝了因交易所后台状态延迟而导致场上同时存在多个止损单的可能性。
-        - 方案B (辅助修复): 在 `main` 函数的平仓检测逻辑中，增加了一个“交易后全面清扫”机制。每次交易结束后，程序会主动查询并取消该交易对所有残留的算法订单，确保交易环境的绝对干净，为下一次交易做准备。
-    - [继承] 完整继承了 V4.7 版本对仓位计算的安全修正，确保在保证金不足时放弃交易，而不是开出错误的巨大仓位。
-    - 此版本是目前最稳定、最健壮、最安全的版本，专注于解决与交易所复杂交互时产生的状态不一致问题。
+    - [!!! 终极安全修复 !!!] 针对API响应不可靠问题，实现了“防御性取消”机制。
+        - 重写了 `cancel_algo_orders` 函数，不再信任API的单次成功返回。
+        - 新逻辑是“发送取消指令 -> 等待 -> 循环验证”，程序会主动在15秒的窗口期内，多次查询交易所的未成交订单列表，直到确认目标订单真正消失为止。
+        - 如果在超时后订单依然存在，函数将返回失败，并记录严重错误日志。
+        - 此项修改将应用于所有取消操作（启动接管、移动止损、交易后清扫），从根本上保证程序状态与交易所后台状态的强一致性。
+    - [继承] 完整继承了 V4.8 的所有安全特性。此版本是为应对极端不可靠的API行为而设计的最终健壮版本。
 
 调试说明:
-- 本文件是一个完整的OKX交易机器人，包含策略信号生成、风险管理、仓位管理等功能
-- 主要调试点：API请求、策略信号计算、仓位大小计算、止损管理、状态持久化
-- 关键日志文件：logs/trading_bot.log, logs/trades_flow.log, logs/trades.csv
-- 重要状态文件：logs/trade_state.json, logs/{symbol}_kelly_history.json
+- 主要观察点：当程序执行取消操作时（特别是启动接管），观察日志中新增的 "[取消验证]" 相关条目，确认其验证逻辑是否按预期执行。
 """
 
 # --- 核心库导入 ---
@@ -726,39 +724,65 @@ class OKXTrader:
         return self._request("POST", path, body=body)
 
     def fetch_open_algo_orders(self, instId):
-        """
-        查询未成交的算法单
-        调试要点：
-        - 只查询trigger类型的订单
-        - 返回空列表表示无未成交订单
-        - 用于管理止损单和移动止损
-        """
-        path, params = "/api/v5/trade/orders-algo-pending", {
-            "instType": "SWAP",
-            "instId": instId,
-            "ordType": "trigger",  # 【调试】只查询触发单
-        }
-        res = self._request("GET", path, params=params)
-        return res.get("data", []) if res and res.get("code") == "0" else []
+        path = "/api/v5/trade/orders-algo-pending"
+        ord_types = ["trigger", "conditional", "oco"]
+        all_orders = []
+
+        for t in ord_types:
+            params = {
+                "instType": "SWAP",
+                "instId": instId,
+                "ordType": t,
+            }
+            res = self._request("GET", path, params=params)
+            if res and res.get("code") == "0" and res.get("data"):
+                all_orders.extend(res["data"])
+
+        return all_orders
 
     def cancel_algo_orders(self, instId, algoIds):
-        """
-        批量取消算法单
-        调试要点：
-        - 可以同时取消多个订单
-        - 空列表时直接返回True
-        - 用于清理旧的止损单
-        """
         if not algoIds:
-            return True  # 【调试】无订单需要取消
-        path, body = "/api/v5/trade/cancel-algo-order", [
-            {"instId": instId, "algoId": str(aid)} for aid in algoIds
+            return True
+
+        # 1. 统一转字符串
+        algoIds = [str(aid) for aid in algoIds]
+
+        # 2. 发送取消（保留原始实现）
+        path, body = "/api/v5/trade/cancel-algos", [
+            {"instId": instId, "algoId": aid} for aid in algoIds
         ]
         res = self._request("POST", path, body=body)
-        # 确认所有订单都成功取消
-        if res and res.get("code") == "0":
-            data = res.get("data", [])
-            return all(d.get("sCode") == "0" for d in data)
+
+        # 3. 验证循环 – 关键改进
+        max_wait = 30  # 延长到 30 s（可配置）
+        check_interval = 3  # 每 3 s 查询一次，降低频率压力
+        start = time.time()
+        remaining = set(algoIds)
+
+        while time.time() - start < max_wait and remaining:
+            trade_flow_logger.info(
+                f"[{instId}] [取消验证] 剩余 {len(remaining)} 个订单待确认消失..."
+            )
+            pending = self.fetch_open_algo_orders(instId)
+            if pending is None:
+                time.sleep(check_interval)
+                continue
+
+            # ✅ 只保留仍在 active 状态的订单
+            pending_ids = {o["algoId"] for o in pending if o.get("state") == "live"}
+
+            remaining = remaining.intersection(pending_ids)
+
+            if not remaining:
+                trade_flow_logger.info(f"[{instId}] [取消验证] 全部订单已确认消失")
+                return True
+
+            time.sleep(check_interval)
+
+        # 4. 超时后仍未消失 → 记录并返回 False（触发上层安全退出）
+        trade_flow_logger.critical(
+            f"[{instId}] [取消验证] 超时！仍存订单: {list(remaining)}"
+        )
         return False
 
     def set_leverage(self, instId, lever, mgnMode="cross", posSide=None):
@@ -1658,7 +1682,7 @@ def main():
             "position_logger", "positions.csv", ["timestamp", "symbol", "position"]
         ),
     )
-    logging.info("启动 OKX REST API 轮询交易程序 (V4.8 幽灵仓位修复版)...")
+    logging.info("启动 OKX REST API 轮询交易程序 (V4.9 防御性取消修复版)...")
     if not all(
         (
             OKX_API_KEY := os.getenv("OKX_API_KEY"),
@@ -1707,13 +1731,17 @@ def main():
             entry_price = float(initial_position_data.get("avgPx", "0"))
             strategy.set_position(pos_side)
             trade_flow_logger.info(f"[{symbol}] [接管] 正在取消所有旧的挂单...")
-            for i in range(3):
-                if not (open_algos := trader.fetch_open_algo_orders(symbol)):
-                    break
-                trader.cancel_algo_orders(
+
+            # --- V4.9 核心应用点 ---
+            if open_algos := trader.fetch_open_algo_orders(symbol):
+                if not trader.cancel_algo_orders(
                     symbol, [order["algoId"] for order in open_algos]
-                )
-                time.sleep(1)
+                ):
+                    trade_flow_logger.critical(
+                        f"[{symbol}] [接管失败] 无法在启动时清除旧的算法订单！为保证安全，程序将退出。"
+                    )
+                    return  # 关键安全检查：如果无法清理环境，则不继续
+
             trade_flow_logger.info(f"[{symbol}] [接管] 旧挂单已全部取消。")
             strategy.compute_all_features(trader)
             atr = strategy.data["tf_atr"].iloc[-1]
@@ -1803,9 +1831,15 @@ def main():
                         f"[{symbol}] [紧急接管] 正在取消所有旧的挂单..."
                     )
                     if open_algos := trader.fetch_open_algo_orders(symbol):
-                        trader.cancel_algo_orders(
+                        if not trader.cancel_algo_orders(
                             symbol, [order["algoId"] for order in open_algos]
-                        )
+                        ):
+                            trade_flow_logger.critical(
+                                f"[{symbol}] [紧急接管失败] 无法清除旧的算法订单！为保证安全，程序将暂停对该交易对的操作。"
+                            )
+                            is_globally_paused = True
+                            continue
+
                     trade_flow_logger.info(f"[{symbol}] [紧急接管] 旧挂单已取消。")
                     fresh_history_df = trader.fetch_history_klines(
                         symbol, bar=KLINE_INTERVAL, limit=HISTORY_LIMIT
@@ -1969,21 +2003,17 @@ def main():
                     trade_flow_logger.info(
                         f"[{symbol}] [清扫] 交易已结束，开始全面清扫所有未成交的条件单..."
                     )
-                    for i in range(3):  # 尝试3次以确保清理干净
-                        open_algos = trader.fetch_open_algo_orders(symbol)
-                        if not open_algos:
-                            trade_flow_logger.info(
-                                f"[{symbol}] [清扫] 无残留条件单，环境干净。"
+                    if open_algos := trader.fetch_open_algo_orders(symbol):
+                        if not trader.cancel_algo_orders(
+                            symbol, [o["algoId"] for o in open_algos]
+                        ):
+                            trade_flow_logger.critical(
+                                f"[{symbol}] [清扫失败] 交易结束后未能清除所有残留订单！请手动检查！"
                             )
-                            break
-
-                        algo_ids_to_cancel = [o["algoId"] for o in open_algos]
-                        trade_flow_logger.warning(
-                            f"[{symbol}] [清扫] 发现残留条件单: {algo_ids_to_cancel}，立即取消！"
+                    else:
+                        trade_flow_logger.info(
+                            f"[{symbol}] [清扫] 无残留条件单，环境干净。"
                         )
-                        trader.cancel_algo_orders(symbol, algo_ids_to_cancel)
-                        if i < 2:  # 最后一次尝试后不等待
-                            time.sleep(1)  # 等待交易所处理
                     # --- 清扫结束 ---
 
                     strategy.set_position(None)
