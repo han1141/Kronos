@@ -1,11 +1,12 @@
-# okx_live_trading_v4.7_sizing_fix.py
+# okx_live_trading_v4.8_ghost_position_fix.py
 """
-OKX REST API 轮询版 (V4.7 - 仓位计算修复版)
+OKX REST API 轮询版 (V4.8 - 幽灵仓位修复版)
 - 核心变更:
-    - [!!! 关键缺陷修复 !!!] 修正了 `_determine_position_size` 函数中的一个致命逻辑错误。
-        - 旧的逻辑在检测到根据风险计算的仓位所需保证金不足时，错误地将其"降级"为一个使用95%总权益和最大杠杆的"全仓"仓位。这是导致之前"几乎全仓买入"现象的根本原因。
-        - 新的逻辑将其修改为最安全的"故障安全"模式：当检测到所需保证金过高时，程序将直接取消本次交易并打印警告日志，而不是开一个错误的巨大仓位。
-    - [继承] 完整继承了 V4.6 版本的所有安全特性，包括仓位优先检查、紧急接管、熔断暂停和交易冷静期。此版本应是目前最稳定和安全的版本。
+    - [!!! 关键安全修复 !!!] 彻底解决了“幽灵仓位” (Ghost Position) 问题。
+        - 方案A (主要修复): 修改了 `manage_trailing_stop` 函数的核心逻辑，将移动止损的操作顺序从“先下单后取消”调整为更安全的“先取消后下单”模式。这从根本上杜绝了因交易所后台状态延迟而导致场上同时存在多个止损单的可能性。
+        - 方案B (辅助修复): 在 `main` 函数的平仓检测逻辑中，增加了一个“交易后全面清扫”机制。每次交易结束后，程序会主动查询并取消该交易对所有残留的算法订单，确保交易环境的绝对干净，为下一次交易做准备。
+    - [继承] 完整继承了 V4.7 版本对仓位计算的安全修正，确保在保证金不足时放弃交易，而不是开出错误的巨大仓位。
+    - 此版本是目前最稳定、最健壮、最安全的版本，专注于解决与交易所复杂交互时产生的状态不一致问题。
 
 调试说明:
 - 本文件是一个完整的OKX交易机器人，包含策略信号生成、风险管理、仓位管理等功能
@@ -16,16 +17,16 @@ OKX REST API 轮询版 (V4.7 - 仓位计算修复版)
 
 # --- 核心库导入 ---
 # 【调试】系统和工具库
-import os          # 文件系统操作，用于日志目录创建和状态文件管理
-import time        # 时间控制，用于轮询间隔和重试延迟
-import json        # JSON序列化，用于状态持久化和API通信
-import hmac        # HMAC签名，用于OKX API认证
-import base64      # Base64编码，用于API签名
-import hashlib     # 哈希算法，用于API签名
-import logging     # 日志系统，用于调试和监控
-import math        # 数学运算，用于仓位大小计算
-import csv         # CSV文件操作，用于交易记录
-import urllib.parse # URL解析，用于API请求构建
+import os  # 文件系统操作，用于日志目录创建和状态文件管理
+import time  # 时间控制，用于轮询间隔和重试延迟
+import json  # JSON序列化，用于状态持久化和API通信
+import hmac  # HMAC签名，用于OKX API认证
+import base64  # Base64编码，用于API签名
+import hashlib  # 哈希算法，用于API签名
+import logging  # 日志系统，用于调试和监控
+import math  # 数学运算，用于仓位大小计算
+import csv  # CSV文件操作，用于交易记录
+import urllib.parse  # URL解析，用于API请求构建
 
 # 【调试】时间和数据结构
 from datetime import datetime, timedelta  # 时间处理，用于时间戳和时间间隔计算
@@ -34,21 +35,21 @@ from collections import deque  # 双端队列，用于Kelly公式历史记录管
 
 # 【调试】数据分析和机器学习
 import pandas as pd  # 数据分析，用于K线数据处理和技术指标计算
-import numpy as np   # 数值计算，用于数学运算和数组操作
-import requests      # HTTP请求，用于OKX API调用
-import ta           # 技术分析，用于计算各种技术指标
-import warnings     # 警告控制，用于抑制不必要的警告信息
+import numpy as np  # 数值计算，用于数学运算和数组操作
+import requests  # HTTP请求，用于OKX API调用
+import ta  # 技术分析，用于计算各种技术指标
+import warnings  # 警告控制，用于抑制不必要的警告信息
 
 # 【调试】HTTP请求优化
 from requests.models import PreparedRequest  # 请求预处理，用于URL构建
-from requests.adapters import HTTPAdapter    # HTTP适配器，用于连接池管理
-from urllib3.util.retry import Retry        # 重试机制，用于网络错误恢复
+from requests.adapters import HTTPAdapter  # HTTP适配器，用于连接池管理
+from urllib3.util.retry import Retry  # 重试机制，用于网络错误恢复
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 # 【调试】机器学习库检查 - 如果导入失败，ML功能将被禁用
 try:
-    import joblib       # 模型序列化，用于加载预训练的scaler和特征列
+    import joblib  # 模型序列化，用于加载预训练的scaler和特征列
     import tensorflow as tf  # 深度学习，用于Keras模型推理
 
     ML_LIBS_INSTALLED = True
@@ -70,13 +71,13 @@ def setup_logging():
     """
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)  # 【调试】确保日志目录存在
-    
+
     # 【调试】配置根日志器 - 所有日志的基础
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)  # 设置最低级别为DEBUG
     if root_logger.hasHandlers():
         root_logger.handlers.clear()  # 清除已有处理器，避免重复日志
-    
+
     # 【调试】文件日志处理器 - 记录详细调试信息
     log_file_path = os.path.join(log_dir, "trading_bot.log")
     file_handler = RotatingFileHandler(
@@ -89,7 +90,7 @@ def setup_logging():
     )  # 包含模块名和行号，便于定位问题
     file_handler.setFormatter(file_formatter)
     root_logger.addHandler(file_handler)
-    
+
     # 【调试】控制台日志处理器 - 显示重要信息
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)  # 只显示INFO及以上级别
@@ -98,7 +99,7 @@ def setup_logging():
     )  # 简化格式，避免控制台信息过多
     console_handler.setFormatter(console_formatter)
     root_logger.addHandler(console_handler)
-    
+
     # 【调试】交易流程专用日志器 - 记录交易决策和执行过程
     trade_flow_logger = logging.getLogger("TradeFlow")
     trade_flow_logger.setLevel(logging.DEBUG)
@@ -132,12 +133,12 @@ def setup_csv_logger(name, log_file, fields):
     logger_obj = logging.getLogger(name)
     logger_obj.setLevel(logging.INFO)
     logger_obj.propagate = False  # 不传播到其他日志器
-    
+
     if logger_obj.hasHandlers():
         return logger_obj  # 避免重复创建处理器
-    
+
     handler = logging.FileHandler(csv_path, mode="a", encoding="utf-8")
-    
+
     # 【调试】如果文件不存在或为空，创建CSV头部
     if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -158,26 +159,26 @@ def setup_csv_logger(name, log_file, fields):
 # --- 全局配置 ---
 # 【调试】OKX API和交易配置
 REST_BASE = "https://www.okx.com"  # OKX REST API基础URL
-SYMBOLS = ["ETH-USDT-SWAP"]        # 交易标的列表，当前只交易ETH永续合约
-KLINE_INTERVAL = "15m"             # K线周期，15分钟线用于策略计算
-DESIRED_LEVERAGE = "1"             # 杠杆倍数，1倍杠杆（现货模式）
-HISTORY_LIMIT = 500                # 历史K线获取数量，用于技术指标计算
-POLL_INTERVAL_SECONDS = 10         # 主循环轮询间隔（秒）
+SYMBOLS = ["ETH-USDT-SWAP"]  # 交易标的列表，当前只交易ETH永续合约
+KLINE_INTERVAL = "15m"  # K线周期，15分钟线用于策略计算
+DESIRED_LEVERAGE = "1"  # 杠杆倍数，1倍杠杆（现货模式）
+HISTORY_LIMIT = 500  # 历史K线获取数量，用于技术指标计算
+POLL_INTERVAL_SECONDS = 10  # 主循环轮询间隔（秒）
 
 # 【调试】模拟交易和风控配置
-SIMULATED = True                   # 是否启用模拟交易模式
+SIMULATED = True  # 是否启用模拟交易模式
 SIMULATED_EQUITY_START = 500000.0  # 模拟交易初始资金（USDT）
-MAX_DAILY_DRAWDOWN_PCT = 0.03      # 最大日回撤百分比（3%），触发熔断
-MAX_CONSECUTIVE_LOSSES = 5         # 最大连续亏损次数，触发暂停交易
-TRADING_PAUSE_HOURS = 4            # 连续亏损后暂停交易时间（小时）
-AUDIT_INTERVAL_MINUTES = 15        # 审计检查间隔（分钟）
-COOL_DOWN_PERIOD_MINUTES = 1       # 交易后冷静期（分钟）
+MAX_DAILY_DRAWDOWN_PCT = 0.03  # 最大日回撤百分比（3%），触发熔断
+MAX_CONSECUTIVE_LOSSES = 5  # 最大连续亏损次数，触发暂停交易
+TRADING_PAUSE_HOURS = 4  # 连续亏损后暂停交易时间（小时）
+AUDIT_INTERVAL_MINUTES = 15  # 审计检查间隔（分钟）
+COOL_DOWN_PERIOD_SECONDS = 10  # 交易后冷静期（秒）
 
 # --- Keras模型文件路径配置 ---
 # 【调试】机器学习模型文件路径 - 用于AI信号生成
-KERAS_MODEL_PATH = "models/eth_trend_model_v1_15m.keras"      # Keras模型文件
-SCALER_PATH = "models/eth_trend_scaler_v1_15m.joblib"        # 特征缩放器
-FEATURE_COLUMNS_PATH = "models/feature_columns_15m.joblib"   # 特征列定义
+KERAS_MODEL_PATH = "models/eth_trend_model_v1_15m.keras"  # Keras模型文件
+SCALER_PATH = "models/eth_trend_scaler_v1_15m.joblib"  # 特征缩放器
+FEATURE_COLUMNS_PATH = "models/feature_columns_15m.joblib"  # 特征列定义
 KERAS_SEQUENCE_LENGTH = 60  # 模型输入序列长度（60个时间步）
 
 # --- 策略参数 ---
@@ -185,71 +186,63 @@ KERAS_SEQUENCE_LENGTH = 60  # 模型输入序列长度（60个时间步）
 STRATEGY_PARAMS = {
     # --- 核心风控参数 ---
     # 【调试】移动止损(TSL)配置 - 用于保护利润和控制风险
-    "tsl_enabled": True,                    # 是否启用移动止损
-    "tsl_activation_profit_pct": 0.007,     # 移动止损激活利润阈值(0.7%) - 调试：过低会频繁激活
-    "tsl_activation_atr_mult": 1.8,         # 移动止损激活距离(ATR倍数) - 调试：过小会过早激活
-    "tsl_trailing_atr_mult": 2.2,           # 移动止损追踪距离(ATR倍数) - 调试：过小会过早止损
-    
+    "tsl_enabled": True,  # 是否启用移动止损
+    "tsl_activation_profit_pct": 0.007,  # 移动止损激活利润阈值(0.7%) - 调试：过低会频繁激活
+    "tsl_activation_atr_mult": 1.8,  # 移动止损激活距离(ATR倍数) - 调试：过小会过早激活
+    "tsl_trailing_atr_mult": 2.2,  # 移动止损追踪距离(ATR倍数) - 调试：过小会过早止损
     # 【调试】Kelly公式风险管理 - 动态调整仓位大小
-    "kelly_trade_history": 25,              # Kelly计算历史交易样本数 - 调试：样本过少会不稳定
-    "default_risk_pct": 0.012,              # 默认风险百分比(1.2%) - 调试：基础仓位大小
-    "max_risk_pct": 0.035,                  # 最大风险百分比(3.5%) - 调试：风险上限保护
-    
+    "kelly_trade_history": 25,  # Kelly计算历史交易样本数 - 调试：样本过少会不稳定
+    "default_risk_pct": 0.012,  # 默认风险百分比(1.2%) - 调试：基础仓位大小
+    "max_risk_pct": 0.035,  # 最大风险百分比(3.5%) - 调试：风险上限保护
     # --- 回撤动态风险调整 ---
     # 【调试】回撤期间风险调整参数 - 在回撤时降低风险暴露
-    "dd_grace_period_bars": 240,           # 回撤宽限期(K线数量)
-    "dd_initial_pct": 0.35,                # 回撤初始风险调整比例
-    "dd_final_pct": 0.25,                  # 回撤最终风险调整比例
-    "dd_decay_bars": 4320,                 # 风险调整衰减周期
-    
+    "dd_grace_period_bars": 240,  # 回撤宽限期(K线数量)
+    "dd_initial_pct": 0.35,  # 回撤初始风险调整比例
+    "dd_final_pct": 0.25,  # 回撤最终风险调整比例
+    "dd_decay_bars": 4320,  # 风险调整衰减周期
     # --- 市场状态检测参数 ---
     # 【调试】市场regime识别 - 区分趋势市场和震荡市场
-    "regime_adx_period": 14,               # ADX周期 - 趋势强度指标
-    "regime_atr_period": 14,               # ATR周期 - 波动率指标
-    "regime_atr_slope_period": 6,          # ATR斜率计算周期 - 调试：波动率变化速度
-    "regime_rsi_period": 14,               # RSI周期 - 超买超卖指标
-    "regime_rsi_vol_period": 14,           # RSI波动率计算周期
-    "regime_norm_period": 252,             # 归一化周期 - 调试：用于指标标准化
-    "regime_hurst_period": 80,             # Hurst指数计算周期 - 调试：趋势持续性
-    
+    "regime_adx_period": 14,  # ADX周期 - 趋势强度指标
+    "regime_atr_period": 14,  # ATR周期 - 波动率指标
+    "regime_atr_slope_period": 6,  # ATR斜率计算周期 - 调试：波动率变化速度
+    "regime_rsi_period": 14,  # RSI周期 - 超买超卖指标
+    "regime_rsi_vol_period": 14,  # RSI波动率计算周期
+    "regime_norm_period": 252,  # 归一化周期 - 调试：用于指标标准化
+    "regime_hurst_period": 80,  # Hurst指数计算周期 - 调试：趋势持续性
     # 【调试】市场regime评分权重 - 综合评估市场状态
-    "regime_score_weight_adx": 0.55,       # ADX权重 - 趋势强度的重要性
-    "regime_score_weight_atr": 0.3,        # ATR权重 - 波动率的重要性
-    "regime_score_weight_rsi": 0.1,        # RSI权重 - 震荡识别的重要性
-    "regime_score_weight_hurst": 0.05,     # Hurst权重 - 趋势持续性的重要性
-    "regime_score_threshold": 0.4,         # 趋势判定阈值 - 调试：过低会误判震荡为趋势
-    
+    "regime_score_weight_adx": 0.55,  # ADX权重 - 趋势强度的重要性
+    "regime_score_weight_atr": 0.3,  # ATR权重 - 波动率的重要性
+    "regime_score_weight_rsi": 0.1,  # RSI权重 - 震荡识别的重要性
+    "regime_score_weight_hurst": 0.05,  # Hurst权重 - 趋势持续性的重要性
+    "regime_score_threshold": 0.4,  # 趋势判定阈值 - 调试：过低会误判震荡为趋势
     # --- 趋势跟随(TF)模块参数 ---
     # 【调试】趋势跟随策略配置 - 用于捕捉趋势行情
-    "tf_donchian_period": 24,              # 唐奇安通道周期 - 调试：突破信号敏感度
-    "tf_ema_fast_period": 21,              # 快速EMA周期 - 调试：趋势确认速度
-    "tf_ema_slow_period": 60,              # 慢速EMA周期 - 调试：趋势过滤强度
-    "tf_adx_confirm_period": 14,           # ADX确认周期
-    "tf_adx_confirm_threshold": 20,        # ADX确认阈值 - 调试：趋势强度要求
-    "tf_chandelier_period": 22,            # 吊灯止损周期
-    "tf_chandelier_atr_multiplier": 3.0,   # 吊灯止损ATR倍数 - 调试：出场信号敏感度
-    "tf_atr_period": 14,                   # ATR计算周期
-    "tf_stop_loss_atr_multiplier": 2.6,    # 止损ATR倍数 - 调试：初始止损距离
-    
+    "tf_donchian_period": 24,  # 唐奇安通道周期 - 调试：突破信号敏感度
+    "tf_ema_fast_period": 21,  # 快速EMA周期 - 调试：趋势确认速度
+    "tf_ema_slow_period": 60,  # 慢速EMA周期 - 调试：趋势过滤强度
+    "tf_adx_confirm_period": 14,  # ADX确认周期
+    "tf_adx_confirm_threshold": 20,  # ADX确认阈值 - 调试：趋势强度要求
+    "tf_chandelier_period": 22,  # 吊灯止损周期
+    "tf_chandelier_atr_multiplier": 3.0,  # 吊灯止损ATR倍数 - 调试：出场信号敏感度
+    "tf_atr_period": 14,  # ATR计算周期
+    "tf_stop_loss_atr_multiplier": 2.6,  # 止损ATR倍数 - 调试：初始止损距离
     # --- 均值回归(MR)模块参数 ---
     # 【调试】均值回归策略配置 - 用于震荡行情
-    "mr_bb_period": 20,                    # 布林带周期
-    "mr_bb_std": 2.0,                      # 布林带标准差倍数
-    "mr_stop_loss_atr_multiplier": 1.5,    # 均值回归止损ATR倍数 - 调试：比TF更紧
-    "mr_risk_multiplier": 0.5,             # 均值回归风险倍数 - 调试：降低仓位
-    
+    "mr_bb_period": 20,  # 布林带周期
+    "mr_bb_std": 2.0,  # 布林带标准差倍数
+    "mr_stop_loss_atr_multiplier": 1.5,  # 均值回归止损ATR倍数 - 调试：比TF更紧
+    "mr_risk_multiplier": 0.5,  # 均值回归风险倍数 - 调试：降低仓位
     # --- 多周期过滤参数 ---
     # 【调试】多时间框架分析 - 提高信号质量
-    "mtf_period": 40,                      # 多周期SMA周期 - 调试：日线趋势确认
-    "score_entry_threshold": 0.5,          # 入场评分阈值 - 调试：信号质量要求
-    
+    "mtf_period": 40,  # 多周期SMA周期 - 调试：日线趋势确认
+    "score_entry_threshold": 0.5,  # 入场评分阈值 - 调试：信号质量要求
     # --- 信号权重配置 ---
     # 【调试】各类信号的重要性权重 - 综合信号评分
     "score_weights_tf": {
-        "breakout": 0.22,      # 突破信号权重 - 调试：价格突破的重要性
-        "momentum": 0.18,      # 动量信号权重 - 调试：趋势确认的重要性
-        "mtf": 0.12,          # 多周期信号权重 - 调试：长期趋势的重要性
-        "ml": 0.23,           # 机器学习信号权重 - 调试：AI预测的重要性
+        "breakout": 0.22,  # 突破信号权重 - 调试：价格突破的重要性
+        "momentum": 0.18,  # 动量信号权重 - 调试：趋势确认的重要性
+        "mtf": 0.12,  # 多周期信号权重 - 调试：长期趋势的重要性
+        "ml": 0.23,  # 机器学习信号权重 - 调试：AI预测的重要性
         "advanced_ml": 0.25,  # 高级ML信号权重 - 调试：复杂模型的重要性
     },
 }
@@ -367,17 +360,17 @@ def compute_hurst(ts, max_lag=100):
     """
     if len(ts) < 10:
         return 0.5  # 【调试】数据不足，返回中性值
-    
+
     lags = range(2, min(max_lag, len(ts) // 2 + 1))
     tau = [
         np.std(np.subtract(ts[lag:], ts[:-lag]))
         for lag in lags
         if np.std(np.subtract(ts[lag:], ts[:-lag])) > 0  # 【调试】避免除零错误
     ]
-    
+
     if len(tau) < 2:
         return 0.5  # 【调试】有效数据点不足
-    
+
     try:
         # 【调试】使用对数回归计算Hurst指数
         hurst = np.polyfit(np.log(lags[: len(tau)]), np.log(tau), 1)[0]
@@ -398,7 +391,7 @@ def run_advanced_model_inference(df):
     if not ML_LIBS_INSTALLED:
         df["advanced_ml_signal"] = 0.0  # 【调试】ML库未安装，返回中性信号
         return df
-    
+
     # 【调试】使用简化的信号生成逻辑
     df["advanced_ml_signal"] = (
         df.get("ai_filter_signal", pd.Series(0, index=df.index))
@@ -419,7 +412,7 @@ def add_ml_features_ported(df: pd.DataFrame) -> pd.DataFrame:
     - 特征包括趋势、波动率、动量等多个维度
     """
     p = STRATEGY_PARAMS
-    
+
     # 【调试】归一化函数 - 将指标标准化到[0,1]范围
     norm = lambda s: (
         (s - s.rolling(p["regime_norm_period"]).min())
@@ -427,8 +420,10 @@ def add_ml_features_ported(df: pd.DataFrame) -> pd.DataFrame:
             s.rolling(p["regime_norm_period"]).max()
             - s.rolling(p["regime_norm_period"]).min()
         )
-    ).fillna(0.5)  # 【调试】无法计算时填充0.5（中性值）
-    
+    ).fillna(
+        0.5
+    )  # 【调试】无法计算时填充0.5（中性值）
+
     # 【调试】计算基础技术指标
     adx = ta.trend.ADXIndicator(df.High, df.Low, df.Close, p["regime_adx_period"]).adx()
     atr = ta.volatility.AverageTrueRange(
@@ -438,28 +433,36 @@ def add_ml_features_ported(df: pd.DataFrame) -> pd.DataFrame:
     bb = ta.volatility.BollingerBands(
         df.Close, window=p["mr_bb_period"], window_dev=p["mr_bb_std"]
     )
-    
+
     # 【调试】生成归一化特征
     df["feature_adx_norm"] = norm(adx)  # 【调试】趋势强度特征
     df["feature_atr_slope_norm"] = norm(
         (atr - atr.shift(p["regime_atr_slope_period"]))
         / atr.shift(p["regime_atr_slope_period"])
     )  # 【调试】ATR变化率特征，衡量波动率变化
-    df["feature_rsi_vol_norm"] = 1 - norm(rsi.rolling(p["regime_rsi_vol_period"]).std())  # 【调试】RSI稳定性特征
+    df["feature_rsi_vol_norm"] = 1 - norm(
+        rsi.rolling(p["regime_rsi_vol_period"]).std()
+    )  # 【调试】RSI稳定性特征
     df["feature_hurst"] = (
         df.Close.rolling(p["regime_hurst_period"])
-        .apply(lambda x: compute_hurst(np.log(x + 1e-9)), raw=False)  # 【调试】添加小值避免log(0)
+        .apply(
+            lambda x: compute_hurst(np.log(x + 1e-9)), raw=False
+        )  # 【调试】添加小值避免log(0)
         .fillna(0.5)
     )  # 【调试】趋势持续性特征
     df["feature_obv_norm"] = norm(
         ta.volume.OnBalanceVolumeIndicator(df.Close, df.Volume).on_balance_volume()
     )  # 【调试】成交量特征
-    df["feature_vol_pct_change_norm"] = norm(df.Volume.pct_change(periods=1).abs())  # 【调试】成交量变化特征
+    df["feature_vol_pct_change_norm"] = norm(
+        df.Volume.pct_change(periods=1).abs()
+    )  # 【调试】成交量变化特征
     df["feature_bb_width_norm"] = norm(
         (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
     )  # 【调试】布林带宽度特征，衡量波动率
-    df["feature_atr_pct_change_norm"] = norm(atr.pct_change(periods=1))  # 【调试】ATR变化特征
-    
+    df["feature_atr_pct_change_norm"] = norm(
+        atr.pct_change(periods=1)
+    )  # 【调试】ATR变化特征
+
     # 【调试】综合regime评分 - 加权组合各个特征
     df["feature_regime_score"] = (
         df["feature_adx_norm"] * p["regime_score_weight_adx"]
@@ -481,19 +484,19 @@ def add_market_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     - market_regime 为数值化的市场状态：1=趋势，-1=震荡
     """
     df["regime_score"] = df["feature_regime_score"]
-    
+
     # 【调试】趋势vs震荡判定
     df["trend_regime"] = np.where(
         df["regime_score"] > STRATEGY_PARAMS["regime_score_threshold"],
-        "Trending",      # 【调试】趋势市场
-        "Mean-Reverting", # 【调试】震荡市场
+        "Trending",  # 【调试】趋势市场
+        "Mean-Reverting",  # 【调试】震荡市场
     )
-    
+
     # 【调试】波动率regime计算 - 年化波动率
     df["volatility"] = df["Close"].pct_change().rolling(24 * 7).std() * np.sqrt(
         24 * 365  # 【调试】年化处理
     )
-    
+
     # 【调试】波动率分档 - 使用33%和67%分位数
     low_vol, high_vol = df["volatility"].quantile(0.33), df["volatility"].quantile(0.67)
     df["volatility_regime"] = pd.cut(
@@ -502,7 +505,7 @@ def add_market_regime_features(df: pd.DataFrame) -> pd.DataFrame:
         labels=["Low", "Medium", "High"],
         include_lowest=True,
     )
-    
+
     # 【调试】数值化市场regime - 便于后续计算
     df["market_regime"] = np.where(df["trend_regime"] == "Trending", 1, -1)
     return df
@@ -518,55 +521,55 @@ def add_features_for_keras_model(df: pd.DataFrame) -> pd.DataFrame:
     - ATRr_14是相对ATR（百分比形式）
     """
     high, low, close, volume = df["High"], df["Low"], df["Close"], df["Volume"]
-    
+
     # 【调试】趋势指标
     df["EMA_8"] = ta.trend.EMAIndicator(close=close, window=8).ema_indicator()
-    
+
     # 【调试】动量指标
     df["RSI_14"] = ta.momentum.RSIIndicator(close=close, window=14).rsi()
-    
+
     # 【调试】ADX系列指标 - 趋势强度和方向
     adx_indicator = ta.trend.ADXIndicator(high=high, low=low, close=close, window=14)
     df["ADX_14"], df["DMP_14"], df["DMN_14"] = (
-        adx_indicator.adx(),      # 【调试】趋势强度
+        adx_indicator.adx(),  # 【调试】趋势强度
         adx_indicator.adx_pos(),  # 【调试】正向动量
         adx_indicator.adx_neg(),  # 【调试】负向动量
     )
-    
+
     # 【调试】波动率指标 - 相对ATR
     atr_raw = ta.volatility.AverageTrueRange(
         high=high, low=low, close=close, window=14
     ).average_true_range()
     df["ATRr_14"] = (atr_raw / close) * 100  # 【调试】转换为百分比形式
-    
+
     # 【调试】布林带指标
     bb_indicator = ta.volatility.BollingerBands(close=close, window=20, window_dev=2.0)
     df["BBU_20_2.0"], df["BBM_20_2.0"], df["BBL_20_2.0"] = (
-        bb_indicator.bollinger_hband(),   # 【调试】上轨
-        bb_indicator.bollinger_mavg(),    # 【调试】中轨
-        bb_indicator.bollinger_lband(),   # 【调试】下轨
+        bb_indicator.bollinger_hband(),  # 【调试】上轨
+        bb_indicator.bollinger_mavg(),  # 【调试】中轨
+        bb_indicator.bollinger_lband(),  # 【调试】下轨
     )
     df["BBB_20_2.0"], df["BBP_20_2.0"] = (
-        bb_indicator.bollinger_wband(),   # 【调试】带宽
-        bb_indicator.bollinger_pband(),   # 【调试】位置百分比
+        bb_indicator.bollinger_wband(),  # 【调试】带宽
+        bb_indicator.bollinger_pband(),  # 【调试】位置百分比
     )
-    
+
     # 【调试】MACD指标
     macd_indicator = ta.trend.MACD(
         close=close, window_fast=12, window_slow=26, window_sign=9
     )
     df["MACD_12_26_9"], df["MACDs_12_26_9"], df["MACDh_12_26_9"] = (
-        macd_indicator.macd(),        # 【调试】MACD线
-        macd_indicator.macd_signal(), # 【调试】信号线
-        macd_indicator.macd_diff(),   # 【调试】柱状图
+        macd_indicator.macd(),  # 【调试】MACD线
+        macd_indicator.macd_signal(),  # 【调试】信号线
+        macd_indicator.macd_diff(),  # 【调试】柱状图
     )
-    
+
     # 【调试】成交量指标
     df["OBV"] = ta.volume.OnBalanceVolumeIndicator(
         close=close, volume=volume
     ).on_balance_volume()  # 【调试】能量潮指标
     df["volume_change_rate"] = volume.pct_change()  # 【调试】成交量变化率
-    
+
     return df
 
 
@@ -581,7 +584,7 @@ class OKXTrader:
     - 内置重试机制和错误处理
     - 缓存合约信息以提高性能
     """
-    
+
     def __init__(self, api_key, api_secret, passphrase, simulated=True):
         """
         初始化OKX交易接口
@@ -605,7 +608,7 @@ class OKXTrader:
         }
         if self.simulated:
             self.common_headers["x-simulated-trading"] = "1"  # 【调试】模拟交易标识
-        
+
         # 【调试】配置HTTP会话和重试策略
         self.session = requests.Session()
         retries = Retry(
@@ -648,7 +651,7 @@ class OKXTrader:
         """
         ts = self._now()
         body_str = "" if body is None else json.dumps(body)
-        
+
         # 【调试】构建完整URL用于签名
         prepped = PreparedRequest()
         prepped.prepare_url(self.base + path, params)
@@ -656,12 +659,12 @@ class OKXTrader:
         if query := urllib.parse.urlparse(prepped.url).query:
             path_for_signing += "?" + query
         path_for_signing = path_for_signing.replace(self.base, "")
-        
+
         # 【调试】生成签名和请求头
         sign = self._sign(ts, method.upper(), path_for_signing, body_str)
         headers = self.common_headers.copy()
         headers.update({"OK-ACCESS-SIGN": sign, "OK-ACCESS-TIMESTAMP": ts})
-        
+
         url, wait_time = self.base + path, 1.0
         for attempt in range(1, max_retries + 1):
             try:
@@ -673,7 +676,7 @@ class OKXTrader:
                     params=params,
                     timeout=(5, 15),  # 【调试】连接超时5秒，读取超时15秒
                 )
-                
+
                 # 【调试】特殊处理：取消不存在的订单返回成功
                 if r.status_code == 404 and "cancel-algo-order" in path:
                     return {
@@ -681,7 +684,7 @@ class OKXTrader:
                         "data": [{"sCode": "0"}],
                         "msg": "Cancelled (already gone)",
                     }
-                
+
                 r.raise_for_status()
                 return r.json()
             except requests.exceptions.RequestException as e:
@@ -707,7 +710,9 @@ class OKXTrader:
         """
         path, price_str = "/api/v5/trade/order-algo", f"{trigger_price:.8f}".rstrip(
             "0"
-        ).rstrip(".")  # 【调试】格式化价格，去除多余的0
+        ).rstrip(
+            "."
+        )  # 【调试】格式化价格，去除多余的0
         body = {
             "instId": instId,
             "tdMode": "cross",  # 【调试】全仓模式
@@ -749,9 +754,12 @@ class OKXTrader:
         path, body = "/api/v5/trade/cancel-algo-order", [
             {"instId": instId, "algoId": str(aid)} for aid in algoIds
         ]
-        return (res := self._request("POST", path, body=body)) and res.get(
-            "code"
-        ) == "0"
+        res = self._request("POST", path, body=body)
+        # 确认所有订单都成功取消
+        if res and res.get("code") == "0":
+            data = res.get("data", [])
+            return all(d.get("sCode") == "0" for d in data)
+        return False
 
     def set_leverage(self, instId, lever, mgnMode="cross", posSide=None):
         """
@@ -819,7 +827,7 @@ class OKXTrader:
         """
         if instId in self.instrument_info:
             return self.instrument_info[instId]  # 【调试】返回缓存结果
-        
+
         path, params = "/api/v5/public/instruments", {
             "instType": instType,
             "instId": instId,
@@ -881,7 +889,7 @@ class OKXTrader:
         ) == "0":
             if not (data := res.get("data", [])):
                 return pd.DataFrame()  # 【调试】无数据返回空DataFrame
-            
+
             # 【调试】构建DataFrame
             df = pd.DataFrame(
                 data,
@@ -897,7 +905,7 @@ class OKXTrader:
                     "confirm",
                 ],
             )
-            
+
             # 【调试】时间戳转换和列重命名
             df["timestamp"] = pd.to_datetime(pd.to_numeric(df["ts"]), unit="ms")
             df = df.rename(
@@ -909,11 +917,11 @@ class OKXTrader:
                     "vol": "Volume",
                 }
             )
-            
+
             # 【调试】数据类型转换
             for col in ["Open", "High", "Low", "Close", "Volume"]:
                 df[col] = pd.to_numeric(df[col])
-            
+
             return (
                 df[["timestamp", "Open", "High", "Low", "Close", "Volume"]]
                 .set_index("timestamp")
@@ -949,7 +957,7 @@ class UltimateStrategy:
     - 集成机器学习模型进行信号增强
     - 完整的状态管理和持久化
     """
-    
+
     def __init__(
         self, df, symbol, trader=None, pos_logger=None, instrument_details=None
     ):
@@ -968,22 +976,22 @@ class UltimateStrategy:
         )
         self.pos_logger, self.instrument_details = pos_logger, instrument_details
         logging.info(f"[{self.symbol}] 策略初始化...")
-        
+
         # 【调试】动态加载策略参数
         for key, value in STRATEGY_PARAMS.items():
             setattr(self, key, value)
-        
+
         # 【调试】应用资产特定参数覆盖
         asset_overrides = ASSET_SPECIFIC_OVERRIDES.get(symbol, {})
         self.score_entry_threshold = asset_overrides.get(
             "score_entry_threshold", self.score_entry_threshold
         )
-        
+
         # 【调试】加载Kelly公式历史记录
         self.recent_trade_returns = load_kelly_history(
             self.symbol, self.kelly_trade_history
         )
-        
+
         # 【调试】初始化ML组件
         self.keras_model, self.scaler, self.feature_columns = None, None, None
         self.equity, self.consecutive_losses, self.trading_paused_until = (
@@ -1048,25 +1056,25 @@ class UltimateStrategy:
         """
         if not ML_LIBS_INSTALLED:
             return  # 【调试】ML库未安装，跳过加载
-        
+
         try:
             # 【调试】加载Keras模型
             if not os.path.exists(KERAS_MODEL_PATH):
                 raise FileNotFoundError(f"Keras模型未找到: {KERAS_MODEL_PATH}")
             self.keras_model = tf.keras.models.load_model(KERAS_MODEL_PATH)
-            
+
             # 【调试】加载特征缩放器
             if not os.path.exists(SCALER_PATH):
                 raise FileNotFoundError(f"Scaler未找到: {SCALER_PATH}")
             self.scaler = joblib.load(SCALER_PATH)
-            
+
             # 【调试】加载特征列定义
             if not os.path.exists(FEATURE_COLUMNS_PATH):
                 raise FileNotFoundError(f"特征列文件未找到: {FEATURE_COLUMNS_PATH}")
             self.feature_columns = joblib.load(FEATURE_COLUMNS_PATH)
             if hasattr(self.feature_columns, "tolist"):
                 self.feature_columns = self.feature_columns.tolist()
-            
+
             logging.info(f"[{self.symbol}] 成功加载所有ML模型及组件。")
         except Exception as e:
             logging.error(f"加载ML模型时出错: {e}")
@@ -1083,28 +1091,30 @@ class UltimateStrategy:
         """
         if len(self.recent_trade_returns) < self.kelly_trade_history:
             return self.default_risk_pct  # 【调试】历史记录不足，使用默认值
-        
+
         # 【调试】分离盈利和亏损交易
         wins, losses = [r for r in self.recent_trade_returns if r > 0], [
             r for r in self.recent_trade_returns if r < 0
         ]
-        
+
         if not wins or not losses:
             return self.default_risk_pct  # 【调试】缺少盈利或亏损记录
-        
+
         # 【调试】计算Kelly公式所需参数
         win_rate, avg_win, avg_loss = (
             len(wins) / len(self.recent_trade_returns),  # 胜率
             sum(wins) / len(wins),  # 平均盈利
             abs(sum(losses) / len(losses)),  # 平均亏损（绝对值）
         )
-        
+
         if avg_loss == 0 or (reward_ratio := avg_win / avg_loss) == 0:
             return self.default_risk_pct  # 【调试】避免除零错误
-        
+
         # 【调试】Kelly公式：f = p - q/b，其中p=胜率，q=败率，b=盈亏比
         kelly = win_rate - (1 - win_rate) / reward_ratio
-        return min(max(0.005, kelly * 0.5), self.max_risk_pct)  # 【调试】保守调整并限制范围
+        return min(
+            max(0.005, kelly * 0.5), self.max_risk_pct
+        )  # 【调试】保守调整并限制范围
 
     def get_ml_confidence_score(self):
         """
@@ -1117,17 +1127,17 @@ class UltimateStrategy:
         """
         if not all([self.keras_model, self.scaler, self.feature_columns]):
             return 0.0  # 【调试】模型组件不完整
-        
+
         if len(self.data) < KERAS_SEQUENCE_LENGTH:
             return 0.0  # 【调试】数据长度不足
-        
+
         # 【调试】检查特征完整性
         if missing_cols := [
             col for col in self.feature_columns if col not in self.data.columns
         ]:
             logging.warning(f"缺少模型特征: {missing_cols}，ML评分为0。")
             return 0.0
-        
+
         try:
             # 【调试】准备模型输入序列
             latest_sequence_df = (
@@ -1137,12 +1147,12 @@ class UltimateStrategy:
                 .fillna(method="ffill")  # 前向填充
                 .fillna(0)  # 剩余NaN填充为0
             )
-            
+
             # 【调试】特征缩放和模型预测
             scaled_sequence = self.scaler.transform(latest_sequence_df)
             input_for_model = np.expand_dims(scaled_sequence, axis=0)  # 添加batch维度
             prediction = self.keras_model.predict(input_for_model, verbose=0)
-            
+
             # 【调试】将[0,1]输出转换为[-1,1]范围
             return float((prediction[0][0] - 0.5) * 2.0)
         except Exception as e:
@@ -1583,35 +1593,56 @@ def manage_trailing_stop(
                 "sell" if pos_side == "LONG" else "buy",
                 trade_state.get("current_stop_id"),
             )
-            if (
-                (
-                    res := trader.place_trigger_order(
-                        symbol,
-                        close_side,
-                        pos_size,
-                        new_stop_price,
-                        "Trailing-Stop-Update",
-                    )
+
+            # --- V4.8 核心修复：先取消，后下单 ---
+
+            # 步骤 1: 取消旧的止损单
+            if old_stop_id:
+                trade_flow_logger.info(
+                    f"[{symbol}] [TSL] 步骤1: 正在取消旧止损单 ID: {old_stop_id}..."
                 )
-                and res.get("code") == "0"
-                and res["data"][0]["sCode"] == "0"
-            ):
+                cancel_success = trader.cancel_algo_orders(symbol, [old_stop_id])
+                if not cancel_success:
+                    trade_flow_logger.error(
+                        f"[{symbol}] [TSL] 严重警告：取消旧止损单失败！本次移动操作中止，以避免产生幽灵仓位。"
+                    )
+                    return  # 中止本次移动，等待下一次轮询
+
+                time.sleep(0.5)  # 可选增加一个短暂延时，给交易所后台多一点处理时间
+                trade_flow_logger.info(f"[{symbol}] [TSL] 步骤1完成: 旧止损单已取消。")
+
+            # 步骤 2: 下达新的止损单
+            trade_flow_logger.info(
+                f"[{symbol}] [TSL] 步骤2: 正在设置新止损单，价格: {new_stop_price:.4f}..."
+            )
+            res = trader.place_trigger_order(
+                symbol,
+                close_side,
+                pos_size,
+                new_stop_price,
+                "Trailing-Stop-Update",
+            )
+
+            if res and res.get("code") == "0" and res["data"][0]["sCode"] == "0":
                 new_stop_id = res["data"][0]["algoId"]
                 trade_flow_logger.info(
-                    f"[{symbol}] 新移动止损单设置成功, Algo ID: {new_stop_id}"
+                    f"[{symbol}] [TSL] 步骤2完成: 新移动止损单设置成功, Algo ID: {new_stop_id}"
                 )
-                if old_stop_id:
-                    trader.cancel_algo_orders(symbol, [old_stop_id])
-                    trade_flow_logger.info(
-                        f"[{symbol}] 旧止损单 (ID: {old_stop_id}) 已取消。"
-                    )
+
+                # 步骤 3: 更新本地状态
                 trade_state["current_stop_price"], trade_state["current_stop_id"] = (
                     new_stop_price,
                     new_stop_id,
                 )
                 save_trade_state(trade_state)
             else:
-                trade_flow_logger.error(f"[{symbol}] 调整移动止损失败！响应: {res}")
+                # 这是一个新的风险点：如果取消成功但下单失败，仓位会短暂失去保护
+                trade_flow_logger.critical(
+                    f"[{symbol}] [TSL] !!! 紧急情况 !!! 旧止损已取消，但新止损下单失败！响应: {res}。仓位暂时无保护，将在下一轮循环中尝试重新设置止损！"
+                )
+                # 清除本地ID，以便下次循环能重新设置
+                trade_state["current_stop_id"] = None
+                save_trade_state(trade_state)
 
 
 def main():
@@ -1627,7 +1658,7 @@ def main():
             "position_logger", "positions.csv", ["timestamp", "symbol", "position"]
         ),
     )
-    logging.info("启动 OKX REST API 轮询交易程序 (V4.7 仓位计算修复版)...")
+    logging.info("启动 OKX REST API 轮询交易程序 (V4.8 幽灵仓位修复版)...")
     if not all(
         (
             OKX_API_KEY := os.getenv("OKX_API_KEY"),
@@ -1908,10 +1939,10 @@ def main():
                 elif strategy.position is not None:
                     trade_flow_logger.info(f"[{symbol}] 检测到仓位已平仓。")
                     strategy.cool_down_until = datetime.utcnow() + timedelta(
-                        minutes=COOL_DOWN_PERIOD_MINUTES
+                        seconds=COOL_DOWN_PERIOD_SECONDS
                     )
                     trade_flow_logger.warning(
-                        f"[{symbol}] 交易结束，启动 {COOL_DOWN_PERIOD_MINUTES} 分钟冷静期。"
+                        f"[{symbol}] 交易结束，启动 {COOL_DOWN_PERIOD_SECONDS} 秒冷静期。"
                     )
                     if (
                         closed_trade_state := load_trade_state()
@@ -1933,6 +1964,28 @@ def main():
                             f"[{symbol}] 交易结束: 入场={entry_price:.4f}, 出场≈{exit_price:.4f}, PnL %≈{pnl_pct:.4%}"
                         )
                         strategy.register_trade_result(pnl_pct)
+
+                    # --- V4.8 辅助修复：交易后全面清扫 ---
+                    trade_flow_logger.info(
+                        f"[{symbol}] [清扫] 交易已结束，开始全面清扫所有未成交的条件单..."
+                    )
+                    for i in range(3):  # 尝试3次以确保清理干净
+                        open_algos = trader.fetch_open_algo_orders(symbol)
+                        if not open_algos:
+                            trade_flow_logger.info(
+                                f"[{symbol}] [清扫] 无残留条件单，环境干净。"
+                            )
+                            break
+
+                        algo_ids_to_cancel = [o["algoId"] for o in open_algos]
+                        trade_flow_logger.warning(
+                            f"[{symbol}] [清扫] 发现残留条件单: {algo_ids_to_cancel}，立即取消！"
+                        )
+                        trader.cancel_algo_orders(symbol, algo_ids_to_cancel)
+                        if i < 2:  # 最后一次尝试后不等待
+                            time.sleep(1)  # 等待交易所处理
+                    # --- 清扫结束 ---
+
                     strategy.set_position(None)
                     clear_trade_state()
                     trade_flow_logger.info(f"[{symbol}] 策略状态已重置。")
