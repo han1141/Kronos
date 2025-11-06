@@ -486,8 +486,8 @@ def add_market_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     # 【调试】趋势vs震荡判定
     df["trend_regime"] = np.where(
         df["regime_score"] > STRATEGY_PARAMS["regime_score_threshold"],
-        "Trending",  # 【调试】趋势市场
-        "Mean-Reverting",  # 【调试】震荡市场
+        "趋势",  # 【调试】趋势市场
+        "震荡",  # 【调试】震荡市场
     )
 
     # 【调试】波动率regime计算 - 年化波动率
@@ -505,7 +505,7 @@ def add_market_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # 【调试】数值化市场regime - 便于后续计算
-    df["market_regime"] = np.where(df["trend_regime"] == "Trending", 1, -1)
+    df["market_regime"] = np.where(df["trend_regime"] == "趋势", 1, -1)
     return df
 
 
@@ -1269,6 +1269,13 @@ class UltimateStrategy:
             stoch_rsi.stochrsi_k(),
             stoch_rsi.stochrsi_d(),
         )
+
+        # <<< [核心修复] START >>>
+        # 在填充NaN之前，将所有可能由“除以零”等运算产生的无穷大值(inf)替换为NaN
+        # 这样它们就能被后续的填充逻辑统一处理，防止模型预测时出错
+        self.data.replace([np.inf, -np.inf], np.nan, inplace=True)
+        # <<< [核心修复] END >>>
+
         self.data.fillna(method="ffill", inplace=True)
         self.data.fillna(method="bfill", inplace=True)
         logging.debug(f"[{self.symbol}] 特征计算完成。")
@@ -2024,9 +2031,17 @@ def main():
                 price_str = f"{current_price:.4f}" if current_price else "N/A"
                 equity_str = f"{strategy.equity:.2f}" if strategy.equity else "N/A"
                 pos_str = strategy.position if strategy.position is not None else "无"
+
+                # <<< [核心修改] START >>>
+                # 从策略数据中安全地获取最新的市场状态
+                regime_str = "计算中..."
+                if not strategy.data.empty and "trend_regime" in strategy.data.columns:
+                    regime_str = strategy.data.iloc[-1].get("trend_regime", "计算中...")
+
                 logging.info(
-                    f"[{symbol}] 等待新K線... 仓位: {pos_str} | 权益: {equity_str} | 价格: {price_str} | K線: {strategy.data.index[-1]}"
+                    f"[{symbol}] 等待新K線... 仓位: {pos_str} | 市场: {regime_str} | 权益: {equity_str} | 价格: {price_str} | K線: {strategy.data.index[-1]}"
                 )
+                # <<< [核心修改] END >>>
 
             if datetime.utcnow() - last_audit_time >= pd.Timedelta(
                 minutes=AUDIT_INTERVAL_MINUTES

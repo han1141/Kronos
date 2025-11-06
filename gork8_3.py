@@ -69,8 +69,8 @@ set_chinese_font()
 CONFIG = {
     "symbols_to_test": ["ETHUSDT"],
     "interval": "15m",
-    "backtest_start_date": "2025-10-01",
-    "backtest_end_date": "2025-11-04",
+    "backtest_start_date": "2025-01-01",
+    "backtest_end_date": "2025-11-05",
     "initial_cash": 500_000,
     "commission": 0.00075,
     "spread": 0.0002,

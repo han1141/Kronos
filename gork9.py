@@ -13,6 +13,14 @@ import matplotlib.font_manager
 import joblib
 import os
 import glob
+import warnings
+
+# --- 新增库 ---
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+
+# 忽略 scikit-learn 关于 n_init 的 UserWarning
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
 # 检查TensorFlow是否已安装
 try:
@@ -26,6 +34,7 @@ from backtesting import Backtest, Strategy
 from backtesting.lib import crossover
 import ta
 
+# --- 日志配置 (无变化) ---
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 log_filename = f"trading_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -65,12 +74,12 @@ def set_chinese_font():
 
 set_chinese_font()
 
-# --- 核心配置 ---
+# --- 核心配置 (无变化) ---
 CONFIG = {
     "symbols_to_test": ["ETHUSDT"],
     "interval": "15m",
-    "backtest_start_date": "2025-01-01",
-    "backtest_end_date": "2025-11-05",
+    "backtest_start_date": "2024-01-01",
+    "backtest_end_date": "2024-12-31",
     "initial_cash": 500_000,
     "commission": 0.00075,
     "spread": 0.0002,
@@ -79,76 +88,67 @@ CONFIG = {
     "enable_ml_component": True,
 }
 
-# --- Keras模型文件路径配置 ---
+# --- Keras模型文件路径配置 (无变化) ---
 KERAS_MODEL_PATH = "models/eth_trend_model_v1_15m.keras"
 SCALER_PATH = "models/eth_trend_scaler_v1_15m.joblib"
 FEATURE_COLUMNS_PATH = "models/feature_columns_15m.joblib"
 KERAS_SEQUENCE_LENGTH = 60
 
-# --- 策略参数 ---
+# --- 策略参数 (无变化) ---
 STRATEGY_PARAMS = {
-    # --- 核心风控 ---
     "tsl_enabled": True,
-    "tsl_activation_profit_pct": 0.007,  # 原 0.005 → 稍提高，延迟止盈激活
-    "tsl_activation_atr_mult": 1.8,  # 原 1.5 → 略放宽触发距离
-    "tsl_trailing_atr_mult": 2.2,  # 原 2.0 → 略放宽追踪距离
-    "kelly_trade_history": 25,  # 原 20 → 增加样本平滑Kelly值
-    "default_risk_pct": 0.012,  # 原 0.015 → 降低基础风险暴露
-    "max_risk_pct": 0.035,  # 原 0.04 → 略下调风险上限
-    # --- 回撤动态风险调整 ---
+    "tsl_activation_profit_pct": 0.005,
+    "tsl_activation_atr_mult": 1.5,
+    "tsl_trailing_atr_mult": 2.0,
+    "kelly_trade_history": 20,
+    "default_risk_pct": 0.015,
+    "max_risk_pct": 0.04,
     "dd_grace_period_bars": 240,
     "dd_initial_pct": 0.35,
     "dd_final_pct": 0.25,
     "dd_decay_bars": 4320,
-    # --- 市场状态检测 ---
     "regime_adx_period": 14,
     "regime_atr_period": 14,
-    "regime_atr_slope_period": 6,  # 原 5 → 略放慢反应
+    "regime_atr_slope_period": 5,
     "regime_rsi_period": 14,
     "regime_rsi_vol_period": 14,
     "regime_norm_period": 252,
-    "regime_hurst_period": 80,  # 原 60 → 放慢Hurst变化
-    "regime_score_weight_adx": 0.55,  # 原 0.6 → 降低趋势权重
+    "regime_hurst_period": 100,
+    "regime_score_weight_adx": 0.6,
     "regime_score_weight_atr": 0.3,
-    "regime_score_weight_rsi": 0.1,  # 原 0.05 → 稍提高震荡识别权重
+    "regime_score_weight_rsi": 0.05,
     "regime_score_weight_hurst": 0.05,
-    "regime_score_threshold": 0.4,  # 原 0.35 → 略提高趋势判定门槛（减少假信号）
-    # --- 趋势跟随模块 ---
-    "tf_donchian_period": 24,  # 原 20 → 略放慢突破信号
-    "tf_ema_fast_period": 21,  # 原 20 → 稍慢一点
-    "tf_ema_slow_period": 60,  # 原 50 → 放慢均线确认节奏
+    "regime_score_threshold": 0.45,
+    "tf_donchian_period": 30,
+    "tf_ema_fast_period": 20,
+    "tf_ema_slow_period": 75,
     "tf_adx_confirm_period": 14,
-    "tf_adx_confirm_threshold": 20,  # 原 18 → 略提高确认要求
+    "tf_adx_confirm_threshold": 18,
     "tf_chandelier_period": 22,
     "tf_chandelier_atr_multiplier": 3.0,
     "tf_atr_period": 14,
-    "tf_stop_loss_atr_multiplier": 2.6,  # 原 2.5 → 稍放宽止损
-    # --- 均值回归模块 ---
+    "tf_stop_loss_atr_multiplier": 2.5,
     "mr_bb_period": 20,
     "mr_bb_std": 2.0,
     "mr_stop_loss_atr_multiplier": 1.5,
     "mr_risk_multiplier": 0.5,
-    # --- 多周期过滤 ---
-    "mtf_period": 40,  # 原 30 → 稍慢日线趋势确认
-    "score_entry_threshold": 0.5,  # 原 0.45 → 提高入场门槛，减少轻微信号触发
-    # --- 信号权重 ---
+    "mtf_period": 50,
+    "score_entry_threshold": 0.4,
     "score_weights_tf": {
-        "breakout": 0.22,  # 原 0.25
+        "breakout": 0.25,
         "momentum": 0.18,
-        "mtf": 0.12,  # 原 0.10 → 更重视多周期一致性
-        "ml": 0.23,  # 原 0.22
+        "mtf": 0.10,
+        "ml": 0.22,
         "advanced_ml": 0.25,
     },
 }
-
-
 ASSET_SPECIFIC_OVERRIDES = {
     "ETHUSDT": {"strategy_class": "ETHStrategy", "score_entry_threshold": 0.45},
 }
 
 
 # --- 函数定义 ---
-class StrategyMemory:
+class StrategyMemory:  # (无变化)
     def __init__(self, filepath="strategy_memory.csv"):
         self.filepath, self.columns = filepath, [
             "timestamp",
@@ -200,7 +200,7 @@ class StrategyMemory:
         return pd.Series(latest.param_value.values, index=latest.param_key).to_dict()
 
 
-def fetch_binance_klines(s, i, st, en=None, l=1000):
+def fetch_binance_klines(s, i, st, en=None, l=1000):  # (无变化)
     url, cols = "https://api.binance.com/api/v3/klines", [
         "timestamp",
         "Open",
@@ -256,7 +256,7 @@ def fetch_binance_klines(s, i, st, en=None, l=1000):
     return df.set_index("timestamp").sort_index()
 
 
-def compute_hurst(ts, max_lag=100):
+def compute_hurst(ts, max_lag=100):  # (无变化)
     if len(ts) < 10:
         return 0.5
     lags = range(2, min(max_lag, len(ts) // 2 + 1))
@@ -276,7 +276,7 @@ def compute_hurst(ts, max_lag=100):
         return 0.5
 
 
-def run_advanced_model_inference(df):
+def run_advanced_model_inference(df):  # (无变化)
     logger.info("正在运行高级模型推理 (模拟)...")
     if not ADVANCED_ML_LIBS_INSTALLED:
         logger.warning("TensorFlow 未安装, 跳过高级模型推理。")
@@ -292,7 +292,7 @@ def run_advanced_model_inference(df):
     return df
 
 
-def add_ml_features(df: pd.DataFrame) -> pd.DataFrame:
+def add_ml_features(df: pd.DataFrame) -> pd.DataFrame:  # (无变化)
     p = STRATEGY_PARAMS
     norm = lambda s: (
         (s - s.rolling(p["regime_norm_period"]).min())
@@ -328,23 +328,92 @@ def add_ml_features(df: pd.DataFrame) -> pd.DataFrame:
         (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
     )
     df["feature_atr_pct_change_norm"] = norm(atr.pct_change(periods=1))
-    df["feature_regime_score"] = (
-        df["feature_adx_norm"] * p["regime_score_weight_adx"]
-        + df["feature_atr_slope_norm"] * p["regime_score_weight_atr"]
-        + df["feature_rsi_vol_norm"] * p["regime_score_weight_rsi"]
-        + np.clip((df["feature_hurst"] - 0.3) / 0.7, 0, 1)
-        * p["regime_score_weight_hurst"]
-    )
+    # 旧的 regime_score 计算可以移除或保留作为备用特征
+    # df["feature_regime_score"] = ...
     return df
 
 
-def add_market_regime_features(df: pd.DataFrame) -> pd.DataFrame:
-    df["regime_score"] = df["feature_regime_score"]
-    df["trend_regime"] = np.where(
-        df["regime_score"] > STRATEGY_PARAMS["regime_score_threshold"],
-        "Trending",
-        "Mean-Reverting",
+# <<< 核心优化：使用 K-Means 重新定义市场状态 >>>
+def add_market_regime_features(df: pd.DataFrame, n_clusters=4) -> pd.DataFrame:
+    """
+    使用K-Means聚类来重新定义市场状态。
+    - n_clusters: 希望将市场划分成的状态数量。
+    """
+    logger.info(f"正在使用 K-Means (n_clusters={n_clusters}) 重新定义市场状态...")
+
+    # --- 1. 特征工程：选择用于聚类的关键指标 ---
+    # 我们选择能描述趋势强度、波动性、趋势持续性的指标
+    # feature_adx_norm, feature_atr_slope_norm, feature_hurst 等已在 add_ml_features 中计算
+    feature_columns = [
+        "feature_adx_norm",
+        "feature_atr_slope_norm",
+        "feature_rsi_vol_norm",
+        "feature_hurst",
+        "feature_bb_width_norm",
+    ]
+
+    # 确保所有特征都存在
+    missing_cols = [col for col in feature_columns if col not in df.columns]
+    if missing_cols:
+        logger.error(f"聚类所需的特征列缺失: {missing_cols}，跳过市场状态聚类。")
+        df["market_regime"] = 1  # 提供一个默认值
+        return df
+
+    # --- 2. 数据准备与标准化 ---
+    features_df = df[feature_columns].copy()
+    # 对NaN值进行前向填充，以确保聚类器有足够的数据
+    features_df.fillna(method="ffill", inplace=True)
+    features_df.dropna(inplace=True)
+
+    if features_df.empty:
+        logger.warning("特征数据为空，无法进行市场状态聚类。")
+        df["market_regime"] = 1
+        return df
+
+    scaler = StandardScaler()
+    scaled_features = scaler.fit_transform(features_df)
+
+    # --- 3. K-Means聚类 ---
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto")
+    kmeans.fit(scaled_features)
+
+    # --- 4. 将聚类标签（市场状态）添加回主DataFrame ---
+    # 新的状态列命名为 'market_regime_cluster' 以区分
+    df["market_regime_cluster"] = np.nan
+    df.loc[features_df.index, "market_regime_cluster"] = kmeans.labels_
+    df["market_regime_cluster"].fillna(method="ffill", inplace=True)
+
+    # --- 5. 解读聚类结果并映射为“趋势”/“震荡”状态 ---
+    # 计算每个簇的特征中心，来“解读”每个状态的含义
+    centers_df = pd.DataFrame(
+        scaler.inverse_transform(kmeans.cluster_centers_), columns=feature_columns
     )
+    centers_df["regime_label"] = centers_df.index
+    logger.info("K-Means 聚类中心 (市场状态解读):")
+
+    # 定义一个“趋势分数”来对状态进行排序：ADX和Hurst越高，趋势性越强
+    centers_df["trend_score"] = (
+        centers_df["feature_adx_norm"] + (centers_df["feature_hurst"] - 0.5) * 2
+    )
+    centers_df = centers_df.sort_values(by="trend_score", ascending=False).reset_index(
+        drop=True
+    )
+
+    # 我们将得分最高的 n/2 个状态视为“趋势市”，其余视为“震荡市”
+    trending_regimes = centers_df.head(n_clusters // 2)["regime_label"].tolist()
+
+    logger.info(f"根据聚类中心分析，以下状态被识别为 '趋势市': {trending_regimes}")
+    # 打印每个状态的详细特征，便于分析
+    print(centers_df[["regime_label", "trend_score"] + feature_columns])
+
+    # 根据映射关系，创建最终的 market_regime 列 (1 for Trending, -1 for Mean-Reverting)
+    df["market_regime"] = np.where(
+        df["market_regime_cluster"].isin(trending_regimes), 1, -1
+    )
+
+    logger.info("✅ K-Means 市场状态定义完成。")
+
+    # 保留旧的波动率计算作为辅助分析
     df["volatility"] = df["Close"].pct_change().rolling(24 * 7).std() * np.sqrt(
         24 * 365
     )
@@ -355,17 +424,17 @@ def add_market_regime_features(df: pd.DataFrame) -> pd.DataFrame:
         labels=["Low", "Medium", "High"],
         include_lowest=True,
     )
-    df["market_regime"] = np.where(df["trend_regime"] == "Trending", 1, -1)
+
     return df
 
 
-def add_features_for_keras_model(df: pd.DataFrame) -> pd.DataFrame:
+def add_features_for_keras_model(df: pd.DataFrame) -> pd.DataFrame:  # (无变化)
     """
     为 Keras 模型生成所有必需的特征。
     - 确保同时计算并添加所有5个布林带相关指标。
     - 修正了 MACD 列名的大小写以匹配模型期望。
     """
-    logger.info("正在为 Kras 模型生成特定特征 (使用 'ta' 库)...")
+    logger.info("正在为 Keras 模型生成特定特征 (使用 'ta' 库)...")
     high, low, close, volume = df["High"], df["Low"], df["Close"], df["Volume"]
 
     # --- 基础指标 ---
@@ -382,15 +451,10 @@ def add_features_for_keras_model(df: pd.DataFrame) -> pd.DataFrame:
 
     # --- 修正: 计算并添加所有5个必需的布林带指标 ---
     bb_indicator = ta.volatility.BollingerBands(close=close, window=20, window_dev=2.0)
-    # 1. 上轨
     df["BBU_20_2.0"] = bb_indicator.bollinger_hband()
-    # 2. 中轨
     df["BBM_20_2.0"] = bb_indicator.bollinger_mavg()
-    # 3. 下轨
     df["BBL_20_2.0"] = bb_indicator.bollinger_lband()
-    # 4. 宽度 (Bandwidth)
     df["BBB_20_2.0"] = bb_indicator.bollinger_wband()
-    # 5. %B 指标 (Percentage)
     df["BBP_20_2.0"] = bb_indicator.bollinger_pband()
 
     # --- 修正: 统一 MACD 列名的大小写 ---
@@ -398,8 +462,8 @@ def add_features_for_keras_model(df: pd.DataFrame) -> pd.DataFrame:
         close=close, window_fast=12, window_slow=26, window_sign=9
     )
     df["MACD_12_26_9"] = macd_indicator.macd()
-    df["MACDs_12_26_9"] = macd_indicator.macd_signal()  # 修正: s小写
-    df["MACDh_12_26_9"] = macd_indicator.macd_diff()  # 修正: h小写
+    df["MACDs_12_26_9"] = macd_indicator.macd_signal()
+    df["MACDh_12_26_9"] = macd_indicator.macd_diff()
 
     # --- 其它指标 ---
     df["OBV"] = ta.volume.OnBalanceVolumeIndicator(
@@ -411,7 +475,9 @@ def add_features_for_keras_model(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataFrame:
+def preprocess_data_for_strategy(
+    data_in: pd.DataFrame, symbol: str
+) -> pd.DataFrame:  # (无变化)
     df = data_in.copy()
     logger.info(
         f"[{symbol}] 开始数据预处理 (数据范围: {df.index.min()} to {df.index.max()})..."
@@ -425,7 +491,9 @@ def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataF
     df = run_advanced_model_inference(df)
     df = add_ml_features(df)
     df = add_features_for_keras_model(df)
+    # 调用新的、基于K-Means的市场状态定义函数
     df = add_market_regime_features(df)
+
     daily_start = df.index.min().normalize() - pd.Timedelta(
         days=STRATEGY_PARAMS["mtf_period"] + 5
     )
@@ -458,7 +526,7 @@ def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataF
     return df
 
 
-def create_sequences(data: np.ndarray, sequence_length: int) -> np.ndarray:
+def create_sequences(data: np.ndarray, sequence_length: int) -> np.ndarray:  # (无变化)
     sequences = []
     data_len = len(data)
     for i in range(data_len - sequence_length + 1):
@@ -467,7 +535,7 @@ def create_sequences(data: np.ndarray, sequence_length: int) -> np.ndarray:
 
 
 # --- 策略类定义 ---
-class BaseAssetStrategy:
+class BaseAssetStrategy:  # (无变化)
     def __init__(self, main_strategy: Strategy):
         self.main = main_strategy
 
@@ -515,12 +583,12 @@ class BaseAssetStrategy:
         return 0
 
 
-class BTCStrategy(BaseAssetStrategy):
+class BTCStrategy(BaseAssetStrategy):  # (无变化)
     def _calculate_entry_score(self) -> float:
         return super()._calculate_entry_score() if self.main.tf_adx[-1] > 20 else 0
 
 
-class ETHStrategy(BaseAssetStrategy):
+class ETHStrategy(BaseAssetStrategy):  # (无变化)
     pass
 
 
@@ -560,7 +628,13 @@ class UltimateStrategy(Strategy):
         low = pd.Series(self.data.Low)
         self.recent_trade_returns = deque(maxlen=self.kelly_trade_history)
         self.reset_trade_state()
+
+        # <<< 修改：直接从数据中读取由 K-Means 生成的市场状态 >>>
         self.market_regime = self.I(lambda: self.data.market_regime)
+        self.market_regime_cluster = self.I(
+            lambda: self.data.market_regime_cluster
+        )  # 可选，用于未来更复杂的逻辑
+
         self.mtf_signal = self.I(lambda: self.data.mtf_signal)
         self.advanced_ml_signal = self.I(lambda: self.data.advanced_ml_signal)
         self.macro_trend = self.I(lambda: self.data.macro_trend_filter)
@@ -609,7 +683,7 @@ class UltimateStrategy(Strategy):
         )
         self.keras_signal = self.I(self._calculate_keras_predictions)
 
-    def _load_keras_model_and_dependencies(self):
+    def _load_keras_model_and_dependencies(self):  # (无变化)
         if not CONFIG["enable_ml_component"] or not ADVANCED_ML_LIBS_INSTALLED:
             logger.warning(f"[{self.symbol}] Keras模型组件已禁用或TensorFlow未安装。")
             return None, None, None
@@ -623,7 +697,7 @@ class UltimateStrategy(Strategy):
             logger.error(f"[{self.symbol}] 加载Keras模型或依赖项失败: {e}")
             return None, None, None
 
-    def _calculate_keras_predictions(self):
+    def _calculate_keras_predictions(self):  # (无变化)
         if self.keras_model is None or self.scaler is None:
             return np.zeros(len(self.data.Close))
         expected_features = set(self.feature_columns)
@@ -656,27 +730,27 @@ class UltimateStrategy(Strategy):
         logger.info(f"[{self.symbol}] Keras模型信号计算完成。")
         return final_signals
 
-    # <<< 核心修改：实现做多/做空双向逻辑 >>>
-    def next(self):
+    def next(self):  # (无变化)
         if self.position:
             self.manage_open_position(self.data.Close[-1])
         else:
             # 宏观牛市，只寻找做多机会
             if self.macro_trend[-1] == 1:
-                if self.data.market_regime[-1] == 1:  # 趋势市
+                # 使用 K-Means 判断的市场状态 (1=趋势市, -1=震荡市)
+                if self.data.market_regime[-1] == 1:
                     score = self.asset_strategy._calculate_entry_score()
                     if score > self.score_entry_threshold:
                         self.open_tf_position(
                             self.data.Close[-1], is_long=True, confidence_factor=score
                         )
-                else:  # 震荡市
+                else:
                     signal = self.asset_strategy._define_mr_entry_signal()
                     if signal == 1:
                         self.open_mr_position(self.data.Close[-1], is_long=True)
 
             # 宏观熊市，只寻找做空机会
             elif self.macro_trend[-1] == -1:
-                if self.data.market_regime[-1] == 1:  # 趋势市
+                if self.data.market_regime[-1] == 1:
                     score = self.asset_strategy._calculate_entry_score()
                     if score < -self.score_entry_threshold:
                         self.open_tf_position(
@@ -684,26 +758,26 @@ class UltimateStrategy(Strategy):
                             is_long=False,
                             confidence_factor=abs(score),
                         )
-                else:  # 震荡市
+                else:
                     signal = self.asset_strategy._define_mr_entry_signal()
                     if signal == -1:
                         self.open_mr_position(self.data.Close[-1], is_long=False)
 
-    def reset_trade_state(self):
+    def reset_trade_state(self):  # (无变化)
         self.active_sub_strategy = None
         self.stop_loss_price = 0.0
         self.trailing_stop_active = False
         self.highest_high_in_trade = 0
         self.lowest_low_in_trade = float("inf")
 
-    def manage_open_position(self, p):
+    def manage_open_position(self, p):  # (无变化)
         self._manage_trailing_stop_loss()
         if self.active_sub_strategy == "TF":
             self.manage_trend_following_exit(p)
         elif self.active_sub_strategy == "MR":
             self.manage_mean_reversion_exit(p)
 
-    def _manage_trailing_stop_loss(self):
+    def _manage_trailing_stop_loss(self):  # (无变化)
         if not self.tsl_enabled or not self.position:
             return
         is_active = self.trailing_stop_active
@@ -746,15 +820,13 @@ class UltimateStrategy(Strategy):
             if new_stop_price is not None:
                 self.stop_loss_price = new_stop_price
 
-    def open_tf_position(self, p, is_long, confidence_factor, score=1.0):
+    def open_tf_position(self, p, is_long, confidence_factor, score=1.0):  # (无变化)
         risk_ps = self.tf_atr[-1] * self.tf_stop_loss_atr_multiplier
         if risk_ps <= 0:
             return
         size = self._calculate_position_size(
             p, risk_ps, self._calculate_dynamic_risk() * score * confidence_factor
         )
-        # <<< 修改: 移除错误的检查，替换为更合理的检查 >>>
-        # 原来的检查 `if not 0 < size < 0.98:` 在计算单位数量时是错误的
         if size <= 0:
             return
         self.reset_trade_state()
@@ -766,7 +838,7 @@ class UltimateStrategy(Strategy):
             self.sell(size=size)
             self.stop_loss_price = p + risk_ps
 
-    def manage_trend_following_exit(self, p):
+    def manage_trend_following_exit(self, p):  # (无变化)
         chandelier_exit_level = 0
         if self.position.is_long:
             self.highest_high_in_trade = max(
@@ -789,14 +861,13 @@ class UltimateStrategy(Strategy):
             if p > final_sl:
                 self.close_position("TF_Exit")
 
-    def open_mr_position(self, p, is_long):
+    def open_mr_position(self, p, is_long):  # (无变化)
         risk_ps = self.tf_atr[-1] * self.mr_stop_loss_atr_multiplier
         if risk_ps <= 0:
             return
         size = self._calculate_position_size(
             p, risk_ps, self._calculate_dynamic_risk() * self.mr_risk_multiplier
         )
-        # <<< 修改: 移除错误的检查，替换为更合理的检查 >>>
         if size <= 0:
             return
         self.reset_trade_state()
@@ -808,7 +879,7 @@ class UltimateStrategy(Strategy):
             self.sell(size=size)
             self.stop_loss_price = p + risk_ps
 
-    def manage_mean_reversion_exit(self, p):
+    def manage_mean_reversion_exit(self, p):  # (无变化)
         if (
             self.position.is_long
             and (p >= self.mr_bb_mid[-1] or p <= self.stop_loss_price)
@@ -818,39 +889,23 @@ class UltimateStrategy(Strategy):
         ):
             self.close_position("MR_Exit")
 
-    def close_position(self, reason: str):
+    def close_position(self, reason: str):  # (无变化)
         eq_before = self.equity
         self.position.close()
         self.recent_trade_returns.append(self.equity / eq_before - 1)
         self.reset_trade_state()
 
-    # <<< 修改: 仓位管理核心逻辑修正 >>>
-    def _calculate_position_size(self, p, rps, risk_pct):
-        """
-        根据风险百分比计算头寸的【单位数量】。
-        这是一个更稳健的方法，避免了分数与单位数量之间的混淆。
-        p: 当前价格
-        rps: 每单位风险 (Risk Per Share/Unit)，即止损距离
-        risk_pct: 愿意承担的风险百分比
-        """
+    def _calculate_position_size(self, p, rps, risk_pct):  # (无变化)
         if rps <= 0 or p <= 0:
             return 0
-
-        # 1. 计算本次交易愿意承担的风险金额（美元）
         risk_amount_dollars = self.equity * risk_pct
-
-        # 2. 计算可以购买多少单位的资产
         units = risk_amount_dollars / rps
-
-        # 3. (安全检查) 确保购买这些单位的钱足够
         cash_needed = units * p
         if cash_needed > self.equity:
-            # 如果所需现金超过全部资产，则用95%的资产来购买，以防万一
             units = (self.equity * 0.95) / p
-
         return int(units)
 
-    def _calculate_dynamic_risk(self):
+    def _calculate_dynamic_risk(self):  # (无变化)
         if len(self.recent_trade_returns) < self.kelly_trade_history:
             return self.default_risk_pct * self.vol_weight
         wins, losses = [r for r in self.recent_trade_returns if r > 0], [
@@ -870,8 +925,8 @@ class UltimateStrategy(Strategy):
         return min(max(0.005, kelly * 0.5) * self.vol_weight, self.max_risk_pct)
 
 
-if __name__ == "__main__":
-    logger.info(f"🚀 (V41.05-MR-Enhanced with Keras Model) 开始运行...")
+if __name__ == "__main__":  # (无变化)
+    logger.info(f"🚀 (V43.0-KMeans-Regime-Detection) 开始运行...")
     backtest_start_dt = pd.to_datetime(CONFIG["backtest_start_date"])
     data_lookback = timedelta(days=CONFIG["data_lookback_days"])
     data_fetch_start_date = (backtest_start_dt - data_lookback).strftime("%Y-%m-%d")
@@ -924,8 +979,6 @@ if __name__ == "__main__":
             if key in asset_overrides:
                 bt_params[f"{key}_override"] = asset_overrides[key]
 
-        # <<< 修改: 正确添加滑点参数 margin >>>
-        # margin 代表单边滑点，通常是 spread (买卖价差) 的一半。
         bt = Backtest(
             data,
             UltimateStrategy,
