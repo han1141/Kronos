@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# V45.1-Leak-Fixed
 
 # --- 1. 导入库与配置 ---
 import pandas as pd
@@ -66,12 +67,12 @@ def set_chinese_font():  # (无变化)
 
 set_chinese_font()
 
-# --- 核心配置 ---
+# --- 核心配置 (保持 V45.0 的设置) ---
 CONFIG = {
     "symbols_to_test": ["ETHUSDT"],
-    "interval": "15m",  # 回测执行的K线周期
-    "backtest_start_date": "2022-01-01",
-    "backtest_end_date": "2022-12-31",
+    "interval": "15m",
+    "backtest_start_date": "2023-01-01",
+    "backtest_end_date": "2023-12-31",
     "initial_cash": 500_000,
     "commission": 0.00075,
     "spread": 0.0002,
@@ -79,26 +80,25 @@ CONFIG = {
     "data_lookback_days": 250,
 }
 
-# --- 模型文件路径配置 ---
+# --- 模型文件路径配置 (无变化) ---
 LGBM_4H_MODEL_PATH = "models/eth_trend_model_lgb_4h.joblib"
 LGBM_4H_SCALER_PATH = "models/eth_trend_scaler_lgb_4h.joblib"
 LGBM_4H_FEATURE_COLUMNS_PATH = "models/feature_columns_lgb_4h.joblib"
 LGBM_4H_THRESHOLD = 0.3159
-LGBM_SEQUENCE_LENGTH = 60  # 与训练时保持一致
+LGBM_SEQUENCE_LENGTH = 60
 
-# --- 策略参数 ---
+# --- 策略参数 (保持 V45.0 的设置) ---
 STRATEGY_PARAMS = {
-    "tactical_ema_period": 50,  # 4h EMA 周期
-    "tactical_adx_period": 14,  # 4h ADX 周期
-    "tactical_adx_threshold": 20,  # ADX 趋势强度阈值
-    # 风险与仓位管理
+    "tactical_ema_period": 50,
+    "tactical_adx_period": 14,
+    "tactical_adx_threshold": 20,
     "tsl_enabled": True,
     "tsl_activation_atr_mult": 1.5,
     "tsl_trailing_atr_mult": 2.0,
     "kelly_trade_history": 20,
     "default_risk_pct": 0.015,
     "max_risk_pct": 0.04,
-    "tf_atr_period": 14,  # 用于计算止损的15m ATR周期
+    "tf_atr_period": 14,
     "tf_stop_loss_atr_multiplier": 2.5,
 }
 
@@ -160,12 +160,10 @@ def fetch_binance_klines(s, i, st, en=None, l=1000):  # (无变化)
     return df.set_index("timestamp").sort_index()
 
 
-def add_features_for_lgbm_model(
-    df: pd.DataFrame,
-) -> pd.DataFrame:  # 从旧代码中提炼的特征函数
+def add_features_for_lgbm_model(df: pd.DataFrame) -> pd.DataFrame:  # (无变化)
     high, low, close, volume = df["High"], df["Low"], df["Close"], df["Volume"]
     df["volatility"] = (
-        np.log(df["Close"] / df["Close"].shift(1)).rolling(window=20).std()
+        (np.log(df["Close"] / df["Close"].shift(1))).rolling(window=20).std()
     )
     df["EMA_8"] = ta.trend.EMAIndicator(close=close, window=8).ema_indicator()
     df["RSI_14"] = ta.momentum.RSIIndicator(close=close, window=14).rsi()
@@ -208,15 +206,21 @@ def add_features_for_lgbm_model(
     return df
 
 
-def create_flattened_sequences(data, look_back=60):
+def create_flattened_sequences(data, look_back=60):  # (无变化)
     X = []
     for i in range(len(data) - look_back + 1):
         X.append(data[i : (i + look_back), :].flatten())
     return np.array(X, dtype=np.float32) if X else np.array([])
 
 
-def generate_lgbm_signals(symbol: str, interval: str) -> pd.Series:
-    logger.info(f"--- 正在为 [{symbol}] 生成 [{interval}] 级别的LGBM信号 ---")
+### <<< 修正点 1: 重构 generate_lgbm_signals 函数 >>> ###
+# 移除网络请求，改为接收一个DataFrame作为数据源，彻底杜绝未来数据泄漏
+def generate_lgbm_signals(
+    symbol: str, interval: str, df_source: pd.DataFrame
+) -> pd.Series:
+    logger.info(
+        f"--- 正在为 [{symbol}] 生成 [{interval}] 级别的LGBM信号 (基于历史数据) ---"
+    )
     if lgb is None:
         logger.warning("lightgbm库未安装，无法生成LGBM信号。")
         return pd.Series(dtype="float64")
@@ -226,33 +230,35 @@ def generate_lgbm_signals(symbol: str, interval: str) -> pd.Series:
     ):
         logger.warning(f"缺少 {interval} 模型的必要文件，将返回空信号。")
         return pd.Series(dtype="float64")
+
     try:
+        if df_source is None or df_source.empty:
+            logger.warning(f"传入的源数据为空，无法生成LGBM信号。")
+            return pd.Series(dtype="float64")
+
         model, scaler, feature_columns = (
             joblib.load(LGBM_4H_MODEL_PATH),
             joblib.load(LGBM_4H_SCALER_PATH),
             joblib.load(LGBM_4H_FEATURE_COLUMNS_PATH),
         )
-        start_date = (
-            datetime.now() - timedelta(days=CONFIG["data_lookback_days"] + 200)
-        ).strftime("%Y-%m-%d")
-        end_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        df_lgbm = fetch_binance_klines(symbol, interval, start_date, end_date)
-        if df_lgbm.empty:
-            return pd.Series(dtype="float64")
 
-        df_featured = add_features_for_lgbm_model(df_lgbm.copy())
+        df_featured = add_features_for_lgbm_model(df_source.copy())
         for col in feature_columns:
             if col not in df_featured.columns:
                 df_featured[col] = 0
         df_aligned = df_featured[feature_columns].dropna()
+
         if df_aligned.empty:
+            logger.warning("特征计算和dropna后数据为空，无法生成信号。")
             return pd.Series(dtype="float64")
 
         scaled_features = scaler.transform(df_aligned)
         X_sequences = create_flattened_sequences(
             scaled_features, look_back=LGBM_SEQUENCE_LENGTH
         )
+
         if X_sequences.shape[0] == 0:
+            logger.warning("创建序列后数据为空，无法生成信号。")
             return pd.Series(dtype="float64")
 
         probs = model.predict_proba(X_sequences)[:, 1]
@@ -295,11 +301,14 @@ def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataF
     )
     df_4h["trend_confirmed"] = adx_indicator.adx() > p["tactical_adx_threshold"]
 
-    lgbm_signal_4h = generate_lgbm_signals(symbol, "4h")
+    ### <<< 修正点 2.1: 调用重构后的函数，传入df_4h作为数据源 >>> ###
+    lgbm_signal_4h = generate_lgbm_signals(symbol, "4h", df_source=df_4h)
     df_4h["entry_signal"] = lgbm_signal_4h.reindex(df_4h.index).fillna(0)
 
     logger.info(f"[{symbol}] 将 4h 信号广播到 15m 数据...")
     for signal_col in ["trend_direction", "trend_confirmed", "entry_signal"]:
+        ### <<< 修正点 2.2: 对4H信号应用.shift(1)以避免前视偏差 >>> ###
+        df_4h[signal_col] = df_4h[signal_col].shift(1)
         df_15m[signal_col] = (
             df_4h[signal_col].reindex(df_15m.index, method="ffill").fillna(0)
         )
@@ -313,7 +322,7 @@ def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataF
     return df_15m
 
 
-# --- 策略类定义 ---
+# --- 策略类定义 (保持 V45.0 的逻辑) ---
 class UltimateStrategy(Strategy):
     symbol, vol_weight = (None, 1.0)
 
@@ -322,6 +331,7 @@ class UltimateStrategy(Strategy):
             setattr(self, key, value)
         self.recent_trade_returns = deque(maxlen=self.kelly_trade_history)
         self.reset_trade_state()
+        # 策略需要的信号
         self.trend_direction = self.I(lambda: self.data.trend_direction)
         self.trend_confirmed = self.I(lambda: self.data.trend_confirmed)
         self.entry_signal = self.I(lambda: self.data.entry_signal)
@@ -333,10 +343,15 @@ class UltimateStrategy(Strategy):
             return
 
         # 核心决策逻辑：三者必须同时满足
-        if self.trend_confirmed[-1]:
-            if self.trend_direction[-1] == 1 and self.entry_signal[-1] == 1:
+        # 使用 [-1] 获取当前已收盘K线的信号值
+        if self.trend_confirmed[-1]:  # ADX > 阈值
+            if (
+                self.trend_direction[-1] == 1 and self.entry_signal[-1] == 1
+            ):  # EMA方向向上 & ML信号为1
                 self.open_position(self.data.Close[-1], is_long=True)
-            elif self.trend_direction[-1] == -1 and self.entry_signal[-1] == -1:
+            elif (
+                self.trend_direction[-1] == -1 and self.entry_signal[-1] == -1
+            ):  # EMA方向向下 & ML信号为-1
                 self.open_position(self.data.Close[-1], is_long=False)
 
     def reset_trade_state(self):
@@ -368,7 +383,7 @@ class UltimateStrategy(Strategy):
                 and current_price <= entry_price - activation_dist
             ):
                 self.trailing_stop_active = True
-                is_active = True
+                is_active = True  # 更新状态以便立即执行下面的逻辑
         if is_active:
             trail_dist = self.atr[-1] * self.tsl_trailing_atr_mult
             if self.position.is_long:
@@ -424,7 +439,7 @@ class UltimateStrategy(Strategy):
 
 # --- 主程序入口 ---
 if __name__ == "__main__":
-    logger.info(f"🚀 (V45.0-Focused-4H-System) 开始运行...")
+    logger.info(f"🚀 (V45.1-Leak-Fixed) 开始运行...")
     backtest_start_dt = pd.to_datetime(CONFIG["backtest_start_date"])
     data_fetch_start_date = (
         backtest_start_dt - timedelta(days=CONFIG["data_lookback_days"])
@@ -451,7 +466,7 @@ if __name__ == "__main__":
         logger.info(f"为 {symbol} 预处理完整时段数据...")
         full_processed_data = preprocess_data_for_strategy(data, symbol)
         backtest_period_slice = full_processed_data.loc[
-            CONFIG["backtest_start_date"] :
+            CONFIG["backtest_start_date"] : CONFIG["backtest_end_date"]
         ].copy()
         if not backtest_period_slice.empty:
             processed_backtest_data[symbol] = backtest_period_slice
@@ -486,8 +501,10 @@ if __name__ == "__main__":
         print(f"\n{'#'*80}\n                 组合策略表现总览\n{'#'*80}")
         for symbol, stats in all_stats.items():
             print(
-                f"  - {symbol}:\n    - 最终权益: ${stats['Equity Final [$]']:,.2f} (回报率: {stats['Return [%]']:.2f}%)\n    - 最大回撤: {stats['Max. Drawdown [%]']:.2f}%\n    - 夏普比率: {stats.get('Sharpe Ratio', 'N/A')}"
+                f"  - {symbol}:\n    - 最终权益: ${stats['Equity Final [$]']:,.2f} (回报率: {stats['Return [%]']:.2f}%)\n"
+                f"    - 最大回撤: {stats['Max. Drawdown [%]']:.2f}%\n    - 夏普比率: {stats.get('Sharpe Ratio', 'N/A')}"
             )
         print(
-            f"\n--- 投资组合整体表现 ---\n总初始资金: ${initial_total:,.2f}\n总最终权益: ${total_equity:,.2f}\n组合总回报率: {ret:.2f}%"
+            f"\n--- 投资组合整体表现 ---\n总初始资金: ${initial_total:,.2f}\n总最终权益: ${total_equity:,.2f}\n"
+            f"组合总回报率: {ret:.2f}%"
         )
