@@ -14,13 +14,15 @@ from sklearn.metrics import (
     f1_score,
     precision_recall_curve,
 )
-from sklearn.utils import class_weight
-import tensorflow as tf
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Bidirectional, LSTM, Dense, Dropout, Input
-from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.keras.regularizers import l2
+
+# from sklearn.utils import class_weight  #不再需要
+# import tensorflow as tf #不再需要
+# from tensorflow.keras.models import Sequential, load_model #不再需要
+# from tensorflow.keras.layers import Bidirectional, LSTM, Dense, Dropout, Input #不再需要
+# from tensorflow.keras.callbacks import EarlyStopping #不再需要
+# from tensorflow.keras.regularizers import l2 #不再需要
 import joblib
+import lightgbm as lgb  # 引入 LightGBM
 
 # ... (从这里到 train_and_evaluate 函数的所有代码都保持不变) ...
 
@@ -32,11 +34,11 @@ logger = logging.getLogger(__name__)
 
 
 SYMBOL = "ETHUSDT"
-INTERVAL = "1h"
+INTERVAL = "15m"
 DATA_START_DATE = "2017-01-01"
 TRAIN_START_DATE = "2018-01-01"
-TRAIN_END_DATE = "2025-05-31"
-TEST_START_DATE = "2025-06-01"
+TRAIN_END_DATE = "2025-01-01"
+TEST_START_DATE = "2025-03-01"
 TEST_END_DATE = "2025-11-06"
 LOOK_BACK = 60
 
@@ -45,10 +47,13 @@ TREND_CONFIG = {
     "ema_length": 8,
 }
 
-MODEL_SAVE_PATH = f"models/eth_trend_model_v1_custom_{INTERVAL}.keras"
-SCALER_SAVE_PATH = f"models/eth_trend_scaler_v1_custom_{INTERVAL}.joblib"
+# 修改模型和Scaler的保存路径以反映模型类型
+MODEL_SAVE_PATH = f"models/eth_trend_model_lgb_{INTERVAL}.joblib"
+SCALER_SAVE_PATH = f"models/eth_trend_scaler_lgb_{INTERVAL}.joblib"
+FEATURE_COLUMNS_PATH = f"models/feature_columns_lgb_{INTERVAL}.joblib"
 
-DATA_CACHE_PATH = f"data/{SYMBOL.lower()}_{INTERVAL}_custom_data.csv"
+
+DATA_CACHE_PATH = f"data/{SYMBOL.lower()}_{INTERVAL}_data.csv"
 
 
 def fetch_binance_klines(s, i, st, en=None, l=1000):
@@ -139,16 +144,21 @@ def create_trend_labels(df, look_forward_steps=12, ema_length=8):
     return df
 
 
-# --- 2. 数据准备 ---
-def create_multivariate_sequences(data, labels, look_back=60):
+# --- 2. 数据准备 (修改) ---
+def create_flattened_sequences(data, labels, look_back=60):
+    """
+    为GBDT模型创建展平的序列数据。
+    每个样本X是look_back个时间步的所有特征的展平向量。
+    """
     X, y = [], []
     for i in range(len(data) - look_back):
-        X.append(data[i : (i + look_back), :])
+        feature_sequence = data[i : (i + look_back), :]
+        X.append(feature_sequence.flatten())
         y.append(labels[i + look_back])
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.int32)
 
 
-# --- 3. 核心训练与评估函数 ---
+# --- 3. 核心训练与评估函数 (使用 LightGBM 重写) ---
 def train_and_evaluate(
     train_df, test_df, look_back, model_save_path, scaler_save_path, trend_config
 ):
@@ -171,24 +181,20 @@ def train_and_evaluate(
     X_train_scaled = scaler.fit_transform(X_train_full_df)
     X_test_scaled = scaler.transform(X_test_df)
 
-    joblib.dump(X_train_full_df.columns, f"models/feature_columns_custom_{INTERVAL}.joblib")
+    joblib.dump(X_train_full_df.columns, FEATURE_COLUMNS_PATH)
 
-    X_train, y_train = create_multivariate_sequences(
+    # 使用新的函数创建展平的数据
+    X_train, y_train = create_flattened_sequences(
         X_train_scaled, y_train_full, look_back
     )
-    X_test, y_test = create_multivariate_sequences(
-        X_test_scaled, y_test_full, look_back
-    )
-
-    logger.info(f"数据类型检查: X_train -> {X_train.dtype}, y_train -> {y_train.dtype}")
+    X_test, y_test = create_flattened_sequences(X_test_scaled, y_test_full, look_back)
 
     if X_train.shape[0] == 0 or X_test.shape[0] == 0:
         logger.error("数据不足，无法创建训练或测试序列。")
         return None, None, None
 
-    num_features = X_train.shape[2]
     logger.info(
-        f"数据准备完成。特征: {num_features}, 训练样本: {len(X_train)}, 测试样本: {len(X_test)}"
+        f"数据准备完成。特征维度: {X_train.shape[1]}, 训练样本: {len(X_train)}, 测试样本: {len(X_test)}"
     )
 
     train_label_counts = np.bincount(y_train)
@@ -199,53 +205,45 @@ def train_and_evaluate(
         f"训练集标签分布: 0 = {train_label_counts[0]}, 1 = {train_label_counts[1]}"
     )
 
-    class_weights = class_weight.compute_class_weight(
-        "balanced", classes=np.unique(y_train), y=y_train
-    )
-    class_weight_dict = dict(enumerate(class_weights))
-    logger.info(f"类别权重: {class_weight_dict}")
+    # 计算 scale_pos_weight 来处理类别不平衡
+    scale_pos_weight = train_label_counts[0] / train_label_counts[1]
+    logger.info(f"计算出的 scale_pos_weight: {scale_pos_weight:.2f}")
 
-    L2_REG = 0.001
-    model = Sequential(
-        [
-            Input(shape=(look_back, num_features)),
-            Bidirectional(
-                LSTM(32, return_sequences=True, kernel_regularizer=l2(L2_REG))
-            ),
-            Dropout(0.5),
-            Bidirectional(LSTM(32, kernel_regularizer=l2(L2_REG))),
-            Dropout(0.5),
-            Dense(16, activation="relu", kernel_regularizer=l2(L2_REG)),
-            Dense(1, activation="sigmoid"),
-        ]
-    )
-    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
-    model.summary()
-
-    early_stopping = EarlyStopping(
-        monitor="val_loss", patience=10, restore_best_weights=True
+    # 定义 LightGBM 模型
+    lgb_model = lgb.LGBMClassifier(
+        objective="binary",
+        metric="logloss",
+        n_estimators=1000,
+        learning_rate=0.05,
+        num_leaves=31,
+        max_depth=-1,
+        min_child_samples=20,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        n_jobs=-1,
+        reg_alpha=0.1,
+        reg_lambda=0.1,
+        scale_pos_weight=scale_pos_weight,
     )
 
-    logger.info("\n开始训练模型...")
-    model.fit(
+    logger.info("\n开始训练 LightGBM 模型...")
+    lgb_model.fit(
         X_train,
         y_train,
-        batch_size=32,
-        epochs=100,
-        class_weight=class_weight_dict,
-        validation_data=(X_test, y_test),
-        callbacks=[early_stopping],
-        verbose=1,
+        eval_set=[(X_test, y_test)],
+        eval_metric="logloss",
+        callbacks=[lgb.early_stopping(stopping_rounds=20, verbose=True)],
     )
 
     os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
-    model.save(model_save_path)
+    joblib.dump(lgb_model, model_save_path)  # 使用 joblib 保存模型
     joblib.dump(scaler, scaler_save_path)
     logger.info(f"模型已保存到: {model_save_path}")
     logger.info(f"Scaler已保存到: {scaler_save_path}")
 
     logger.info("\n--- 开始在测试集上评估模型 ---")
-    y_pred_probs = model.predict(X_test).flatten()
+    y_pred_probs = lgb_model.predict_proba(X_test)[:, 1]  # 获取类别1的概率
     precisions, recalls, thresholds = precision_recall_curve(y_test, y_pred_probs)
     f1_scores = np.divide(
         2 * recalls * precisions,
@@ -263,47 +261,77 @@ def train_and_evaluate(
     print(f"召回率: {recall_score(y_test, y_pred_labels_best_f1):.4f}")
     print(f"F1 分数: {f1_score(y_test, y_pred_labels_best_f1):.4f}")
 
-    return model, scaler, best_f1_threshold
+    return lgb_model, scaler, best_f1_threshold
 
 
 # ==============================================================================
-# === 新增：独立的预测演示函数，以解决变量作用域问题 ===
+# === 独立的预测演示函数 (已修复) ===
 # ==============================================================================
 def run_prediction_demo(
     raw_df, model_path, scaler_path, trend_config, look_back, threshold
 ):
     """
-    加载已保存的模型并对最新数据进行一次预测演示。
+    加载已保存的 LightGBM 模型并对最新数据进行一次预测演示。
+    (已修改为使用iloc进行切片，以适应不同时间间隔)
     """
     logger.info("\n" + "=" * 60)
-    logger.info("--- 加载已保存的模型进行预测演示 ---")
+    logger.info("--- 加载已保存的 LightGBM 模型进行预测演示 ---")
     logger.info("=" * 60)
 
     try:
-        loaded_model = load_model(model_path)
+        loaded_model = joblib.load(model_path)
         loaded_scaler = joblib.load(scaler_path)
-        feature_columns = joblib.load(f"models/feature_columns_custom_{INTERVAL}.joblib")
+        feature_columns = joblib.load(FEATURE_COLUMNS_PATH)
         logger.info("模型、Scaler和特征列加载成功。")
 
-        prediction_end_date = raw_df.index[-1]
-        prediction_start_date = prediction_end_date - pd.DateOffset(
-            hours=look_back + 200
-        )
-        latest_data = raw_df.loc[prediction_start_date:prediction_end_date].copy()
+        # --- 这是主要的修改点 ---
+        # 我们需要 look_back 条数据来构建最终的预测序列，
+        # 并且需要额外的数据（例如50条）来确保特征计算（如Boll(20)）不会产生NaN。
+        required_rows = look_back + 50
+        if len(raw_df) < required_rows:
+            logger.error(
+                f"数据不足以进行预测。需要 {required_rows} 条，但只有 {len(raw_df)} 条。"
+            )
+            return
+
+        # 使用 iloc 从末尾获取固定数量的数据，而不是使用时间偏移量
+        latest_data = raw_df.iloc[-required_rows:].copy()
+        logger.info(f"已获取最新的 {len(latest_data)} 条数据用于预测准备。")
+        # --- 修改结束 ---
 
         latest_featured = feature_engineering(latest_data)
         latest_featured.ta.ema(length=trend_config["ema_length"], append=True)
+
+        # 在对齐特征列之前进行dropna
         latest_featured.dropna(inplace=True)
+
+        if latest_featured.empty:
+            logger.error("在特征计算和dropna之后，没有剩下任何数据用于预测。")
+            return
 
         latest_featured_aligned = latest_featured.reindex(
             columns=feature_columns, fill_value=0
         )
         latest_scaled = loaded_scaler.transform(latest_featured_aligned)
 
-        last_sequence = latest_scaled[-look_back:]
-        last_sequence = np.expand_dims(last_sequence, axis=0)
+        # 检查是否有足够的数据来构建最后的序列
+        if len(latest_scaled) < look_back:
+            logger.error(f"预处理后数据不足 {look_back} 条，无法构建预测序列。")
+            return
 
-        prediction_prob = loaded_model.predict(last_sequence)[0][0]
+        # 准备展平的序列数据用于预测
+        last_sequence_unflattened = latest_scaled[-look_back:]
+        last_sequence_flattened = last_sequence_unflattened.flatten().reshape(1, -1)
+
+        # 检查特征数量是否匹配
+        if last_sequence_flattened.shape[1] != loaded_model.n_features_:
+            logger.error(
+                f"特征数量不匹配! 模型需要 {loaded_model.n_features_} 个特征, "
+                f"但输入数据有 {last_sequence_flattened.shape[1]} 个特征。"
+            )
+            return
+
+        prediction_prob = loaded_model.predict_proba(last_sequence_flattened)[0][1]
 
         logger.info(f"对最新的数据序列进行预测...")
         logger.info(f"模型输出的上涨趋势概率: {prediction_prob:.4f}")

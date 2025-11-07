@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# V49.2-Fetch-Fix
 
 # --- 1. 导入库与配置 ---
 import pandas as pd
@@ -19,15 +20,16 @@ try:
 except ImportError:
     lgb = None
 
-# 忽略不必要的警告
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 from backtesting import Backtest, Strategy
+from backtesting.lib import crossover
 import ta
 
 # --- 日志配置 (无变化) ---
 logger = logging.getLogger(__name__)
+# ... (日志配置保持不变)
 logger.setLevel(logging.DEBUG)
 log_filename = f"trading_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 file_handler = logging.FileHandler(log_filename, encoding="utf-8")
@@ -66,12 +68,13 @@ def set_chinese_font():  # (无变化)
 
 set_chinese_font()
 
-# --- 核心配置 ---
+
+# --- 核心配置 (无变化) ---
 CONFIG = {
     "symbols_to_test": ["ETHUSDT"],
-    "interval": "15m",  # 回测执行的K线周期
-    "backtest_start_date": "2022-01-01",
-    "backtest_end_date": "2022-12-31",
+    "interval": "15m",
+    "backtest_start_date": "2025-01-01",
+    "backtest_end_date": "2025-11-06",
     "initial_cash": 500_000,
     "commission": 0.00075,
     "spread": 0.0002,
@@ -79,32 +82,37 @@ CONFIG = {
     "data_lookback_days": 250,
 }
 
-# --- 模型文件路径配置 ---
+# --- 模型文件路径配置 (无变化) ---
 LGBM_4H_MODEL_PATH = "models/eth_trend_model_lgb_4h.joblib"
 LGBM_4H_SCALER_PATH = "models/eth_trend_scaler_lgb_4h.joblib"
 LGBM_4H_FEATURE_COLUMNS_PATH = "models/feature_columns_lgb_4h.joblib"
 LGBM_4H_THRESHOLD = 0.3159
-LGBM_SEQUENCE_LENGTH = 60  # 与训练时保持一致
+LGBM_SEQUENCE_LENGTH = 60
 
-# --- 策略参数 ---
+# --- 策略参数 (无变化) ---
 STRATEGY_PARAMS = {
-    "tactical_ema_period": 50,  # 4h EMA 周期
-    "tactical_adx_period": 14,  # 4h ADX 周期
-    "tactical_adx_threshold": 20,  # ADX 趋势强度阈值
-    # 风险与仓位管理
+    "tactical_ema_period": 50,
+    "tactical_adx_period": 14,
+    "long_entry_threshold": 0.3,
+    "short_entry_threshold": -0.3,
+    "score_weights": {
+        "ema_direction": 0.5,
+        "ml_signal": 0.4,
+        "adx_score": 0.1,
+    },
     "tsl_enabled": True,
     "tsl_activation_atr_mult": 1.5,
     "tsl_trailing_atr_mult": 2.0,
     "kelly_trade_history": 20,
     "default_risk_pct": 0.015,
     "max_risk_pct": 0.04,
-    "tf_atr_period": 14,  # 用于计算止损的15m ATR周期
+    "tf_atr_period": 14,
     "tf_stop_loss_atr_multiplier": 2.5,
 }
 
 
 # --- 函数定义 ---
-def fetch_binance_klines(s, i, st, en=None, l=1000):  # (无变化)
+def fetch_binance_klines(s, i, st, en=None, l=1000):
     url, cols = "https://api.binance.com/api/v3/klines", [
         "timestamp",
         "Open",
@@ -140,7 +148,10 @@ def fetch_binance_klines(s, i, st, en=None, l=1000):  # (无变化)
                     sts = ets
                     break
                 all_d.extend(d)
+
+                # ### <<< 核心修正：从列表中获取时间戳 >>> ###
                 sts = d[-1][0] + 1
+
                 break
             except requests.exceptions.RequestException as e:
                 last_e = e
@@ -160,9 +171,7 @@ def fetch_binance_klines(s, i, st, en=None, l=1000):  # (无变化)
     return df.set_index("timestamp").sort_index()
 
 
-def add_features_for_lgbm_model(
-    df: pd.DataFrame,
-) -> pd.DataFrame:  # 从旧代码中提炼的特征函数
+def add_features_for_lgbm_model(df: pd.DataFrame) -> pd.DataFrame:  # (无变化)
     high, low, close, volume = df["High"], df["Low"], df["Close"], df["Volume"]
     df["volatility"] = (
         np.log(df["Close"] / df["Close"].shift(1)).rolling(window=20).std()
@@ -208,14 +217,14 @@ def add_features_for_lgbm_model(
     return df
 
 
-def create_flattened_sequences(data, look_back=60):
+def create_flattened_sequences(data, look_back=60):  # (无变化)
     X = []
     for i in range(len(data) - look_back + 1):
         X.append(data[i : (i + look_back), :].flatten())
     return np.array(X, dtype=np.float32) if X else np.array([])
 
 
-def generate_lgbm_signals(symbol: str, interval: str) -> pd.Series:
+def generate_lgbm_signals(symbol: str, interval: str) -> pd.Series:  # (无变化)
     logger.info(f"--- 正在为 [{symbol}] 生成 [{interval}] 级别的LGBM信号 ---")
     if lgb is None:
         logger.warning("lightgbm库未安装，无法生成LGBM信号。")
@@ -267,54 +276,49 @@ def generate_lgbm_signals(symbol: str, interval: str) -> pd.Series:
         return pd.Series(dtype="float64")
 
 
-def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataFrame:
+def preprocess_data_for_strategy(
+    data_in: pd.DataFrame, symbol: str
+) -> pd.DataFrame:  # (无变化)
     df_15m = data_in.copy()
     logger.info(f"[{symbol}] 开始 4h 周期策略的数据预处理...")
     p = STRATEGY_PARAMS
-
     start_date = (
         df_15m.index.min() - timedelta(days=CONFIG["data_lookback_days"] + 50)
     ).strftime("%Y-%m-%d")
     end_date = (df_15m.index.max() + timedelta(days=1)).strftime("%Y-%m-%d")
     df_4h = fetch_binance_klines(symbol, "4h", start_date, end_date)
-
     if df_4h.empty:
         logger.error(f"无法获取 {symbol} 的 4h 数据，策略无法运行。")
-        for col in ["trend_direction", "trend_confirmed", "entry_signal"]:
+        for col in ["trend_direction", "adx_score", "entry_signal"]:
             df_15m[col] = 0
         return df_15m
-
     logger.info(f"[{symbol}] 在 4h 数据上计算 EMA, ADX, 和 LGBM 信号...")
     ema_4h = ta.trend.EMAIndicator(
         df_4h["Close"], window=p["tactical_ema_period"]
     ).ema_indicator()
     df_4h["trend_direction"] = np.where(df_4h["Close"] > ema_4h, 1, -1)
-
     adx_indicator = ta.trend.ADXIndicator(
         df_4h["High"], df_4h["Low"], df_4h["Close"], window=p["tactical_adx_period"]
     )
-    df_4h["trend_confirmed"] = adx_indicator.adx() > p["tactical_adx_threshold"]
-
+    adx_values = adx_indicator.adx()
+    df_4h["adx_score"] = (adx_values / 60).clip(0, 1)
     lgbm_signal_4h = generate_lgbm_signals(symbol, "4h")
     df_4h["entry_signal"] = lgbm_signal_4h.reindex(df_4h.index).fillna(0)
-
     logger.info(f"[{symbol}] 将 4h 信号广播到 15m 数据...")
-    for signal_col in ["trend_direction", "trend_confirmed", "entry_signal"]:
+    for signal_col in ["trend_direction", "adx_score", "entry_signal"]:
         df_15m[signal_col] = (
             df_4h[signal_col].reindex(df_15m.index, method="ffill").fillna(0)
         )
-
     df_15m["atr_15m"] = ta.volatility.AverageTrueRange(
         df_15m["High"], df_15m["Low"], df_15m["Close"], p["tf_atr_period"]
     ).average_true_range()
-
     df_15m.dropna(inplace=True)
     logger.info(f"[{symbol}] 数据预处理完成。")
     return df_15m
 
 
 # --- 策略类定义 ---
-class UltimateStrategy(Strategy):
+class UltimateStrategy(Strategy):  # (无变化)
     symbol, vol_weight = (None, 1.0)
 
     def init(self):
@@ -323,21 +327,30 @@ class UltimateStrategy(Strategy):
         self.recent_trade_returns = deque(maxlen=self.kelly_trade_history)
         self.reset_trade_state()
         self.trend_direction = self.I(lambda: self.data.trend_direction)
-        self.trend_confirmed = self.I(lambda: self.data.trend_confirmed)
+        self.adx_score = self.I(lambda: self.data.adx_score)
         self.entry_signal = self.I(lambda: self.data.entry_signal)
+        self.final_score = self.I(self._calculate_score)
         self.atr = self.I(lambda: self.data.atr_15m)
+
+    def _calculate_score(self):
+        w = self.score_weights
+        direction_scores = w["ema_direction"] * self.trend_direction
+        ml_scores = w["ml_signal"] * self.entry_signal
+        adx_scores = w["adx_score"] * self.adx_score
+        return direction_scores + ml_scores + adx_scores
 
     def next(self):
         if self.position:
             self.manage_open_position(self.data.Close[-1])
             return
 
-        # 核心决策逻辑：三者必须同时满足
-        if self.trend_confirmed[-1]:
-            if self.trend_direction[-1] == 1 and self.entry_signal[-1] == 1:
-                self.open_position(self.data.Close[-1], is_long=True)
-            elif self.trend_direction[-1] == -1 and self.entry_signal[-1] == -1:
-                self.open_position(self.data.Close[-1], is_long=False)
+        long_signal = crossover(self.final_score, self.long_entry_threshold)
+        short_signal = crossover(self.short_entry_threshold, self.final_score)
+
+        if long_signal:
+            self.open_position(self.data.Close[-1], is_long=True)
+        elif short_signal:
+            self.open_position(self.data.Close[-1], is_long=False)
 
     def reset_trade_state(self):
         self.stop_loss_price = 0.0
@@ -368,8 +381,7 @@ class UltimateStrategy(Strategy):
                 and current_price <= entry_price - activation_dist
             ):
                 self.trailing_stop_active = True
-                is_active = True
-        if is_active:
+        if self.trailing_stop_active:
             trail_dist = self.atr[-1] * self.tsl_trailing_atr_mult
             if self.position.is_long:
                 self.stop_loss_price = max(
@@ -424,7 +436,14 @@ class UltimateStrategy(Strategy):
 
 # --- 主程序入口 ---
 if __name__ == "__main__":
-    logger.info(f"🚀 (V45.0-Focused-4H-System) 开始运行...")
+    logger.info(f"🚀 (V49.2-Fetch-Fix & Crossover) 开始运行...")
+
+    import sys
+
+    if len(sys.argv) == 3:
+        CONFIG["backtest_start_date"] = sys.argv[1]
+        CONFIG["backtest_end_date"] = sys.argv[2]
+
     backtest_start_dt = pd.to_datetime(CONFIG["backtest_start_date"])
     data_fetch_start_date = (
         backtest_start_dt - timedelta(days=CONFIG["data_lookback_days"])
@@ -451,7 +470,7 @@ if __name__ == "__main__":
         logger.info(f"为 {symbol} 预处理完整时段数据...")
         full_processed_data = preprocess_data_for_strategy(data, symbol)
         backtest_period_slice = full_processed_data.loc[
-            CONFIG["backtest_start_date"] :
+            CONFIG["backtest_start_date"] : CONFIG["backtest_end_date"]
         ].copy()
         if not backtest_period_slice.empty:
             processed_backtest_data[symbol] = backtest_period_slice
