@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 SYMBOL = "ETHUSDT"
-INTERVAL = "5m"
+INTERVAL = "15m"
 DATA_START_DATE = "2021-01-01"
 TRAIN_START_DATE = "2022-01-01"
 TRAIN_END_DATE = "2025-09-30"

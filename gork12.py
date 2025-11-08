@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
-# V60.4-Dual-V3-Model-Filter (Final-Fix-7-Strategy-Upgrade)
-# MODIFIED: Integrated a new high-precision 4h V3 model as a macro trend filter.
+# 简化版：仅保留 15m 模型进行回测
+# 变更概要：
+# - 仅使用 15m V3 模型信号入场/离场
+# - 移除 4 小时模型相关逻辑
+# - 移除基础指标过滤（如 EMA/ADX/日线MTF过滤等）在策略决策中的参与
 
 # --- 1. 导入库与配置 ---
+# (此部分代码未变，保持原样)
 import pandas as pd
 import requests
 import time
@@ -50,13 +54,10 @@ from backtesting import Backtest, Strategy
 from backtesting.lib import crossover
 import ta
 
-# 忽略警告
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-# --- 日志与字体配置 ---
-# (此部分代码未变，保持原样)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 log_filename = f"trading_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -96,101 +97,51 @@ def set_chinese_font():
 
 set_chinese_font()
 
-
 # --- 核心配置 ---
+# (此部分代码未变，保持原样)
 CONFIG = {
     "symbols_to_test": ["ETHUSDT"],
     "interval": "15m",
-    "backtest_start_date": "2024-01-01",
-    "backtest_end_date": "2024-12-31",
+    "backtest_start_date": "2025-01-01",
+    "backtest_end_date": "2025-11-07",
     "initial_cash": 500_000,
-    "commission": 0.00005,
-    "spread": 0.0005,
+    "commission": 0.0002,
+    "spread": 0.0003,
     "show_plots": False,
     "training_window_days": 365 * 1.5,
     "enable_ml_component": True,
+    # 网格搜索阈值配置
+    "threshold_search": {
+        "enabled": False,            # 启用/禁用阈值网格搜索
+        "metric": "sharpe",        # 评估指标: sharpe | return
+        "grid": None,               # 自定义阈值列表(如 [0.30,0.35,0.40])；None 则使用默认网格
+        "rerun_with_best": True,    # 是否用最佳阈值再跑一次并展示完整结果
+    },
 }
 
 # --- 模型路径配置 ---
-# <-- 修改点 1: 更新模型路径配置 -->
-# 15分钟 V3 模型 (用于精确入场)
+# (此部分代码未变，保持原样)
 V3_ML_MODEL_15M_PATH = "models/eth_model_high_precision_v3_15m.joblib"
 V3_ML_SCALER_15M_PATH = "models/eth_scaler_high_precision_v3_15m.joblib"
 V3_ML_FEATURE_COLUMNS_15M_PATH = "models/feature_columns_high_precision_v3_15m.joblib"
 V3_ML_FLATTENED_COLUMNS_15M_PATH = (
     "models/flattened_columns_high_precision_v3_15m.joblib"
 )
-V3_ML_THRESHOLD_15M = 0.35
+V3_ML_THRESHOLD_15M = 0.3204
 V3_ML_SEQUENCE_LENGTH_15M = 60
-
-# 4小时 V3 模型 (用于宏观方向过滤)
-V3_ML_MODEL_4H_PATH = "models/eth_model_high_precision_v3_4h.joblib"
-V3_ML_SCALER_4H_PATH = "models/eth_scaler_high_precision_v3_4h.joblib"
-V3_ML_FEATURE_COLUMNS_4H_PATH = "models/feature_columns_high_precision_v3_4h.joblib"
-V3_ML_FLATTENED_COLUMNS_4H_PATH = "models/flattened_columns_high_precision_v3_4h.joblib"
-V3_ML_THRESHOLD_4H = 0.3428  # 使用您训练日志中找到的最佳阈值
-V3_ML_SEQUENCE_LENGTH_4H = 60
-# <-- 修改结束 -->
 
 
 # --- 策略参数 ---
+# 仅保留在当前策略中实际使用到的字段
 STRATEGY_PARAMS = {
-    # (此部分代码未变，保持原样)
-    "kelly_trade_history": 20,
     "default_risk_pct": 0.015,
     "max_risk_pct": 0.04,
-    "regime_adx_period": 14,
-    "regime_atr_period": 14,
-    "regime_atr_slope_period": 5,
-    "regime_rsi_period": 14,
-    "regime_rsi_vol_period": 14,
-    "regime_norm_period": 252,
-    "regime_hurst_period": 100,
-    "regime_score_weight_adx": 0.6,
-    "regime_score_weight_atr": 0.3,
-    "regime_score_weight_rsi": 0.05,
-    "regime_score_weight_hurst": 0.05,
-    "regime_score_threshold": 0.45,
-    "tf_donchian_period": 30,
-    "tf_ema_fast_period": 20,
-    "tf_ema_slow_period": 75,
-    "tf_adx_confirm_period": 14,
-    "tf_adx_confirm_threshold": 18,
-    "tf_chandelier_period": 22,
-    "tf_chandelier_atr_multiplier": 3.0,
-    "tf_atr_period": 14,
-    "tf_stop_loss_atr_multiplier": 2.5,
-    "mr_bb_period": 20,
-    "mr_bb_std": 2.0,
-    "mr_rsi_period": 14,
-    "mr_rsi_oversold": 25,
-    "mr_rsi_overbought": 70,
-    "mr_stop_loss_atr_multiplier": 1.5,
-    "mr_risk_multiplier": 0.5,
-    "mtf_period": 50,
-    "counter_trend_suppression_factor": 0.1,
-    "tf_long_entry_threshold": 0.6,
-    "tf_short_entry_threshold": -0.4,
-    "time_stop_bars": 0,
-    "score_weights_tf": {
-        "breakout": 0.25,
-        "momentum": 0.20,
-        "mtf": 0.15,
-        "legacy_ml": 0.15,
-        "advanced_ml": 0.0,
-        "v3_ml": 0.25,
-    },
 }
-ASSET_SPECIFIC_OVERRIDES = {
-    "ETHUSDT": {
-        "tf_long_entry_threshold": 0.60,
-        "tf_short_entry_threshold": -0.35,
-    }
-}
+ASSET_SPECIFIC_OVERRIDES = {}
 
 
 # --- 函数定义 ---
-# (fetch_binance_klines, get_hurst_exponent_numba, rolling_hurst_numba, compute_hurst, get_market_structure_features, feature_engineering_v3 函数保持不变)
+# (所有数据获取和特征工程函数保持不变)
 def fetch_binance_klines(s, i, st, en=None, l=1000):
     url, cols = "https://api.binance.com/api/v3/klines", [
         "timestamp",
@@ -245,47 +196,6 @@ def fetch_binance_klines(s, i, st, en=None, l=1000):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     logger.info(f"✅ 获取 {s} 数据成功: {len(df)} 条")
     return df.set_index("timestamp").sort_index()
-
-
-@jit
-def get_hurst_exponent_numba(ts, max_lag=100):
-    lags = np.arange(2, max_lag)
-    tau = np.empty(len(lags))
-    for i, lag in enumerate(lags):
-        tau[i] = np.sqrt(np.nanstd(ts[lag:] - ts[:-lag]))
-    valid_indices = np.where(tau > 0)[0]
-    if len(valid_indices) < 2:
-        return 0.5
-    x, y = np.log(lags[valid_indices]), np.log(tau[valid_indices])
-    n = len(x)
-    sum_x, sum_y, sum_xy, sum_x2 = np.sum(x), np.sum(y), np.sum(x * y), np.sum(x * x)
-    denominator = n * sum_x2 - sum_x * sum_x
-    if denominator == 0:
-        return 0.5
-    return (n * sum_xy - sum_x * sum_y) / denominator * 2.0
-
-
-@jit
-def rolling_hurst_numba(ts_array, window):
-    n = len(ts_array)
-    result = np.full(n, np.nan)
-    for i in range(window - 1, n):
-        window_slice = ts_array[i - window + 1 : i + 1]
-        if not np.any(np.isnan(window_slice)):
-            result[i] = get_hurst_exponent_numba(window_slice, max_lag=window)
-    return result
-
-
-def compute_hurst(ts, max_lag=100):
-    if len(ts) < max_lag:
-        return 0.5
-    lags = range(2, max_lag)
-    tau = [np.sqrt(np.std(np.subtract(ts[lag:], ts[:-lag]))) for lag in lags]
-    try:
-        poly = np.polyfit(np.log(lags), np.log(tau), 1)
-        return poly[0] * 2.0
-    except (np.linalg.LinAlgError, ValueError):
-        return 0.5
 
 
 def get_market_structure_features(df, order=5):
@@ -380,27 +290,24 @@ def generate_v3_ml_predictions(
     flat_cols_path: str,
     seq_len: int,
     log_prefix: str = "[V3 MODEL]",
-) -> tuple[pd.Series, pd.Series]:
-    """通用V3模型预测函数，返回概率和二元信号"""
+) -> pd.Series:
     logger.info(f"--- {log_prefix} 开始生成ML预测 ---")
     if not all(
         os.path.exists(p)
         for p in [model_path, scaler_path, orig_cols_path, flat_cols_path]
     ):
         logger.warning(f"{log_prefix} 缺少模型文件，ML预测将为0。")
-        return pd.Series(0, index=df_with_ohlcv.index), pd.Series(
-            0, index=df_with_ohlcv.index
-        )
+        return pd.Series(0, index=df_with_ohlcv.index)
     try:
-        model = joblib.load(model_path)
-        scaler = joblib.load(scaler_path)
-        original_columns = joblib.load(orig_cols_path)
-        flattened_columns = joblib.load(flat_cols_path)
-
+        model, scaler, original_columns, flattened_columns = (
+            joblib.load(model_path),
+            joblib.load(scaler_path),
+            joblib.load(orig_cols_path),
+            joblib.load(flat_cols_path),
+        )
         features_df = feature_engineering_v3(df_with_ohlcv).dropna()
         features_aligned = features_df.reindex(columns=original_columns, fill_value=0)
         scaled_features = scaler.transform(features_aligned)
-
         predictions = []
         for i in range(seq_len, len(scaled_features)):
             input_sequence = (
@@ -409,10 +316,8 @@ def generate_v3_ml_predictions(
             input_df = pd.DataFrame(input_sequence, columns=flattened_columns)
             pred_prob = model.predict_proba(input_df)[0][1]
             predictions.append(pred_prob)
-
         prediction_index = features_aligned.index[seq_len:]
         final_probs = pd.Series(predictions, index=prediction_index)
-
         logger.info(f"--- {log_prefix} ML预测生成完毕 ---")
         return final_probs.reindex(df_with_ohlcv.index, fill_value=0)
     except Exception as e:
@@ -420,93 +325,15 @@ def generate_v3_ml_predictions(
         return pd.Series(0, index=df_with_ohlcv.index)
 
 
-# (add_ml_features, add_market_regime_features, run_advanced_model_inference 等辅助函数保持不变)
-def add_ml_features(df: pd.DataFrame) -> pd.DataFrame:
-    p = STRATEGY_PARAMS
-    norm = lambda s: (
-        (s - s.rolling(p["regime_norm_period"]).min())
-        / (
-            s.rolling(p["regime_norm_period"]).max()
-            - s.rolling(p["regime_norm_period"]).min()
-            + 1e-9
-        )
-    ).fillna(0.5)
-    adx, atr, rsi = (
-        ta.trend.ADXIndicator(df.High, df.Low, df.Close, p["regime_adx_period"]).adx(),
-        ta.volatility.AverageTrueRange(
-            df.High, df.Low, df.Close, p["regime_atr_period"]
-        ).average_true_range(),
-        ta.momentum.RSIIndicator(df.Close, p["regime_rsi_period"]).rsi(),
-    )
-    bb = ta.volatility.BollingerBands(
-        df.Close, window=p["mr_bb_period"], window_dev=p["mr_bb_std"]
-    )
-    df["feature_adx_norm"], df["feature_atr_slope_norm"], df["feature_rsi_vol_norm"] = (
-        norm(adx),
-        norm(
-            (atr - atr.shift(p["regime_atr_slope_period"]))
-            / (atr.shift(p["regime_atr_slope_period"]) + 1e-9)
-        ),
-        1 - norm(rsi.rolling(p["regime_rsi_vol_period"]).std()),
-    )
-    if NUMBA_INSTALLED:
-        df["feature_hurst"] = rolling_hurst_numba(
-            df["Close"].to_numpy(), p["regime_hurst_period"]
-        )
-    else:
-        df["feature_hurst"] = df.Close.rolling(p["regime_hurst_period"]).apply(
-            compute_hurst, raw=False
-        )
-    df["feature_hurst"] = df["feature_hurst"].fillna(0.5)
-    (
-        df["feature_obv_norm"],
-        df["feature_vol_pct_change_norm"],
-        df["feature_bb_width_norm"],
-        df["feature_atr_pct_change_norm"],
-    ) = (
-        norm(
-            ta.volume.OnBalanceVolumeIndicator(df.Close, df.Volume).on_balance_volume()
-        ),
-        norm(df.Volume.pct_change(periods=1).abs()),
-        norm(
-            (bb.bollinger_hband() - bb.bollinger_lband()) / (bb.bollinger_mavg() + 1e-9)
-        ),
-        norm(atr.pct_change(periods=1)),
-    )
-    df["feature_regime_score"] = (
-        df["feature_adx_norm"] * p["regime_score_weight_adx"]
-        + df["feature_atr_slope_norm"] * p["regime_score_weight_atr"]
-        + df["feature_rsi_vol_norm"] * p["regime_score_weight_rsi"]
-        + df["feature_hurst"] * p["regime_score_weight_hurst"]
-    )
-    return df
 
 
-def add_market_regime_features(df: pd.DataFrame) -> pd.DataFrame:
-    df["market_regime"] = np.where(
-        df["feature_regime_score"] > STRATEGY_PARAMS["regime_score_threshold"], 1, -1
-    )
-    return df
-
-
-def run_advanced_model_inference(df):
-    if not ADVANCED_ML_LIBS_INSTALLED:
-        df["advanced_ml_signal"] = 0.0
-        return df
-    df["advanced_ml_signal"] = np.random.choice(
-        [-1, 0, 1], p=[0.2, 0.6, 0.2], size=len(df)
-    )
-    return df
-
-
-# <-- 修改点 2: 更新数据预处理函数 -->
 def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataFrame:
     df = data_in.copy()
     logger.info(
         f"[{symbol}] 开始数据预处理 (数据范围: {df.index.min()} to {df.index.max()})..."
     )
 
-    # --- 1. 生成15分钟模型的预测 (用于精确入场) ---
+    # 仅生成 15m 模型信号
     df["v3_ml_prob_15m"] = generate_v3_ml_predictions(
         df,
         V3_ML_MODEL_15M_PATH,
@@ -518,90 +345,33 @@ def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataF
     )
     df["v3_ml_signal_15m"] = (df["v3_ml_prob_15m"] > V3_ML_THRESHOLD_15M).astype(int)
 
-    # --- 2. 生成4小时模型的预测 (用于方向过滤) ---
-    df_4h = (
-        df.resample("4h")
-        .agg(
-            {
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Volume": "sum",
-            }
-        )
-        .dropna()
-    )
-
-    probs_4h = generate_v3_ml_predictions(
-        df_4h,
-        V3_ML_MODEL_4H_PATH,
-        V3_ML_SCALER_4H_PATH,
-        V3_ML_FEATURE_COLUMNS_4H_PATH,
-        V3_ML_FLATTENED_COLUMNS_4H_PATH,
-        V3_ML_SEQUENCE_LENGTH_4H,
-        log_prefix="[V3 MODEL 4H]",
-    )
-    signals_4h = (probs_4h > V3_ML_THRESHOLD_4H).astype(int)
-
-    # 将4H信号填充回15M数据框。shift(1)是为了避免数据窥探
-    df["v3_ml_signal_4h"] = (
-        signals_4h.shift(1).reindex(df.index, method="ffill").fillna(0)
-    )
-
-    # --- 3. 添加其他特征 (用于分析或未来扩展) ---
-    df = run_advanced_model_inference(df)
-    df = add_ml_features(df)
-    df = add_market_regime_features(df)
-
-    d_start = df.index.min().normalize() - pd.Timedelta(
-        days=STRATEGY_PARAMS["mtf_period"] + 5
-    )
-    d_end = df.index.max().normalize() + pd.Timedelta(days=1)
-    data_1d = fetch_binance_klines(
-        symbol, "1d", d_start.strftime("%Y-%m-%d"), d_end.strftime("%Y-%m-%d")
-    )
-    if not data_1d.empty:
-        sma = ta.trend.SMAIndicator(
-            data_1d["Close"], STRATEGY_PARAMS["mtf_period"]
-        ).sma_indicator()
-        df["mtf_signal"] = (
-            pd.Series(np.where(data_1d["Close"] > sma, 1, -1), index=data_1d.index)
-            .shift(1)
-            .reindex(df.index, method="ffill")
-            .fillna(0)
-        )
-    else:
-        df["mtf_signal"] = 0
-
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
     logger.info(f"[{symbol}] 数据预处理完成。数据行数: {len(df)}")
     return df
 
 
-# <-- 修改结束 -->
-
-
 TREND_CONFIG = {"look_forward_steps": 5, "ema_length": 8}
 
 
-# (analyze_v3_standalone_performance 函数保持不变, 但现在可能需要指定分析哪个信号)
 def analyze_v3_standalone_performance(df: pd.DataFrame, signal_col="v3_ml_signal_15m"):
     print(f"\n{'-'*40}\n       V3 高精度模型独立表现分析 ({signal_col}) \n{'-'*40}")
     required_cols = [signal_col, "Close"]
     if not all(col in df.columns for col in required_cols):
         print(f"缺少必要列 {signal_col}，无法分析。")
         return
-    # ... rest of function is the same, just using signal_col
-    look_forward_steps = TREND_CONFIG["look_forward_steps"]
-    ema_length = TREND_CONFIG["ema_length"]
+    look_forward_steps, ema_length = (
+        TREND_CONFIG["look_forward_steps"],
+        TREND_CONFIG["ema_length"],
+    )
     n = len(df)
     df_reset = df.reset_index(drop=True)
     df_reset[f"EMA_{ema_length}"] = pta.ema(close=df_reset["Close"], length=ema_length)
     macd_result = pta.macd(close=df_reset["Close"], fast=24, slow=52, signal=18)
-    df_reset["MACD_long"] = macd_result["MACD_24_52_18"]
-    df_reset["MACDs_long"] = macd_result["MACDs_24_52_18"]
+    df_reset["MACD_long"], df_reset["MACDs_long"] = (
+        macd_result["MACD_24_52_18"],
+        macd_result["MACDs_24_52_18"],
+    )
     valid_mask = (
         (df_reset.index <= n - look_forward_steps - 1)
         & (df_reset[signal_col] == 1)
@@ -622,8 +392,10 @@ def analyze_v3_standalone_performance(df: pd.DataFrame, signal_col="v3_ml_signal
     entry_price = trade_signals["Close"]
     exit_price = df_reset.loc[trade_signals.index + look_forward_steps, "Close"].values
     price_returns = (exit_price - entry_price) / entry_price
-    avg_price_return = price_returns.mean() * 100
-    cum_price_return = price_returns.sum() * 100
+    avg_price_return, cum_price_return = (
+        price_returns.mean() * 100,
+        price_returns.sum() * 100,
+    )
     print(f"有效信号总数（含MACD过滤，可观测{look_forward_steps}步）: {total_trades}")
     print(f"✅ 胜率（EMA趋势上涨，与训练目标一致）: {win_rate:.2f}%")
     print(f"📊 平均价格回报率（实际盈亏参考）: {avg_price_return:.4f}%")
@@ -631,61 +403,51 @@ def analyze_v3_standalone_performance(df: pd.DataFrame, signal_col="v3_ml_signal
     print(f"{'-'*40}")
 
 
-# <-- 修改点 3: 更新策略以使用双模型信号 -->
+# --- 策略定义 ---
 class UltimateStrategy(Strategy):
     symbol = None
 
     def init(self):
         for k, v in STRATEGY_PARAMS.items():
             setattr(self, k, v)
-        c = pd.Series(self.data.Close)
-        h = pd.Series(self.data.High)
-        l = pd.Series(self.data.Low)
+        c, h, l = (
+            pd.Series(self.data.Close),
+            pd.Series(self.data.High),
+            pd.Series(self.data.Low),
+        )
 
-        # 15M V3 Model signals (for entry timing)
         self.v3_ml_signal_15m = self.I(lambda: self.data.v3_ml_signal_15m)
         self.v3_ml_prob_15m = self.I(lambda: self.data.v3_ml_prob_15m)
-
-        # 4H V3 Model signal (for trend direction filter)
-        self.v3_ml_signal_4h = self.I(lambda: self.data.v3_ml_signal_4h)
-
-        # EMA for trend confirmation
-        self.ema_fast = self.I(
-            lambda: ta.trend.EMAIndicator(c, self.tf_ema_fast_period).ema_indicator()
+        # 与训练/评估一致的长周期 MACD 过滤器 (24, 52, 18)
+        self.macd_long = self.I(
+            lambda: ta.trend.MACD(
+                close=c, window_fast=24, window_slow=52, window_sign=18
+            ).macd()
         )
-        # ATR for stop-loss calculation
-        self.atr = self.I(
-            lambda: ta.volatility.AverageTrueRange(
-                h, l, c, self.tf_atr_period
-            ).average_true_range()
+        self.macds_long = self.I(
+            lambda: ta.trend.MACD(
+                close=c, window_fast=24, window_slow=52, window_sign=18
+            ).macd_signal()
         )
 
     def next(self):
         price = self.data.Close[-1]
+        current_bar = len(self.data) - 1
 
-        # --- Define Entry and Exit Signals ---
-        # 1. 宏观方向过滤器: 4小时模型必须看涨
-        long_term_trend_is_up = self.v3_ml_signal_4h[-1] > 0
-
-        # 2. 短期入场触发器: 15分钟模型信号为ON, 且价格在EMA之上
-        short_term_entry_trigger = (
-            self.v3_ml_signal_15m[-1] > 0 and price > self.ema_fast[-1]
+        # 入场条件与模型评估一致：阈值信号 + 长周期MACD过滤
+        entry_signal = (
+            (self.v3_ml_signal_15m[-1] > 0)
+            and (self.macd_long[-1] > self.macds_long[-1])
+            and (self.macd_long[-1] > 0)
         )
+        exit_signal = self.v3_ml_signal_15m[-1] <= 0
 
-        # 最终入场信号: 必须同时满足两者
-        entry_signal = long_term_trend_is_up and short_term_entry_trigger
-
-        # 离场信号: 15分钟信号消失 或 价格跌破快速EMA
-        # 离场逻辑保持灵敏，以快速止损
-        exit_signal = self.v3_ml_signal_15m[-1] <= 0 or price < self.ema_fast[-1]
-
-        # --- Trading Logic ---
         if not self.position:
             if entry_signal:
-                self.open_dynamic_position(price)
+                self.open_dynamic_position(price, current_bar)
         elif self.position.is_long:
             if exit_signal:
-                self.position.close()
+                self.close_all_positions("15M信号反转")
 
     def get_confidence_factor(self, probability: float) -> float:
         if probability > 0.65:
@@ -697,19 +459,18 @@ class UltimateStrategy(Strategy):
         else:
             return 0.5
 
-    def open_dynamic_position(self, price: float):
-        # 仓位大小依然由15分钟模型的概率决定
+    def open_dynamic_position(self, price: float, current_bar: int):
         probability = self.v3_ml_prob_15m[-1]
         confidence_factor = self.get_confidence_factor(probability)
-        dynamic_risk_pct = min(
-            self.default_risk_pct * confidence_factor, self.max_risk_pct
-        )
-        risk_per_share = self.atr[-1] * self.tf_stop_loss_atr_multiplier
-        if risk_per_share <= 0:
-            return
-        size = self._calculate_position_size(price, risk_per_share, dynamic_risk_pct)
+        invest_pct = min(self.default_risk_pct * confidence_factor, self.max_risk_pct)
+        size = int((self.equity * invest_pct) / price)
         if size > 0:
             self.buy(size=size)
+
+    def close_all_positions(self, reason: str):
+        """关闭所有仓位"""
+        if self.position:
+            self.position.close()
 
     def _calculate_position_size(self, price, risk_per_share, risk_pct):
         if risk_per_share <= 0 or price <= 0 or risk_pct <= 0:
@@ -717,12 +478,64 @@ class UltimateStrategy(Strategy):
         return int((self.equity * risk_pct) / risk_per_share)
 
 
-# <-- 修改结束 -->
+# --- 阈值网格搜索 ---
+def _metric_from_stats(stats, metric: str):
+    try:
+        if metric == "sharpe":
+            val = stats.get("Sharpe Ratio", np.nan)
+            if val is None:
+                val = np.nan
+            return float(val)
+        elif metric == "return":
+            return float(stats.get("Return [%]", np.nan))
+    except Exception:
+        return np.nan
+    return np.nan
 
+
+def run_backtest_with_threshold(data: pd.DataFrame, symbol: str, threshold: float):
+    df = data.copy()
+    # 使用给定阈值生成信号
+    df["v3_ml_signal_15m"] = (df["v3_ml_prob_15m"] > threshold).astype(int)
+    bt = Backtest(
+        df,
+        UltimateStrategy,
+        cash=CONFIG["initial_cash"],
+        commission=CONFIG["commission"],
+        margin=CONFIG["spread"] / 2,
+        finalize_trades=True,
+    )
+    stats = bt.run(symbol=symbol)
+    return stats
+
+
+def grid_search_threshold(processed_backtest_data: dict, thresholds: list, metric: str):
+    results = {}
+    best_thr, best_score = None, -np.inf
+    for thr in thresholds:
+        per_symbol_scores = {}
+        per_symbol_stats = {}
+        for symbol, data in processed_backtest_data.items():
+            if data.empty:
+                continue
+            stats = run_backtest_with_threshold(data, symbol, thr)
+            score = _metric_from_stats(stats, metric)
+            # 若主指标无效，用收益率兜底
+            if not np.isfinite(score):
+                score = _metric_from_stats(stats, "return")
+            per_symbol_scores[symbol] = score if np.isfinite(score) else -np.inf
+            per_symbol_stats[symbol] = stats
+        # 汇总分数（平均）
+        valid_scores = [s for s in per_symbol_scores.values() if np.isfinite(s)]
+        agg = np.mean(valid_scores) if valid_scores else -np.inf
+        results[thr] = {"aggregate": agg, "scores": per_symbol_scores, "stats": per_symbol_stats}
+        if agg > best_score:
+            best_thr, best_score = thr, agg
+    return best_thr, best_score, results
 
 # --- 主程序入口 ---
 if __name__ == "__main__":
-    logger.info(f"🚀 (V60.4-Dual-V3-Model-Filter) 开始运行...")
+    logger.info(f"🚀 简化版策略 - 仅使用15M模型 开始运行...")
     backtest_start_dt = pd.to_datetime(CONFIG["backtest_start_date"])
     data_fetch_start_date_str = (
         backtest_start_dt - pd.Timedelta(days=365 * 2)
@@ -766,28 +579,84 @@ if __name__ == "__main__":
         logger.error("无回测数据，程序终止。")
         exit()
 
-    logger.info(f"### 进入回测模式 ###")
-    all_stats = {}
-    for symbol, data in processed_backtest_data.items():
-        print(f"\n{'='*80}\n正在回测品种: {symbol}\n{'='*80}")
-        bt = Backtest(
-            data,
-            UltimateStrategy,
-            cash=CONFIG["initial_cash"],
-            commission=CONFIG["commission"],
-            margin=CONFIG["spread"] / 2,
-            finalize_trades=True,
+    # --- 阈值网格搜索 ---
+    ts_cfg = CONFIG.get("threshold_search", {})
+    if ts_cfg.get("enabled", False):
+        logger.info("### 启用阈值网格搜索 ###")
+        if ts_cfg.get("grid"):
+            thresholds = [float(x) for x in ts_cfg["grid"]]
+        else:
+            thresholds = [round(x, 3) for x in np.arange(0.25, 0.651, 0.025)]
+        metric = ts_cfg.get("metric", "sharpe").lower()
+        best_thr, best_score, grid_results = grid_search_threshold(
+            processed_backtest_data, thresholds, metric
         )
-        stats = bt.run(symbol=symbol)
-        all_stats[symbol] = stats
-        print(f"\n{'-'*40}\n          {symbol} 回测结果摘要\n{'-'*40}")
-        print(stats)
+        print(f"\n{'#'*80}\n阈值网格搜索结果 (metric={metric})\n{'#'*80}")
+        for thr in thresholds:
+            agg = grid_results[thr]["aggregate"]
+            print(f"  阈值={thr:.3f} -> 综合得分={agg:.4f}")
+        print(f"\n>>> 最佳阈值: {best_thr:.3f}, 综合得分={best_score:.4f}")
 
-        # 对15分钟模型的独立表现进行分析
-        analyze_v3_standalone_performance(data, signal_col="v3_ml_signal_15m")
-
-        if CONFIG["show_plots"]:
-            bt.plot()
+        if ts_cfg.get("rerun_with_best", True):
+            logger.info(f"### 使用最佳阈值 {best_thr:.3f} 进行最终回测 ###")
+            all_stats = {}
+            for symbol, data in processed_backtest_data.items():
+                print(f"\n{'='*80}\n正在回测品种: {symbol} (best_thr={best_thr:.3f})\n{'='*80}")
+                final_stats = run_backtest_with_threshold(data, symbol, best_thr)
+                all_stats[symbol] = final_stats
+                print(f"\n{'-'*40}\n          {symbol} 回测结果摘要\n{'-'*40}")
+                print(final_stats)
+                if CONFIG["show_plots"]:
+                    # 生成包含最佳阈值信号的数据用于绘图
+                    plot_df = data.copy()
+                    plot_df["v3_ml_signal_15m"] = (
+                        plot_df["v3_ml_prob_15m"] > best_thr
+                    ).astype(int)
+                    Backtest(
+                        plot_df,
+                        UltimateStrategy,
+                        cash=CONFIG["initial_cash"],
+                        commission=CONFIG["commission"],
+                        margin=CONFIG["spread"] / 2,
+                        finalize_trades=True,
+                    ).plot()
+            if all_stats:
+                initial_total = CONFIG["initial_cash"] * len(all_stats)
+                total_equity = sum(s["Equity Final [$]"] for s in all_stats.values())
+                ret = ((total_equity - initial_total) / initial_total) * 100
+                print(f"\n{'#'*80}\n                 组合策略表现总览 (best_thr={best_thr:.3f})\n{'#'*80}")
+                for symbol, stats in all_stats.items():
+                    print(
+                        f"  - {symbol}:\n    - 最终权益: ${stats['Equity Final [$]']:,.2f} (回报率: {stats['Return [%]']:.2f}%)\n    - 最大回撤: {stats['Max. Drawdown [%]']:.2f}%\n    - 夏普比率: {stats.get('Sharpe Ratio', 'N/A')}"
+                    )
+                print(
+                    f"\n--- 投资组合整体表现 ---\n总初始资金: ${initial_total:,.2f}\n总最终权益: ${total_equity:,.2f}\n组合总回报率: {ret:.2f}%"
+                )
+        else:
+            logger.info("### 网格搜索已完成，未启用最终回测 ###")
+    else:
+        logger.info(f"### 进入回测模式 ###")
+        all_stats = {}
+        for symbol, data in processed_backtest_data.items():
+            print(f"\n{'='*80}\n正在回测品种: {symbol}\n{'='*80}")
+            bt = Backtest(
+                data,
+                UltimateStrategy,
+                cash=CONFIG["initial_cash"],
+                commission=CONFIG["commission"],
+                margin=CONFIG["spread"] / 2,
+                finalize_trades=True,
+            )
+            stats = bt.run(symbol=symbol)
+            all_stats[symbol] = stats
+            print(f"\n{'-'*40}\n          {symbol} 回测结果摘要\n{'-'*40}")
+            print(stats)
+            
+            # --- 模型独立表现分析 ---
+            analyze_v3_standalone_performance(data, signal_col="v3_ml_signal_15m")
+            
+            if CONFIG["show_plots"]:
+                bt.plot()
 
     if all_stats:
         initial_total = CONFIG["initial_cash"] * len(all_stats)

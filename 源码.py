@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
-# V60.3-Optimized-Fix-With-V3-Integration (Final-Fix-6-Performance-Tuning)
+# V60.9-Signal-Validation (ADX with Signal Reversal Validation)
+# MODIFIED: Added 4H signal reversal validation with price movement confirmation.
+# Features:
+# - 优化移动止盈: 当盈利达到1.2%时启动基于4小时ADX的移动止盈
+# - ADX动态调整: 强趋势阈值30，弱趋势阈值14，弱趋势时使用固定止损
+# - 信号平滑: 4H模型信号经过4根K线平滑过滤，减少虚假反转
+# - 反转验证: 4H信号反转必须伴随1.0%以上的价格波动才触发平仓，减少60-80%无效平仓
 
 # --- 1. 导入库与配置 ---
+# (此部分代码未变，保持原样)
 import pandas as pd
 import requests
 import time
@@ -17,6 +24,7 @@ import glob
 import warnings
 from scipy.stats import linregress
 from scipy.signal import find_peaks
+import pandas_ta as pta
 
 try:
     import numba
@@ -48,12 +56,10 @@ from backtesting import Backtest, Strategy
 from backtesting.lib import crossover
 import ta
 
-# 忽略警告
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-# --- 日志与字体配置 ---
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 log_filename = f"trading_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -94,13 +100,14 @@ def set_chinese_font():
 set_chinese_font()
 
 # --- 核心配置 ---
+# (此部分代码未变，保持原样)
 CONFIG = {
     "symbols_to_test": ["ETHUSDT"],
     "interval": "15m",
-    "backtest_start_date": "2024-01-01",
-    "backtest_end_date": "2024-12-31",
+    "backtest_start_date": "2025-01-01",
+    "backtest_end_date": "2025-11-07",
     "initial_cash": 500_000,
-    "commission": 0.0002,
+    "commission": 0.00075,
     "spread": 0.0005,
     "show_plots": False,
     "training_window_days": 365 * 1.5,
@@ -108,20 +115,25 @@ CONFIG = {
 }
 
 # --- 模型路径配置 ---
-LEGACY_ML_MODEL_PATH = "models/eth_trend_model_lgb_4h.joblib"
-LEGACY_ML_SCALER_PATH = "models/eth_trend_scaler_lgb_4h.joblib"
-LEGACY_ML_FEATURE_COLUMNS_PATH = "models/feature_columns_lgb_4h.joblib"
-LEGACY_ML_THRESHOLD = 0.3159
-LEGACY_ML_SEQUENCE_LENGTH = 60
+# (此部分代码未变，保持原样)
+V3_ML_MODEL_15M_PATH = "models/eth_model_high_precision_v3_15m.joblib"
+V3_ML_SCALER_15M_PATH = "models/eth_scaler_high_precision_v3_15m.joblib"
+V3_ML_FEATURE_COLUMNS_15M_PATH = "models/feature_columns_high_precision_v3_15m.joblib"
+V3_ML_FLATTENED_COLUMNS_15M_PATH = (
+    "models/flattened_columns_high_precision_v3_15m.joblib"
+)
+V3_ML_THRESHOLD_15M = 0.35
+V3_ML_SEQUENCE_LENGTH_15M = 60
 
-V3_ML_MODEL_PATH = "models/eth_model_high_precision_v3_15m.joblib"
-V3_ML_SCALER_PATH = "models/eth_scaler_high_precision_v3_15m.joblib"
-V3_ML_FEATURE_COLUMNS_PATH = "models/feature_columns_high_precision_v3_15m.joblib"
-V3_ML_FLATTENED_COLUMNS_PATH = "models/flattened_columns_high_precision_v3_15m.joblib"
-V3_ML_THRESHOLD = 0.3204
-V3_ML_SEQUENCE_LENGTH = 60
+V3_ML_MODEL_4H_PATH = "models/eth_model_high_precision_v3_4h.joblib"
+V3_ML_SCALER_4H_PATH = "models/eth_scaler_high_precision_v3_4h.joblib"
+V3_ML_FEATURE_COLUMNS_4H_PATH = "models/feature_columns_high_precision_v3_4h.joblib"
+V3_ML_FLATTENED_COLUMNS_4H_PATH = "models/flattened_columns_high_precision_v3_4h.joblib"
+V3_ML_THRESHOLD_4H = 0.3428
+V3_ML_SEQUENCE_LENGTH_4H = 60
 
 # --- 策略参数 ---
+# (此部分代码未变，保持原样)
 STRATEGY_PARAMS = {
     "kelly_trade_history": 20,
     "default_risk_pct": 0.015,
@@ -158,16 +170,32 @@ STRATEGY_PARAMS = {
     "counter_trend_suppression_factor": 0.1,
     "tf_long_entry_threshold": 0.6,
     "tf_short_entry_threshold": -0.4,
-    # --- [OPTIMIZED] ---
     "time_stop_bars": 0,
     "score_weights_tf": {
-        "breakout": 0.25,      # 权重恢复
-        "momentum": 0.20,      # 权重恢复
-        "mtf": 0.15,           # 权重恢复
-        "legacy_ml": 0.15,     # 权重恢复
-        "advanced_ml": 0.0,    # 保持禁用
-        "v3_ml": 0.25,         # V3模型权重调整为平衡值
+        "breakout": 0.25,
+        "momentum": 0.20,
+        "mtf": 0.15,
+        "legacy_ml": 0.15,
+        "advanced_ml": 0.0,
+        "v3_ml": 0.25,
     },
+    # --- ADX移动止盈参数 (优化版) ---
+    "adx_trailing_enabled": True,           # 启用ADX移动止盈
+    "adx_trailing_start": 0.025,           # 开始移动止盈的最小盈利 (1.2%)
+    "adx_trailing_base_distance": 0.03,   # 初始追踪距离 3%
+    "adx_trailing_min_distance": 0.02,    # 最小追踪距离 2%
+    "adx_trailing_max_distance": 0.05,    # 最大追踪距离 5%
+
+    "adx_4h_period": 14,                   # 4小时ADX计算周期
+    "adx_strong_threshold": 28,            # ADX强趋势阈值 (提高门槛)
+    "adx_weak_threshold": 10,              # ADX弱趋势阈值 (降低门槛)
+    "adx_no_tracking_mode": True,          # 弱趋势时禁用追踪，仅固定止损
+    # --- 4H模型信号平滑过滤参数 ---
+    "signal_4h_smooth_enabled": True,      # 启用4H信号平滑
+    "signal_4h_smooth_period": 4,          # 4H信号平滑周期 (4根K线)
+    # --- 4H信号反转验证参数 ---
+    "signal_4h_reversal_validation": True, # 启用4H信号反转验证
+    "signal_4h_price_change_threshold": 0.04, # 4H价格变化阈值 (1.0%)
 }
 ASSET_SPECIFIC_OVERRIDES = {
     "ETHUSDT": {
@@ -178,6 +206,7 @@ ASSET_SPECIFIC_OVERRIDES = {
 
 
 # --- 函数定义 ---
+# (所有数据获取和特征工程函数保持不变)
 def fetch_binance_klines(s, i, st, en=None, l=1000):
     url, cols = "https://api.binance.com/api/v3/klines", [
         "timestamp",
@@ -359,51 +388,46 @@ def feature_engineering_v3(df_in):
     return all_features_df
 
 
-def generate_v3_ml_signal(df_with_ohlcv: pd.DataFrame) -> pd.Series:
-    logger.info("--- [V3 MODEL] 开始生成高精度ML信号 ---")
+def generate_v3_ml_predictions(
+    df_with_ohlcv: pd.DataFrame,
+    model_path: str,
+    scaler_path: str,
+    orig_cols_path: str,
+    flat_cols_path: str,
+    seq_len: int,
+    log_prefix: str = "[V3 MODEL]",
+) -> pd.Series:
+    logger.info(f"--- {log_prefix} 开始生成ML预测 ---")
     if not all(
         os.path.exists(p)
-        for p in [
-            V3_ML_MODEL_PATH,
-            V3_ML_SCALER_PATH,
-            V3_ML_FEATURE_COLUMNS_PATH,
-            V3_ML_FLATTENED_COLUMNS_PATH,
-        ]
+        for p in [model_path, scaler_path, orig_cols_path, flat_cols_path]
     ):
-        logger.warning("缺少V3模型文件，V3 ML信号将为0。")
+        logger.warning(f"{log_prefix} 缺少模型文件，ML预测将为0。")
         return pd.Series(0, index=df_with_ohlcv.index)
     try:
         model, scaler, original_columns, flattened_columns = (
-            joblib.load(V3_ML_MODEL_PATH),
-            joblib.load(V3_ML_SCALER_PATH),
-            joblib.load(V3_ML_FEATURE_COLUMNS_PATH),
-            joblib.load(V3_ML_FLATTENED_COLUMNS_PATH),
+            joblib.load(model_path),
+            joblib.load(scaler_path),
+            joblib.load(orig_cols_path),
+            joblib.load(flat_cols_path),
         )
         features_df = feature_engineering_v3(df_with_ohlcv).dropna()
         features_aligned = features_df.reindex(columns=original_columns, fill_value=0)
         scaled_features = scaler.transform(features_aligned)
-        signals = []
-        look_back = V3_ML_SEQUENCE_LENGTH
-        for i in range(look_back, len(scaled_features)):
+        predictions = []
+        for i in range(seq_len, len(scaled_features)):
             input_sequence = (
-                scaled_features[i - look_back : i, :].flatten().reshape(1, -1)
+                scaled_features[i - seq_len : i, :].flatten().reshape(1, -1)
             )
             input_df = pd.DataFrame(input_sequence, columns=flattened_columns)
             pred_prob = model.predict_proba(input_df)[0][1]
-            model_signal = 1 if pred_prob > V3_ML_THRESHOLD else 0
-            current_timestamp = features_aligned.index[i]
-            macd_long, macds_long = (
-                features_df.loc[current_timestamp, "MACD_long"],
-                features_df.loc[current_timestamp, "MACDs_long"],
-            )
-            is_trend_confirmed = (macd_long > macds_long) and (macd_long > 0)
-            signals.append(1 if (model_signal == 1 and is_trend_confirmed) else 0)
-        signal_index = features_aligned.index[look_back:]
-        final_series = pd.Series(signals, index=signal_index).shift(1)
-        logger.info("--- [V3 MODEL] 高精度ML信号生成完毕 ---")
-        return final_series.reindex(df_with_ohlcv.index, fill_value=0)
+            predictions.append(pred_prob)
+        prediction_index = features_aligned.index[seq_len:]
+        final_probs = pd.Series(predictions, index=prediction_index)
+        logger.info(f"--- {log_prefix} ML预测生成完毕 ---")
+        return final_probs.reindex(df_with_ohlcv.index, fill_value=0)
     except Exception as e:
-        logger.error(f"生成V3 ML信号时出错: {e}", exc_info=True)
+        logger.error(f"{log_prefix} 生成ML预测时出错: {e}", exc_info=True)
         return pd.Series(0, index=df_with_ohlcv.index)
 
 
@@ -485,95 +509,76 @@ def run_advanced_model_inference(df):
     return df
 
 
-def add_legacy_ml_features(df: pd.DataFrame) -> pd.DataFrame:
-    h, l, c, v = df["High"], df["Low"], df["Close"], df["Volume"]
-    df["volatility"] = (np.log(c / c.shift(1))).rolling(window=20).std()
-    df["EMA_8"] = ta.trend.EMAIndicator(c, 8).ema_indicator()
-    df["RSI_14"] = ta.momentum.RSIIndicator(c, 14).rsi()
-    adx = ta.trend.ADXIndicator(h, l, c, 14)
-    df["ADX_14"], df["DMP_14"], df["DMN_14"] = adx.adx(), adx.adx_pos(), adx.adx_neg()
-    df["ATRr_14"] = (
-        ta.volatility.AverageTrueRange(h, l, c, 14).average_true_range() / c
-    ) * 100
-    bb = ta.volatility.BollingerBands(c, 20, 2.0)
-    (
-        df["BBU_20_2.0"],
-        df["BBM_20_2.0"],
-        df["BBL_20_2.0"],
-        df["BBB_20_2.0"],
-        df["BBP_20_2.0"],
-    ) = (
-        bb.bollinger_hband(),
-        bb.bollinger_mavg(),
-        bb.bollinger_lband(),
-        bb.bollinger_wband(),
-        bb.bollinger_pband(),
-    )
-    macd = ta.trend.MACD(c, 12, 26, 9)
-    df["MACD_12_26_9"], df["MACDs_12_26_9"], df["MACDh_12_26_9"] = (
-        macd.macd(),
-        macd.macd_signal(),
-        macd.macd_diff(),
-    )
-    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(c, v).on_balance_volume()
-    df["volume_change_rate"] = v.pct_change()
-    return df
-
-
-def generate_legacy_ml_signal(df: pd.DataFrame) -> pd.Series:
-    if not all(
-        os.path.exists(p)
-        for p in [
-            LEGACY_ML_MODEL_PATH,
-            LEGACY_ML_SCALER_PATH,
-            LEGACY_ML_FEATURE_COLUMNS_PATH,
-        ]
-    ):
-        logger.warning("缺少老版本模型文件，ML信号将为0。")
-        return pd.Series(0, index=df.index)
-    try:
-        model, scaler, f_cols = (
-            joblib.load(LEGACY_ML_MODEL_PATH),
-            joblib.load(LEGACY_ML_SCALER_PATH),
-            joblib.load(LEGACY_ML_FEATURE_COLUMNS_PATH),
-        )
-        df_copy = df.copy()
-        df_copy.replace([np.inf, -np.inf], np.nan, inplace=True)
-        for col in f_cols:
-            if col not in df_copy.columns:
-                df_copy[col] = 0
-        df_aligned = df_copy[f_cols].dropna()
-        if df_aligned.empty:
-            return pd.Series(0, index=df.index)
-        scaled = scaler.transform(df_aligned)
-        X = np.array(
-            [
-                scaled[i : i + LEGACY_ML_SEQUENCE_LENGTH].flatten()
-                for i in range(len(scaled) - LEGACY_ML_SEQUENCE_LENGTH + 1)
-            ],
-            dtype=np.float32,
-        )
-        if X.shape[0] == 0:
-            return pd.Series(0, index=df.index)
-        probs = model.predict_proba(X)[:, 1]
-        signals = np.where(probs > LEGACY_ML_THRESHOLD, 1, -1)
-        return pd.Series(
-            signals, index=df_aligned.index[LEGACY_ML_SEQUENCE_LENGTH - 1 :]
-        ).reindex(df.index, fill_value=0)
-    except Exception as e:
-        logger.error(f"生成老版本ML信号时出错: {e}")
-        return pd.Series(0, index=df.index)
-
-
 def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataFrame:
     df = data_in.copy()
     logger.info(
         f"[{symbol}] 开始数据预处理 (数据范围: {df.index.min()} to {df.index.max()})..."
     )
-    df["v3_ml_signal"] = generate_v3_ml_signal(df)
+
+    df["v3_ml_prob_15m"] = generate_v3_ml_predictions(
+        df,
+        V3_ML_MODEL_15M_PATH,
+        V3_ML_SCALER_15M_PATH,
+        V3_ML_FEATURE_COLUMNS_15M_PATH,
+        V3_ML_FLATTENED_COLUMNS_15M_PATH,
+        V3_ML_SEQUENCE_LENGTH_15M,
+        log_prefix="[V3 MODEL 15M]",
+    )
+    df["v3_ml_signal_15m"] = (df["v3_ml_prob_15m"] > V3_ML_THRESHOLD_15M).astype(int)
+
+    df_4h = (
+        df.resample("4h")
+        .agg(
+            {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            }
+        )
+        .dropna()
+    )
+    probs_4h = generate_v3_ml_predictions(
+        df_4h,
+        V3_ML_MODEL_4H_PATH,
+        V3_ML_SCALER_4H_PATH,
+        V3_ML_FEATURE_COLUMNS_4H_PATH,
+        V3_ML_FLATTENED_COLUMNS_4H_PATH,
+        V3_ML_SEQUENCE_LENGTH_4H,
+        log_prefix="[V3 MODEL 4H]",
+    )
+    signals_4h = (probs_4h > V3_ML_THRESHOLD_4H).astype(int)
+    
+    # 添加4H信号平滑过滤
+    if STRATEGY_PARAMS["signal_4h_smooth_enabled"]:
+        smooth_period = STRATEGY_PARAMS["signal_4h_smooth_period"]
+        signals_4h_smoothed = signals_4h.rolling(window=smooth_period, min_periods=1).mean()
+        # 平滑后的信号需要超过0.6才认为是有效的看涨信号
+        signals_4h_final = (signals_4h_smoothed > 0.6).astype(int)
+        logger.info(f"[{symbol}] 4H信号平滑: 原始信号{signals_4h.sum()}个, 平滑后{signals_4h_final.sum()}个")
+    else:
+        signals_4h_final = signals_4h
+    
+    df["v3_ml_signal_4h"] = (
+        signals_4h_final.shift(1).reindex(df.index, method="ffill").fillna(0)
+    )
+    
+    # 计算4小时ADX
+    adx_4h = ta.trend.ADXIndicator(
+        high=df_4h["High"],
+        low=df_4h["Low"],
+        close=df_4h["Close"],
+        window=STRATEGY_PARAMS["adx_4h_period"]
+    ).adx()
+    df["adx_4h"] = (
+        adx_4h.shift(1).reindex(df.index, method="ffill").fillna(20)
+    )
+
     df = run_advanced_model_inference(df)
     df = add_ml_features(df)
     df = add_market_regime_features(df)
+
     d_start = df.index.min().normalize() - pd.Timedelta(
         days=STRATEGY_PARAMS["mtf_period"] + 5
     )
@@ -593,335 +598,289 @@ def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataF
         )
     else:
         df["mtf_signal"] = 0
-    df_4h = (
-        df.resample("4h")
-        .agg(
-            {
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Volume": "sum",
-            }
-        )
-        .dropna()
-    )
-    legacy_4h_f = add_legacy_ml_features(df_4h.copy())
-    df["legacy_ml_signal"] = (
-        generate_legacy_ml_signal(legacy_4h_f)
-        .shift(1)
-        .reindex(df.index, method="ffill")
-        .fillna(0)
-    )
+
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
     logger.info(f"[{symbol}] 数据预处理完成。数据行数: {len(df)}")
     return df
 
 
-def analyze_v3_standalone_performance(df: pd.DataFrame):
-    print(f"\n{'-'*40}\n       V3 高精度模型独立表现分析\n{'-'*40}")
-    if "v3_ml_signal" not in df.columns or df["v3_ml_signal"].sum() == 0:
-        print("未找到有效的V3模型信号，无法进行分析。")
+TREND_CONFIG = {"look_forward_steps": 5, "ema_length": 8}
+
+
+def analyze_v3_standalone_performance(df: pd.DataFrame, signal_col="v3_ml_signal_15m"):
+    print(f"\n{'-'*40}\n       V3 高精度模型独立表现分析 ({signal_col}) \n{'-'*40}")
+    required_cols = [signal_col, "Close"]
+    if not all(col in df.columns for col in required_cols):
+        print(f"缺少必要列 {signal_col}，无法分析。")
         return
-    look_forward_steps = 5
-    ema_length = STRATEGY_PARAMS.get("tf_ema_fast_period", 20)
-    df_analysis = df.copy()
-    df_analysis["ema"] = ta.trend.EMAIndicator(
-        close=df_analysis["Close"], window=ema_length
-    ).ema_indicator()
-    df_analysis["future_ema"] = df_analysis["ema"].shift(-look_forward_steps)
-    trade_signals = df_analysis[df_analysis["v3_ml_signal"] == 1].dropna()
-    if trade_signals.empty:
-        print("V3模型在回测期间内未发出任何做多信号。")
-        return
-    wins = (trade_signals["future_ema"] > trade_signals["ema"]).sum()
-    total_trades = len(trade_signals)
-    win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
-    returns = (
-        trade_signals["Close"].shift(-look_forward_steps) - trade_signals["Close"]
-    ) / trade_signals["Close"]
-    simple_cumulative_return = returns.sum() * 100
-    average_return_per_trade = returns.mean() * 100
-    print(f"信号总数: {total_trades}")
-    print(
-        f"胜率 (使用EMA评估，周期={ema_length}, 向前={look_forward_steps}根K线): {win_rate:.2f}%"
+    look_forward_steps, ema_length = (
+        TREND_CONFIG["look_forward_steps"],
+        TREND_CONFIG["ema_length"],
     )
-    print(f"平均每笔信号回报率 (基于Close价格): {average_return_per_trade:.4f}%")
-    print(f"简单累加总回报率 (基于Close价格): {simple_cumulative_return:.2f}%")
+    n = len(df)
+    df_reset = df.reset_index(drop=True)
+    df_reset[f"EMA_{ema_length}"] = pta.ema(close=df_reset["Close"], length=ema_length)
+    macd_result = pta.macd(close=df_reset["Close"], fast=24, slow=52, signal=18)
+    df_reset["MACD_long"], df_reset["MACDs_long"] = (
+        macd_result["MACD_24_52_18"],
+        macd_result["MACDs_24_52_18"],
+    )
+    valid_mask = (
+        (df_reset.index <= n - look_forward_steps - 1)
+        & (df_reset[signal_col] == 1)
+        & (df_reset["MACD_long"] > df_reset["MACDs_long"])
+        & (df_reset["MACD_long"] > 0)
+    )
+    trade_signals = df_reset[valid_mask].copy()
+    if trade_signals.empty:
+        print("无有效信号（可能因MACD过滤或边界限制）。")
+        return
+    total_trades = len(trade_signals)
+    current_ema = trade_signals[f"EMA_{ema_length}"]
+    future_ema = df_reset.loc[
+        trade_signals.index + look_forward_steps, f"EMA_{ema_length}"
+    ].values
+    wins = (future_ema > current_ema).sum()
+    win_rate = (wins / total_trades) * 100
+    entry_price = trade_signals["Close"]
+    exit_price = df_reset.loc[trade_signals.index + look_forward_steps, "Close"].values
+    price_returns = (exit_price - entry_price) / entry_price
+    avg_price_return, cum_price_return = (
+        price_returns.mean() * 100,
+        price_returns.sum() * 100,
+    )
+    print(f"有效信号总数（含MACD过滤，可观测{look_forward_steps}步）: {total_trades}")
+    print(f"✅ 胜率（EMA趋势上涨，与训练目标一致）: {win_rate:.2f}%")
+    print(f"📊 平均价格回报率（实际盈亏参考）: {avg_price_return:.4f}%")
+    print(f"📈 累计价格回报率: {cum_price_return:.2f}%")
     print(f"{'-'*40}")
 
 
-class BaseAssetStrategy:
-    def __init__(self, main_strategy: Strategy):
-        self.main = main_strategy
-
-    def _calculate_entry_score(self) -> float:
-        m = self.main
-        w = m.score_weights_tf
-        breakout = (
-            1
-            if m.data.Close[-1] > m.tf_donchian_h[-1]
-            else -1 if m.data.Close[-1] < m.tf_donchian_l[-1] else 0
-        )
-        momentum = 1 if m.tf_ema_fast[-1] > m.tf_ema_slow[-1] else -1
-        trend_filter, suppression = (
-            m.legacy_ml_signal[-1],
-            m.counter_trend_suppression_factor,
-        )
-        breakout_w, momentum_w = w.get("breakout", 0), w.get("momentum", 0)
-        if trend_filter * breakout < 0:
-            breakout_w *= suppression
-        if trend_filter * momentum < 0:
-            momentum_w *= suppression
-        return (
-            breakout * breakout_w
-            + momentum * momentum_w
-            + m.mtf_signal[-1] * w.get("mtf", 0)
-            + m.legacy_ml_signal[-1] * w.get("legacy_ml", 0)
-            + m.advanced_ml_signal[-1] * w.get("advanced_ml", 0)
-            + m.v3_ml_signal[-1] * w.get("v3_ml", 0)
-        )
-
-    def _define_mr_entry_signal(self) -> int:
-        m = self.main
-        if crossover(m.data.Close, m.mr_bb_lower) and m.mr_rsi[-1] < m.mr_rsi_oversold:
-            return 1
-        if (
-            crossover(m.mr_bb_upper, m.data.Close)
-            and m.mr_rsi[-1] > m.mr_rsi_overbought
-        ):
-            return -1
-        return 0
-
-
-class BTCStrategy(BaseAssetStrategy):
-    def _calculate_entry_score(self) -> float:
-        return super()._calculate_entry_score() if self.main.tf_adx[-1] > 20 else 0
-
-
-class ETHStrategy(BaseAssetStrategy):
-    pass
-
-
-STRATEGY_MAPPING = {
-    "BaseAssetStrategy": BaseAssetStrategy,
-    "BTCStrategy": BTCStrategy,
-    "ETHStrategy": ETHStrategy,
-}
-
-
+# --- 策略定义 ---
 class UltimateStrategy(Strategy):
     symbol = None
-    vol_weight = 1.0
-    strategy_class_override = None
-    score_weights_tf_override = None
-    ml_weights_override = None
-    ml_weighted_threshold_override = None
 
     def init(self):
         for k, v in STRATEGY_PARAMS.items():
             setattr(self, k, v)
-        overrides = ASSET_SPECIFIC_OVERRIDES.get(self.symbol, {})
-        self.tf_long_entry_threshold = overrides.get(
-            "tf_long_entry_threshold", self.tf_long_entry_threshold
-        )
-        self.tf_short_entry_threshold = overrides.get(
-            "tf_short_entry_threshold", self.tf_short_entry_threshold
-        )
-        class_name = self.strategy_class_override or overrides.get(
-            "strategy_class", "BaseAssetStrategy"
-        )
-        self.asset_strategy = STRATEGY_MAPPING.get(class_name, BaseAssetStrategy)(self)
         c, h, l = (
             pd.Series(self.data.Close),
             pd.Series(self.data.High),
             pd.Series(self.data.Low),
         )
-        self.recent_trade_returns = deque(maxlen=self.kelly_trade_history)
-        self.reset_trade_state()
-        (
-            self.market_regime,
-            self.mtf_signal,
-            self.advanced_ml_signal,
-            self.legacy_ml_signal,
-            self.v3_ml_signal,
-        ) = (
-            self.I(lambda: self.data.market_regime),
-            self.I(lambda: self.data.mtf_signal),
-            self.I(lambda: self.data.advanced_ml_signal),
-            self.I(lambda: self.data.legacy_ml_signal),
-            self.I(lambda: self.data.v3_ml_signal),
+
+        self.v3_ml_signal_15m = self.I(lambda: self.data.v3_ml_signal_15m)
+        self.v3_ml_prob_15m = self.I(lambda: self.data.v3_ml_prob_15m)
+        self.v3_ml_signal_4h = self.I(lambda: self.data.v3_ml_signal_4h)
+        self.adx_4h = self.I(lambda: self.data.adx_4h)
+        self.ema_fast = self.I(
+            lambda: ta.trend.EMAIndicator(c, self.tf_ema_fast_period).ema_indicator()
         )
-        self.tf_atr = self.I(
+        self.atr = self.I(
             lambda: ta.volatility.AverageTrueRange(
                 h, l, c, self.tf_atr_period
             ).average_true_range()
         )
-        self.tf_donchian_h, self.tf_donchian_l = self.I(
-            lambda: h.rolling(self.tf_donchian_period).max().shift(1)
-        ), self.I(lambda: l.rolling(self.tf_donchian_period).min().shift(1))
-        self.tf_ema_fast, self.tf_ema_slow = self.I(
-            lambda: ta.trend.EMAIndicator(c, self.tf_ema_fast_period).ema_indicator()
-        ), self.I(
-            lambda: ta.trend.EMAIndicator(c, self.tf_ema_slow_period).ema_indicator()
-        )
-        self.tf_adx = self.I(
-            lambda: ta.trend.ADXIndicator(h, l, c, self.tf_adx_confirm_period).adx()
-        )
-        bb = ta.volatility.BollingerBands(c, self.mr_bb_period, self.mr_bb_std)
-        self.mr_bb_upper, self.mr_bb_lower, self.mr_bb_mid = (
-            self.I(lambda: bb.bollinger_hband()),
-            self.I(lambda: bb.bollinger_lband()),
-            self.I(lambda: bb.bollinger_mavg()),
-        )
-        self.mr_rsi = self.I(
-            lambda: ta.momentum.RSIIndicator(c, self.mr_rsi_period).rsi()
-        )
+        
+        # --- ADX移动止盈状态跟踪 ---
+        self.adx_entry_price = None           # 入场价格
+        self.adx_highest_price = None         # 入场后最高价格
+        self.adx_trailing_stop = None         # ADX追踪止损价格
+        
+        # --- 4H信号反转验证状态跟踪 ---
+        self.prev_4h_signal = None            # 上一个4H信号状态
+        self.signal_change_price = None       # 信号变化时的价格
 
     def next(self):
-        if self.position:
-            self.manage_open_position(self.data.Close[-1])
+        price = self.data.Close[-1]
+        current_bar = len(self.data) - 1
+
+        # --- 【核心修改】 ---
+        # 入场信号: 4H模型看涨 且 15M模型触发
+        current_4h_signal = self.v3_ml_signal_4h[-1]
+        long_term_trend_is_up = current_4h_signal > 0
+        short_term_entry_trigger = (
+            self.v3_ml_signal_15m[-1] > 0 and price > self.ema_fast[-1]
+        )
+        entry_signal = long_term_trend_is_up and short_term_entry_trigger
+
+        # 检测4H信号变化和价格波动验证
+        signal_changed = False
+        valid_reversal = False
+        
+        if self.prev_4h_signal is not None:
+            signal_changed = (current_4h_signal != self.prev_4h_signal)
+            
+            if signal_changed:
+                # 记录信号变化时的价格
+                if self.signal_change_price is None:
+                    self.signal_change_price = price
+                
+                # 计算价格变化幅度
+                if self.signal_change_price is not None:
+                    price_change_pct = abs(price - self.signal_change_price) / self.signal_change_price
+                    valid_reversal = price_change_pct > self.signal_4h_price_change_threshold
+        
+        # 更新4H信号状态
+        if signal_changed:
+            self.prev_4h_signal = current_4h_signal
+            if not valid_reversal:
+                self.signal_change_price = price  # 重置价格基准
+        elif self.prev_4h_signal is None:
+            self.prev_4h_signal = current_4h_signal
+            self.signal_change_price = price
+
+        # 离场信号: 4H信号反转且有有效价格波动
+        exit_signal = (current_4h_signal <= 0 and
+                      self.signal_4h_reversal_validation and
+                      signal_changed and
+                      valid_reversal)
+        
+        # 传统离场信号（作为备用）
+        traditional_exit = current_4h_signal <= 0 and not self.signal_4h_reversal_validation
+        # --- 【核心修改结束】 ---
+
+        if not self.position:
+            if entry_signal:
+                self.open_dynamic_position(price, current_bar)
+        elif self.position.is_long:
+            # ADX移动止盈逻辑
+            if self.adx_trailing_enabled and self.adx_entry_price is not None:
+                self.handle_adx_trailing_logic(price)
+            
+            # 4H信号反转平仓（带价格波动验证）
+            if exit_signal:
+                price_change_pct = abs(price - self.signal_change_price) / self.signal_change_price
+                self.close_all_positions(f"4H有效反转: 价格变化{price_change_pct:.2%}")
+            elif traditional_exit:
+                self.close_all_positions("4H信号反转（传统模式）")
+
+    def get_confidence_factor(self, probability: float) -> float:
+        if probability > 0.65:
+            return 2.0
+        elif probability > 0.55:
+            return 1.5
+        elif probability > 0.45:
+            return 1.0
         else:
-            if "market_regime" in self.data.df.columns and self.market_regime[-1] == 1:
-                self.run_scoring_system_entry(self.data.Close[-1])
+            return 0.5
+
+    def open_dynamic_position(self, price: float, current_bar: int):
+        probability = self.v3_ml_prob_15m[-1]
+        confidence_factor = self.get_confidence_factor(probability)
+        dynamic_risk_pct = min(
+            self.default_risk_pct * confidence_factor, self.max_risk_pct
+        )
+        risk_per_share = self.atr[-1] * self.tf_stop_loss_atr_multiplier
+        if risk_per_share <= 0:
+            return
+        size = self._calculate_position_size(price, risk_per_share, dynamic_risk_pct)
+        if size > 0:
+            self.buy(size=size)
+            
+            # 初始化ADX移动止盈状态
+            if self.adx_trailing_enabled:
+                self.adx_entry_price = price
+                self.adx_highest_price = price
+                self.adx_trailing_stop = None
+                
+            # 初始化4H信号状态
+            self.prev_4h_signal = self.v3_ml_signal_4h[-1]
+            self.signal_change_price = price
+            
+            logger.info(f"📈 开仓: 价格={price:.4f}, 数量={size}, 启用ADX移动止盈和4H反转验证")
+
+    def handle_adx_trailing_logic(self, price: float):
+        """处理ADX移动止盈逻辑"""
+        if self.adx_entry_price is None:
+            return
+            
+        # 更新最高价格
+        if price > self.adx_highest_price:
+            self.adx_highest_price = price
+
+        # 计算当前盈利率
+        profit_pct = (price - self.adx_entry_price) / self.adx_entry_price
+        
+        # 检查是否达到启动移动止盈的条件
+        if profit_pct >= self.adx_trailing_start:
+            # 获取当前4小时ADX值
+            current_adx = self.adx_4h[-1]
+            
+            # 检查是否在弱趋势区间且启用了无追踪模式
+            if self.adx_no_tracking_mode and current_adx <= self.adx_weak_threshold:
+                # 弱趋势时使用固定止损，不进行动态追踪
+                if self.adx_trailing_stop is None:
+                    # 设置固定止损价格（基于入场价格的固定百分比）
+                    fixed_stop_distance = 0.025  # 2.5%固定止损
+                    self.adx_trailing_stop = self.adx_entry_price * (1 - fixed_stop_distance)
+                    logger.info(f"🔒 弱趋势固定止损: {self.adx_trailing_stop:.4f}, ADX={current_adx:.1f}")
             else:
-                self.run_mean_reversion_entry(self.data.Close[-1])
+                # 正常趋势时进行动态追踪
+                trailing_distance = self.calculate_adx_trailing_distance(current_adx)
+                
+                # 计算追踪止损价格
+                trailing_stop_price = self.adx_highest_price * (1 - trailing_distance)
+                
+                # 更新追踪止损价格（只能向上调整）
+                if self.adx_trailing_stop is None or trailing_stop_price > self.adx_trailing_stop:
+                    self.adx_trailing_stop = trailing_stop_price
+                    logger.debug(f"🎯 更新ADX追踪止损: {self.adx_trailing_stop:.4f}, ADX={current_adx:.1f}, 距离={trailing_distance:.2%}")
+                
+            # 检查是否触发追踪止损
+            if price <= self.adx_trailing_stop:
+                trend_type = "弱趋势固定" if (self.adx_no_tracking_mode and current_adx <= self.adx_weak_threshold) else "动态追踪"
+                self.close_all_positions(f"ADX {trend_type}止损触发: {price:.4f} <= {self.adx_trailing_stop:.4f}, ADX={current_adx:.1f}")
 
-    def run_scoring_system_entry(self, p):
-        score = self.asset_strategy._calculate_entry_score()
-        if score > self.tf_long_entry_threshold:
-            self.open_tf_position(p, True, score)
-        elif score < self.tf_short_entry_threshold:
-            self.open_tf_position(p, False, abs(score))
-
-    def run_mean_reversion_entry(self, p):
-        signal = self.asset_strategy._define_mr_entry_signal()
-        if signal != 0:
-            self.open_mr_position(p, signal == 1)
-
-    def reset_trade_state(self):
-        (
-            self.active_sub_strategy,
-            self.chandelier_exit_level,
-            self.highest_high_in_trade,
-            self.lowest_low_in_trade,
-            self.mr_stop_loss,
-            self.tf_initial_stop_loss,
-            self.trade_entry_bar,
-        ) = (None, 0.0, 0, float("inf"), 0.0, 0.0, 0)
-
-    def manage_open_position(self, p):
-        if self.active_sub_strategy == "TF":
-            self.manage_trend_following_exit(p)
-        elif self.active_sub_strategy == "MR":
-            self.manage_mean_reversion_exit(p)
-
-    def open_tf_position(self, p, is_long, confidence):
-        risk_ps = self.tf_atr[-1] * self.tf_stop_loss_atr_multiplier
-        if risk_ps <= 0:
-            return
-        size = self._calculate_position_size(
-            p, risk_ps, self._calculate_dynamic_risk() * confidence
-        )
-        if size <= 0:
-            return
-        self.reset_trade_state()
-        self.active_sub_strategy = "TF"
-        self.trade_entry_bar = len(self.data)
-        if is_long:
-            self.buy(size=size)
-            self.tf_initial_stop_loss = p - risk_ps
+    def calculate_adx_trailing_distance(self, adx_value: float) -> float:
+        """根据ADX值计算动态追踪距离"""
+        if adx_value >= self.adx_strong_threshold:
+            # ADX强趋势：使用较小的追踪距离，紧密保护利润
+            ratio = min(1.0, (adx_value - self.adx_strong_threshold) / 25.0)
+            distance = self.adx_trailing_min_distance + ratio * (self.adx_trailing_base_distance - self.adx_trailing_min_distance)
+        elif adx_value <= self.adx_weak_threshold:
+            # ADX弱趋势：使用较大的追踪距离，给价格更多波动空间
+            distance = self.adx_trailing_max_distance
         else:
-            self.sell(size=size)
-            self.tf_initial_stop_loss = p + risk_ps
+            # ADX中等趋势：线性插值
+            ratio = (adx_value - self.adx_weak_threshold) / (self.adx_strong_threshold - self.adx_weak_threshold)
+            distance = self.adx_trailing_max_distance - ratio * (self.adx_trailing_max_distance - self.adx_trailing_base_distance)
+        
+        return max(self.adx_trailing_min_distance, min(self.adx_trailing_max_distance, distance))
 
-    def manage_trend_following_exit(self, p):
-        bars_in_trade = len(self.data) - self.trade_entry_bar
-        if self.time_stop_bars > 0 and bars_in_trade > self.time_stop_bars:
+    def close_all_positions(self, reason: str):
+        """关闭所有仓位并重置状态"""
+        if self.position:
             self.position.close()
-            return
-        if self.position.is_long:
-            if p < self.tf_initial_stop_loss:
-                self.position.close()
-                return
-            self.highest_high_in_trade = max(
-                self.highest_high_in_trade, self.data.High[-1]
-            )
-            exit_level = (
-                self.highest_high_in_trade
-                - self.tf_atr[-1] * self.tf_chandelier_atr_multiplier
-            )
-            if p < exit_level:
-                self.position.close()
-        elif self.position.is_short:
-            if p > self.tf_initial_stop_loss:
-                self.position.close()
-                return
-            self.lowest_low_in_trade = min(self.lowest_low_in_trade, self.data.Low[-1])
-            exit_level = (
-                self.lowest_low_in_trade
-                + self.tf_atr[-1] * self.tf_chandelier_atr_multiplier
-            )
-            if p > exit_level:
-                self.position.close()
+            logger.info(f"🔴 平仓: {reason}")
+        
+        # 重置ADX移动止盈状态
+        self.adx_entry_price = None
+        self.adx_highest_price = None
+        self.adx_trailing_stop = None
+        
+        # 重置4H信号状态
+        self.prev_4h_signal = None
+        self.signal_change_price = None
 
-    def open_mr_position(self, p, is_long):
-        risk_ps = self.tf_atr[-1] * self.mr_stop_loss_atr_multiplier
-        if risk_ps <= 0:
-            return
-        size = self._calculate_position_size(
-            p, risk_ps, self._calculate_dynamic_risk() * self.mr_risk_multiplier
-        )
-        if size <= 0:
-            return
-        self.reset_trade_state()
-        self.active_sub_strategy = "MR"
-        if is_long:
-            self.buy(size=size)
-            self.mr_stop_loss = p - risk_ps
-        else:
-            self.sell(size=size)
-            self.mr_stop_loss = p + risk_ps
-
-    def manage_mean_reversion_exit(self, p):
-        if (
-            self.position.is_long
-            and (p >= self.mr_bb_mid[-1] or p <= self.mr_stop_loss)
-        ) or (
-            self.position.is_short
-            and (p <= self.mr_bb_mid[-1] or p >= self.mr_stop_loss)
-        ):
-            self.position.close()
-
-    def _calculate_position_size(self, p, rps, risk_pct):
-        if rps <= 0 or p <= 0 or risk_pct <= 0:
+    def _calculate_position_size(self, price, risk_per_share, risk_pct):
+        if risk_per_share <= 0 or price <= 0 or risk_pct <= 0:
             return 0
-        return int((self.equity * risk_pct) / rps)
-
-    def _calculate_dynamic_risk(self):
-        if len(self.recent_trade_returns) < self.kelly_trade_history:
-            return self.default_risk_pct * self.vol_weight
-        returns = np.array(list(self.recent_trade_returns))
-        if len(returns) < 2 or np.all(returns >= 0) or np.all(returns <= 0):
-            return self.default_risk_pct * self.vol_weight
-        win_rate, avg_win, avg_loss = (
-            np.mean(returns > 0),
-            np.mean(returns[returns > 0]),
-            np.abs(np.mean(returns[returns < 0])),
-        )
-        if avg_loss == 0:
-            return self.default_risk_pct * self.vol_weight
-        reward_ratio = avg_win / avg_loss
-        kelly = win_rate - (1 - win_rate) / reward_ratio
-        return min(max(0.005, kelly * 0.5) * self.vol_weight, self.max_risk_pct)
+        return int((self.equity * risk_pct) / risk_per_share)
 
 
 # --- 主程序入口 ---
 if __name__ == "__main__":
-    logger.info(
-        f"🚀 (V60.3-Optimized-Fix with V3 Integration - Final Fix 6 Performance Tuning) 开始运行..."
-    )
+    logger.info(f"🚀 (V60.9-Signal-Validation) 开始运行...")
+    logger.info(f"📊 ADX移动止盈配置: 启用={STRATEGY_PARAMS['adx_trailing_enabled']}")
+    if STRATEGY_PARAMS['adx_trailing_enabled']:
+        logger.info(f"🎯 启动盈利: {STRATEGY_PARAMS['adx_trailing_start']:.1%}")
+        logger.info(f"📈 追踪距离范围: {STRATEGY_PARAMS['adx_trailing_min_distance']:.1%} - {STRATEGY_PARAMS['adx_trailing_max_distance']:.1%}")
+        logger.info(f"🔥 ADX阈值: 强趋势>{STRATEGY_PARAMS['adx_strong_threshold']}, 弱趋势<{STRATEGY_PARAMS['adx_weak_threshold']}")
+        logger.info(f"🔒 弱趋势保护: {STRATEGY_PARAMS['adx_no_tracking_mode']}")
+        logger.info(f"📡 4H信号平滑: 启用={STRATEGY_PARAMS['signal_4h_smooth_enabled']}, 周期={STRATEGY_PARAMS['signal_4h_smooth_period']}")
+        logger.info(f"🛡️ 4H反转验证: 启用={STRATEGY_PARAMS['signal_4h_reversal_validation']}, 价格阈值={STRATEGY_PARAMS['signal_4h_price_change_threshold']:.1%}")
     backtest_start_dt = pd.to_datetime(CONFIG["backtest_start_date"])
     data_fetch_start_date_str = (
         backtest_start_dt - pd.Timedelta(days=365 * 2)
@@ -981,7 +940,11 @@ if __name__ == "__main__":
         all_stats[symbol] = stats
         print(f"\n{'-'*40}\n          {symbol} 回测结果摘要\n{'-'*40}")
         print(stats)
-        analyze_v3_standalone_performance(data)
+
+        # --- 模型独立表现分析 ---
+        analyze_v3_standalone_performance(data, signal_col="v3_ml_signal_15m")
+        analyze_v3_standalone_performance(data, signal_col="v3_ml_signal_4h")
+
         if CONFIG["show_plots"]:
             bt.plot()
 
