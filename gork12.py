@@ -105,8 +105,8 @@ CONFIG = {
     "backtest_start_date": "2025-01-01",
     "backtest_end_date": "2025-11-07",
     "initial_cash": 500_000,
-    "commission": 0.0002,
-    "spread": 0.0003,
+    "commission": 0.000002,
+    "spread": 0.0001,
     "show_plots": False,
     "training_window_days": 365 * 1.5,
     "enable_ml_component": True,
@@ -429,25 +429,45 @@ class UltimateStrategy(Strategy):
                 close=c, window_fast=24, window_slow=52, window_sign=18
             ).macd_signal()
         )
+        # 固定持仓最大K线数（与训练目标5根相近，这里取6根）
+        self.max_hold_bars = 6
 
     def next(self):
         price = self.data.Close[-1]
         current_bar = len(self.data) - 1
 
-        # 入场条件与模型评估一致：阈值信号 + 长周期MACD过滤
-        entry_signal = (
-            (self.v3_ml_signal_15m[-1] > 0)
-            and (self.macd_long[-1] > self.macds_long[-1])
-            and (self.macd_long[-1] > 0)
+        # ① 入场条件去掉长周期 MACD 过滤，仅使用模型信号
+        entry_signal = self.v3_ml_signal_15m[-1] > 0
+        # 改动 1：离场条件改为趋势转弱或概率显著走低
+        exit_signal = (
+            (self.macd_long[-1] < self.macds_long[-1])
+            or (self.v3_ml_prob_15m[-1] < 0.15)
         )
-        exit_signal = self.v3_ml_signal_15m[-1] <= 0
+
+        # 管理持仓的移动止盈/止损
+        if self.position and self.position.is_long:
+            # ② 移动止损改为 ATR 动态波动止损
+            if not hasattr(self, "highest_since_entry") or self.highest_since_entry is None:
+                self.highest_since_entry = self.data.Close[-1]
+            self.highest_since_entry = max(self.highest_since_entry, price)
+            atr_val = ta.volatility.AverageTrueRange(
+                self.data.High, self.data.Low, self.data.Close, window=14
+            ).average_true_range()[-1]
+            trailing_sl = self.highest_since_entry - 1.8 * atr_val
+            if price <= trailing_sl:
+                self.close_all_positions("ATR Trailing Stop")
+
+            # ③ 固定持仓时间退出：达到最大持仓K线数则平仓
+            if hasattr(self, "entry_bar") and self.entry_bar is not None:
+                if current_bar - self.entry_bar >= self.max_hold_bars:
+                    self.close_all_positions("Time-based exit")
 
         if not self.position:
             if entry_signal:
                 self.open_dynamic_position(price, current_bar)
         elif self.position.is_long:
             if exit_signal:
-                self.close_all_positions("15M信号反转")
+                self.close_all_positions("趋势转弱/概率走低")
 
     def get_confidence_factor(self, probability: float) -> float:
         if probability > 0.65:
@@ -460,18 +480,32 @@ class UltimateStrategy(Strategy):
             return 0.5
 
     def open_dynamic_position(self, price: float, current_bar: int):
-        probability = self.v3_ml_prob_15m[-1]
-        confidence_factor = self.get_confidence_factor(probability)
-        invest_pct = min(self.default_risk_pct * confidence_factor, self.max_risk_pct)
+        probability = float(self.v3_ml_prob_15m[-1])
+        # 改动 3：更激进的仓位放大策略
+        if probability < 0.40:
+            return  # 不开仓
+        elif probability < 0.55:
+            invest_pct = 0.01
+        elif probability < 0.65:
+            invest_pct = 0.03
+        else:
+            # 0.65 起步 8%，到 0.85 线性放大至 12%
+            invest_pct = 0.08 + 0.04 * max(0.0, min(1.0, (probability - 0.65) / 0.20))
         size = int((self.equity * invest_pct) / price)
         if size > 0:
+            # 下单，不设固定TP，改为ATR追踪+时间退出
             self.buy(size=size)
+            self.entry_price = price
+            self.highest_since_entry = price
+            self.entry_bar = current_bar
 
     def close_all_positions(self, reason: str):
         """关闭所有仓位"""
         if self.position:
             self.position.close()
-
+            # 重置移动止盈相关状态
+            self.highest_since_entry = None
+            self.entry_bar = None
     def _calculate_position_size(self, price, risk_per_share, risk_pct):
         if risk_per_share <= 0 or price <= 0 or risk_pct <= 0:
             return 0
