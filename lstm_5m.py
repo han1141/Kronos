@@ -4,7 +4,19 @@ import matplotlib.pyplot as plt
 import requests
 import time
 import logging
+
+# Compatibility shim: some pandas_ta versions import `NaN` from numpy,
+# but newer numpy exposes it as `np.nan` only. Ensure attribute exists.
+if not hasattr(np, "NaN"):
+    np.NaN = np.nan
+
 import pandas_ta as ta
+# Force pandas_ta to avoid TA-Lib backend (binary-incompatible with NumPy 2.x)
+try:
+    if hasattr(ta, "Imports"):
+        ta.Imports["talib"] = False
+except Exception:
+    pass
 import os
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import (
@@ -37,7 +49,7 @@ DATA_START_DATE = "2021-01-01"
 TRAIN_START_DATE = "2022-01-01"
 TRAIN_END_DATE = "2025-09-30"
 TEST_START_DATE = "2025-10-01"
-TEST_END_DATE = "2025-11-04"
+TEST_END_DATE = "2025-11-10"
 LOOK_BACK = 60
 
 TREND_CONFIG = {

@@ -70,7 +70,7 @@ CONFIG = {
     "symbols_to_test": ["ETHUSDT"],
     "interval": "15m",
     "backtest_start_date": "2025-01-01",
-    "backtest_end_date": "2025-11-05",
+    "backtest_end_date": "2025-11-10",
     "initial_cash": 500_000,
     "commission": 0.00075,
     "spread": 0.0002,
@@ -428,8 +428,10 @@ def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataF
         sma = ta.trend.SMAIndicator(
             data_1d["Close"], window=STRATEGY_PARAMS["mtf_period"]
         ).sma_indicator()
-        mtf_signal_1d = pd.Series(
-            np.where(data_1d["Close"] > sma, 1, -1), index=data_1d.index
+        # 为避免前视偏差：使用“上一日”已完成的日线信号
+        mtf_signal_1d = (
+            pd.Series(np.where(data_1d["Close"] > sma, 1, -1), index=data_1d.index)
+            .shift(1)
         )
         df["mtf_signal"] = mtf_signal_1d.reindex(df.index, method="ffill").fillna(0)
     else:
@@ -440,8 +442,10 @@ def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataF
         df_4h["Close"], window=50
     ).ema_indicator()
     df_4h["macro_trend"] = np.where(df_4h["Close"] > df_4h["macro_ema"], 1, -1)
+    # 为避免前视偏差：使用“上一根已完成的4小时”宏观趋势
+    macro_trend_safe = df_4h["macro_trend"].shift(1)
     df["macro_trend_filter"] = (
-        df_4h["macro_trend"].reindex(df.index, method="ffill").fillna(0)
+        macro_trend_safe.reindex(df.index, method="ffill").fillna(0)
     )
     logger.info(f"[{symbol}] 宏观趋势过滤器计算完成。")
     df.dropna(inplace=True)
