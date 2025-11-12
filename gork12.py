@@ -1,706 +1,460 @@
-# -*- coding: utf-8 -*-
-# 简化版：仅保留 15m 模型进行回测
-# 变更概要：
-# - 仅使用 15m V3 模型信号入场/离场
-# - 移除 4 小时模型相关逻辑
-# - 移除基础指标过滤（如 EMA/ADX/日线MTF过滤等）在策略决策中的参与
+# --- 核心库导入 ---
+import logging
+import time
+import warnings
 
-# --- 1. 导入库与配置 ---
-# (此部分代码未变，保持原样)
+# --- 数据分析和机器学习库 ---
+import numpy as np
 import pandas as pd
 import requests
-import time
-from datetime import datetime, timedelta
-import logging
-import numpy as np
-import matplotlib.pyplot as plt
-from collections import deque
-import matplotlib.font_manager
-import joblib
-import os
-import glob
-import warnings
-from scipy.stats import linregress
-from scipy.signal import find_peaks
-import pandas_ta as pta
-
-try:
-    import numba
-
-    jit = numba.jit(nopython=True, cache=True)
-    NUMBA_INSTALLED = True
-except ImportError:
-
-    def jit(func):
-        return func
-
-    NUMBA_INSTALLED = False
-
-try:
-    import lightgbm as lgb
-
-    ML_LIBS_INSTALLED = True
-except ImportError:
-    ML_LIBS_INSTALLED = False
-
-try:
-    import tensorflow as tf
-
-    ADVANCED_ML_LIBS_INSTALLED = True
-except ImportError:
-    ADVANCED_ML_LIBS_INSTALLED = False
-
-from backtesting import Backtest, Strategy
-from backtesting.lib import crossover
 import ta
+from backtesting import Backtest, Strategy
 
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=RuntimeWarning)
+# 忽略一些常见的未来警告
+warnings.simplefilter(action="ignore", category=FutureWarning)
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-log_filename = f"trading_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-file_handler = logging.FileHandler(log_filename, encoding="utf-8")
-file_handler.setLevel(logging.DEBUG)
-stream_handler = logging.StreamHandler()
-stream_handler.setLevel(logging.INFO)
-formatter = logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-)
-file_handler.setFormatter(formatter)
-stream_handler.setFormatter(formatter)
-if not logger.handlers:
-    logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
+# --- 1. 全局配置和策略参数 ---
 
+# 回测配置
+SYMBOL = "ETHUSDT"
+INTERVAL = "15m"
+START_DATE = "2025-01-01"
+END_DATE = "2025-11-11"
+INITIAL_CASH = 100_000
+COMMISSION = 0.0006  # 币安费率: 0.06%
 
-def set_chinese_font():
-    try:
-        font_names = [
-            "PingFang SC",
-            "Microsoft YaHei",
-            "SimHei",
-            "Heiti TC",
-            "sans-serif",
-        ]
-        for font in font_names:
-            if font in [f.name for f in matplotlib.font_manager.fontManager.ttflist]:
-                plt.rcParams["font.sans-serif"] = [font]
-                plt.rcParams["axes.unicode_minus"] = False
-                logger.info(f"成功设置中文字体: {font}")
-                return
-        logger.warning("未找到指定的中文字体")
-    except Exception as e:
-        logger.error(f"设置中文字体时出错: {e}")
-
-
-set_chinese_font()
-
-# --- 核心配置 ---
-# (此部分代码未变，保持原样)
-CONFIG = {
-    "symbols_to_test": ["ETHUSDT"],
-    "interval": "15m",
-    "backtest_start_date": "2025-01-01",
-    "backtest_end_date": "2025-11-07",
-    "initial_cash": 500_000,
-    "commission": 0.000002,
-    "spread": 0.0001,
-    "show_plots": False,
-    "training_window_days": 365 * 1.5,
-    "enable_ml_component": True,
-    # 网格搜索阈值配置
-    "threshold_search": {
-        "enabled": False,            # 启用/禁用阈值网格搜索
-        "metric": "sharpe",        # 评估指标: sharpe | return
-        "grid": None,               # 自定义阈值列表(如 [0.30,0.35,0.40])；None 则使用默认网格
-        "rerun_with_best": True,    # 是否用最佳阈值再跑一次并展示完整结果
+# 策略核心参数
+STRATEGY_PARAMS = {
+    # --- 市场状态检测参数 ---
+    "regime_adx_period": 14,
+    "regime_atr_period": 14,
+    "regime_atr_slope_period": 6,
+    "regime_rsi_period": 14,
+    "regime_rsi_vol_period": 14,
+    "regime_norm_period": 252,
+    "regime_hurst_period": 80,
+    "regime_score_weight_adx": 0.55,
+    "regime_score_weight_atr": 0.3,
+    "regime_score_weight_rsi": 0.1,
+    "regime_score_weight_hurst": 0.05,
+    "regime_score_threshold": 0.4,
+    # --- 趋势跟随(TF)模块参数 ---
+    "tf_donchian_period": 24,
+    "tf_ema_fast_period": 21,
+    "tf_ema_slow_period": 60,
+    "tf_atr_period": 14,
+    "tf_stop_loss_atr_multiplier": 2.6,
+    # --- 均值回归(MR)模块参数 ---
+    "mr_bb_period": 20,
+    "mr_bb_std": 2.0,
+    "mr_stop_loss_atr_multiplier": 1.5,
+    # --- 多周期过滤和信号权重 ---
+    "mtf_period": 40,
+    "score_entry_threshold": 0.5,
+    # 纯指标打分（临时禁用 ML 权重，重归一化其余权重）
+    "score_weights_tf": {
+        "breakout": 0.42,
+        "momentum": 0.35,
+        "mtf": 0.23,
+        # "ml": 0.0,  # 暂不参与
+        # "advanced_ml": 0.0,
     },
 }
 
-# --- 模型路径配置 ---
-# (此部分代码未变，保持原样)
-V3_ML_MODEL_15M_PATH = "models/eth_model_high_precision_v3_15m.joblib"
-V3_ML_SCALER_15M_PATH = "models/eth_scaler_high_precision_v3_15m.joblib"
-V3_ML_FEATURE_COLUMNS_15M_PATH = "models/feature_columns_high_precision_v3_15m.joblib"
-V3_ML_FLATTENED_COLUMNS_15M_PATH = (
-    "models/flattened_columns_high_precision_v3_15m.joblib"
+# --- 2. 日志系统设置 ---
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
-V3_ML_THRESHOLD_15M = 0.3204
-V3_ML_SEQUENCE_LENGTH_15M = 60
+logger = logging.getLogger(__name__)
 
 
-# --- 策略参数 ---
-# 仅保留在当前策略中实际使用到的字段
-STRATEGY_PARAMS = {
-    "default_risk_pct": 0.015,
-    "max_risk_pct": 0.04,
-}
-ASSET_SPECIFIC_OVERRIDES = {}
+# --- 3. 特征工程 & 原始策略逻辑 ---
+# 这部分代码是从 `ultimate_strategy.py` 移植过来的，用于预先计算所有指标。
 
 
-# --- 函数定义 ---
-# (所有数据获取和特征工程函数保持不变)
-def fetch_binance_klines(s, i, st, en=None, l=1000):
-    url, cols = "https://api.binance.com/api/v3/klines", [
-        "timestamp",
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "Volume",
-        "close_time",
-        "quote_asset_volume",
-        "number_of_trades",
-        "taker_buy_base_volume",
-        "taker_buy_quote_volume",
-        "ignore",
+def compute_hurst(ts, max_lag=100):
+    if len(ts) < 10:
+        return 0.5
+    lags = range(2, min(max_lag, len(ts) // 2 + 1))
+    tau = [
+        np.std(np.subtract(ts[lag:], ts[:-lag]))
+        for lag in lags
+        if np.std(np.subtract(ts[lag:], ts[:-lag])) > 0
     ]
-    sts, ets = int(pd.to_datetime(st).timestamp() * 1000), (
-        int(pd.to_datetime(en).timestamp() * 1000) if en else int(time.time() * 1000)
+    if len(tau) < 2:
+        return 0.5
+    try:
+        hurst = np.polyfit(np.log(lags[: len(tau)]), np.log(tau), 1)[0]
+        return max(0.0, min(1.0, hurst))
+    except:
+        return 0.5
+
+
+def add_ml_features_ported(df: pd.DataFrame) -> pd.DataFrame:
+    p = STRATEGY_PARAMS
+    norm = lambda s: (
+        (s - s.rolling(p["regime_norm_period"]).min())
+        / (
+            s.rolling(p["regime_norm_period"]).max()
+            - s.rolling(p["regime_norm_period"]).min()
+        )
+    ).fillna(0.5)
+    adx = ta.trend.ADXIndicator(df.High, df.Low, df.Close, p["regime_adx_period"]).adx()
+    atr = ta.volatility.AverageTrueRange(
+        df.High, df.Low, df.Close, p["regime_atr_period"]
+    ).average_true_range()
+    rsi = ta.momentum.RSIIndicator(df.Close, p["regime_rsi_period"]).rsi()
+    bb = ta.volatility.BollingerBands(
+        df.Close, window=p["mr_bb_period"], window_dev=p["mr_bb_std"]
     )
-    all_d, retries, last_e = [], 5, None
-    while sts < ets:
-        p = {
-            "symbol": s.upper(),
-            "interval": i,
-            "startTime": sts,
-            "endTime": ets,
-            "limit": l,
-        }
-        for attempt in range(retries):
-            try:
-                r = requests.get(url, params=p, timeout=15)
-                r.raise_for_status()
-                d = r.json()
-                if not d:
-                    sts = ets
-                    break
-                all_d.extend(d)
-                sts = d[-1][0] + 1
-                break
-            except requests.exceptions.RequestException as e:
-                last_e = e
-                time.sleep(2**attempt)
+    df["feature_adx_norm"] = norm(adx)
+    df["feature_atr_slope_norm"] = norm(
+        (atr - atr.shift(p["regime_atr_slope_period"]))
+        / atr.shift(p["regime_atr_slope_period"])
+    )
+    df["feature_rsi_vol_norm"] = 1 - norm(rsi.rolling(p["regime_rsi_vol_period"]).std())
+    df["feature_hurst"] = (
+        df.Close.rolling(p["regime_hurst_period"])
+        .apply(lambda x: compute_hurst(np.log(x + 1e-9)), raw=False)
+        .fillna(0.5)
+    )
+    df["feature_regime_score"] = (
+        df["feature_adx_norm"] * p["regime_score_weight_adx"]
+        + df["feature_atr_slope_norm"] * p["regime_score_weight_atr"]
+        + df["feature_rsi_vol_norm"] * p["regime_score_weight_rsi"]
+        + np.clip((df["feature_hurst"] - 0.3) / 0.7, 0, 1)
+        * p["regime_score_weight_hurst"]
+    )
+    return df
+
+
+def add_market_regime_features(df: pd.DataFrame) -> pd.DataFrame:
+    df["regime_score"] = df["feature_regime_score"]
+    df["trend_regime"] = np.where(
+        df["regime_score"] > STRATEGY_PARAMS["regime_score_threshold"], "趋势", "震荡"
+    )
+    df["market_regime"] = np.where(df["trend_regime"] == "趋势", 1, -1)
+    return df
+
+
+class UltimateStrategyCalculator:
+    """
+    这个类仅用于在回测前，一次性地计算所有需要的技术指标。
+    它不是一个可交易的策略，而是一个特征计算器。
+    """
+
+    def __init__(self, df: pd.DataFrame, symbol: str):
+        self.data = df.copy()
+        self.symbol = symbol
+        # 将策略参数加载到实例中
+        for key, value in STRATEGY_PARAMS.items():
+            setattr(self, key, value)
+
+    def compute_all_features(self, trader, kline_interval: str):
+        logger.debug(f"[{self.symbol}] 开始计算特征...")
+        # 确保数据完整性
+        self.data.dropna(
+            subset=["Open", "High", "Low", "Close", "Volume"], inplace=True
+        )
+        if len(self.data) < self.tf_donchian_period:
+            logger.warning(f"数据量过少({len(self.data)}条)，无法计算特征。")
+            return
+
+        # 计算所有需要的指标
+        self.data = add_ml_features_ported(self.data)
+        self.data = add_market_regime_features(self.data)
+
+        # 多时间框架(MTF)信号
+        # --- !!! 这里是修改点 !!! ---
+        if (
+            data_1d := trader.fetch_history_klines(
+                self.symbol, bar="1d", limit=self.mtf_period + 50
+            )
+        ) is not None and not data_1d.empty:
+            sma = ta.trend.SMAIndicator(
+                data_1d["Close"], window=self.mtf_period
+            ).sma_indicator()
+            mtf_signal_1d = pd.Series(
+                np.where(data_1d["Close"] > sma, 1, -1), index=data_1d.index
+            )
+            self.data["mtf_signal"] = mtf_signal_1d.reindex(
+                self.data.index, method="ffill"
+            ).fillna(0)
         else:
-            logger.error(f"获取 {s} 失败: {last_e}")
-            return pd.DataFrame()
-    if not all_d:
+            self.data["mtf_signal"] = 0  # 如果获取失败，则为中性信号
+
+        # 宏观趋势过滤
+        df_4h = self.data["Close"].resample("4H").last().to_frame()
+        df_4h["macro_ema"] = ta.trend.EMAIndicator(
+            df_4h["Close"], window=50
+        ).ema_indicator()
+        df_4h["macro_trend"] = np.where(df_4h["Close"] > df_4h["macro_ema"], 1, -1)
+        self.data["macro_trend_filter"] = (
+            df_4h["macro_trend"].reindex(self.data.index, method="ffill").fillna(0)
+        )
+
+        # 趋势跟随(TF)指标
+        self.data["tf_atr"] = ta.volatility.AverageTrueRange(
+            self.data.High, self.data.Low, self.data.Close, self.tf_atr_period
+        ).average_true_range()
+        self.data["tf_donchian_h"] = (
+            self.data.High.rolling(self.tf_donchian_period).max().shift(1)
+        )
+        self.data["tf_donchian_l"] = (
+            self.data.Low.rolling(self.tf_donchian_period).min().shift(1)
+        )
+        self.data["tf_ema_fast"] = ta.trend.EMAIndicator(
+            self.data.Close, self.tf_ema_fast_period
+        ).ema_indicator()
+        self.data["tf_ema_slow"] = ta.trend.EMAIndicator(
+            self.data.Close, self.tf_ema_slow_period
+        ).ema_indicator()
+
+        # 均值回归(MR)指标
+        bb = ta.volatility.BollingerBands(
+            self.data.Close, self.mr_bb_period, self.mr_bb_std
+        )
+        self.data["mr_bb_upper"] = bb.bollinger_hband()
+        self.data["mr_bb_lower"] = bb.bollinger_lband()
+        self.data["mr_bb_mid"] = bb.bollinger_mavg()
+        stoch_rsi = ta.momentum.StochRSIIndicator(
+            self.data.Close, window=14, smooth1=3, smooth2=3
+        )
+        self.data["mr_stoch_rsi_k"] = stoch_rsi.stochrsi_k()
+        self.data["mr_stoch_rsi_d"] = stoch_rsi.stochrsi_d()
+
+        # 清理数据
+        self.data.replace([np.inf, -np.inf], np.nan, inplace=True)
+        self.data.fillna(method="ffill", inplace=True)
+        self.data.dropna(inplace=True)  # 删除计算后仍然存在的NaN行
+        logger.debug(f"[{self.symbol}] 特征计算完成。")
+
+
+# --- 4. 数据获取函数 ---
+
+
+def fetch_binance_klines(symbol, interval, start_str, end_str=None, limit=1000):
+    if end_str is None:
+        end_str = pd.to_datetime("now", utc=True).strftime("%Y-%m-%d %H:%M:%S")
+
+    url = "https://api.binance.com/api/v3/klines"
+    cols = ["timestamp", "Open", "High", "Low", "Close", "Volume"]
+    start_ts = int(pd.to_datetime(start_str).timestamp() * 1000)
+    end_ts = int(pd.to_datetime(end_str).timestamp() * 1000)
+    all_data = []
+
+    logger.info(f"正在从币安获取 {symbol} 从 {start_str} 到 {end_str} 的K线数据...")
+
+    while start_ts < end_ts:
+        params = {
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "startTime": start_ts,
+            "limit": limit,
+        }
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            if not data:
+                break
+            all_data.extend(data)
+            start_ts = data[-1][0] + 1
+        except requests.exceptions.RequestException as e:
+            logger.error(f"获取数据失败: {e}")
+            time.sleep(5)
+
+    if not all_data:
+        logger.warning(f"未能获取到 {symbol} 的任何数据。")
         return pd.DataFrame()
-    df = pd.DataFrame(all_d, columns=cols)[
-        ["timestamp", "Open", "High", "Low", "Close", "Volume"]
+
+    df = pd.DataFrame(all_data, columns=[*cols, "c1", "c2", "c3", "c4", "c5", "c6"])[
+        cols
     ].copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     for col in df.columns[1:]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    logger.info(f"✅ 获取 {s} 数据成功: {len(df)} 条")
+
+    logger.info(f"✅ 成功获取 {len(df)} 条 {symbol} 的K线数据")
     return df.set_index("timestamp").sort_index()
 
 
-def get_market_structure_features(df, order=5):
-    df = df.copy()
-    high_peaks_idx, _ = find_peaks(
-        df["High"], distance=order, prominence=df["High"].std() * 0.5
-    )
-    low_peaks_idx, _ = find_peaks(
-        -df["Low"], distance=order, prominence=df["Low"].std() * 0.5
-    )
-    df["swing_high_price"], df["swing_low_price"] = np.nan, np.nan
-    df.iloc[high_peaks_idx, df.columns.get_loc("swing_high_price")] = df.iloc[
-        high_peaks_idx
-    ]["High"]
-    df.iloc[low_peaks_idx, df.columns.get_loc("swing_low_price")] = df.iloc[
-        low_peaks_idx
-    ]["Low"]
-    df["swing_high_price"], df["swing_low_price"] = (
-        df["swing_high_price"].ffill(),
-        df["swing_low_price"].ffill(),
-    )
-    df["is_uptrend"] = (
-        (df["swing_high_price"] > df["swing_high_price"].shift(1))
-        & (df["swing_low_price"] > df["swing_low_price"].shift(1))
-    ).astype(int)
-    df["is_downtrend"] = (
-        (df["swing_high_price"] < df["swing_high_price"].shift(1))
-        & (df["swing_low_price"] < df["swing_low_price"].shift(1))
-    ).astype(int)
-    df["market_structure"] = df["is_uptrend"] - df["is_downtrend"]
-    return df[["market_structure"]]
+# --- 5. Backtesting.py 策略集成 ---
 
 
-def feature_engineering_v3(df_in):
-    df = df_in.copy()
-    df["RSI_14"] = ta.momentum.RSIIndicator(close=df["Close"], window=14).rsi()
-    macd_indicator = ta.trend.MACD(
-        close=df["Close"], window_fast=12, window_slow=26, window_sign=9
-    )
-    df["MACD_12_26_9"], df["MACDs_12_26_9"], df["MACDh_12_26_9"] = (
-        macd_indicator.macd(),
-        macd_indicator.macd_signal(),
-        macd_indicator.macd_diff(),
-    )
-    bb_indicator = ta.volatility.BollingerBands(
-        close=df["Close"], window=20, window_dev=2
-    )
-    (
-        df["BBL_20_2.0"],
-        df["BBM_20_2.0"],
-        df["BBU_20_2.0"],
-        df["BBB_20_2.0"],
-        df["BBP_20_2.0"],
-    ) = (
-        bb_indicator.bollinger_lband(),
-        bb_indicator.bollinger_mavg(),
-        bb_indicator.bollinger_hband(),
-        bb_indicator.bollinger_wband(),
-        bb_indicator.bollinger_pband(),
-    )
-    adx_indicator = ta.trend.ADXIndicator(
-        high=df["High"], low=df["Low"], close=df["Close"], window=14
-    )
-    df["ADX_14"], df["DMP_14"], df["DMN_14"] = (
-        adx_indicator.adx(),
-        adx_indicator.adx_pos(),
-        adx_indicator.adx_neg(),
-    )
-    df["volatility"] = (
-        (np.log(df["Close"] / df["Close"].shift(1))).rolling(window=20).std()
-    )
-    market_structure_df = get_market_structure_features(df)
-    macd_long_indicator = ta.trend.MACD(
-        close=df["Close"], window_fast=24, window_slow=52, window_sign=18
-    )
-    df["MACD_long"], df["MACDh_long"], df["MACDs_long"] = (
-        macd_long_indicator.macd(),
-        macd_long_indicator.macd_diff(),
-        macd_long_indicator.macd_signal(),
-    )
-    all_features_df = df.drop(columns=["Open", "High", "Low", "Close", "Volume"])
-    all_features_df = pd.concat([all_features_df, market_structure_df], axis=1)
-    all_features_df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    return all_features_df
-
-
-def generate_v3_ml_predictions(
-    df_with_ohlcv: pd.DataFrame,
-    model_path: str,
-    scaler_path: str,
-    orig_cols_path: str,
-    flat_cols_path: str,
-    seq_len: int,
-    log_prefix: str = "[V3 MODEL]",
-) -> pd.Series:
-    logger.info(f"--- {log_prefix} 开始生成ML预测 ---")
-    if not all(
-        os.path.exists(p)
-        for p in [model_path, scaler_path, orig_cols_path, flat_cols_path]
-    ):
-        logger.warning(f"{log_prefix} 缺少模型文件，ML预测将为0。")
-        return pd.Series(0, index=df_with_ohlcv.index)
-    try:
-        model, scaler, original_columns, flattened_columns = (
-            joblib.load(model_path),
-            joblib.load(scaler_path),
-            joblib.load(orig_cols_path),
-            joblib.load(flat_cols_path),
-        )
-        features_df = feature_engineering_v3(df_with_ohlcv).dropna()
-        features_aligned = features_df.reindex(columns=original_columns, fill_value=0)
-        scaled_features = scaler.transform(features_aligned)
-        predictions = []
-        for i in range(seq_len, len(scaled_features)):
-            input_sequence = (
-                scaled_features[i - seq_len : i, :].flatten().reshape(1, -1)
-            )
-            input_df = pd.DataFrame(input_sequence, columns=flattened_columns)
-            pred_prob = model.predict_proba(input_df)[0][1]
-            predictions.append(pred_prob)
-        prediction_index = features_aligned.index[seq_len:]
-        final_probs = pd.Series(predictions, index=prediction_index)
-        logger.info(f"--- {log_prefix} ML预测生成完毕 ---")
-        return final_probs.reindex(df_with_ohlcv.index, fill_value=0)
-    except Exception as e:
-        logger.error(f"{log_prefix} 生成ML预测时出错: {e}", exc_info=True)
-        return pd.Series(0, index=df_with_ohlcv.index)
-
-
-
-
-def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    df = data_in.copy()
-    logger.info(
-        f"[{symbol}] 开始数据预处理 (数据范围: {df.index.min()} to {df.index.max()})..."
-    )
-
-    # 仅生成 15m 模型信号
-    df["v3_ml_prob_15m"] = generate_v3_ml_predictions(
-        df,
-        V3_ML_MODEL_15M_PATH,
-        V3_ML_SCALER_15M_PATH,
-        V3_ML_FEATURE_COLUMNS_15M_PATH,
-        V3_ML_FLATTENED_COLUMNS_15M_PATH,
-        V3_ML_SEQUENCE_LENGTH_15M,
-        log_prefix="[V3 MODEL 15M]",
-    )
-    df["v3_ml_signal_15m"] = (df["v3_ml_prob_15m"] > V3_ML_THRESHOLD_15M).astype(int)
-
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.dropna(inplace=True)
-    logger.info(f"[{symbol}] 数据预处理完成。数据行数: {len(df)}")
-    return df
-
-
-TREND_CONFIG = {"look_forward_steps": 5, "ema_length": 8}
-
-
-def analyze_v3_standalone_performance(df: pd.DataFrame, signal_col="v3_ml_signal_15m"):
-    print(f"\n{'-'*40}\n       V3 高精度模型独立表现分析 ({signal_col}) \n{'-'*40}")
-    required_cols = [signal_col, "Close"]
-    if not all(col in df.columns for col in required_cols):
-        print(f"缺少必要列 {signal_col}，无法分析。")
-        return
-    look_forward_steps, ema_length = (
-        TREND_CONFIG["look_forward_steps"],
-        TREND_CONFIG["ema_length"],
-    )
-    n = len(df)
-    df_reset = df.reset_index(drop=True)
-    df_reset[f"EMA_{ema_length}"] = pta.ema(close=df_reset["Close"], length=ema_length)
-    macd_result = pta.macd(close=df_reset["Close"], fast=24, slow=52, signal=18)
-    df_reset["MACD_long"], df_reset["MACDs_long"] = (
-        macd_result["MACD_24_52_18"],
-        macd_result["MACDs_24_52_18"],
-    )
-    valid_mask = (
-        (df_reset.index <= n - look_forward_steps - 1)
-        & (df_reset[signal_col] == 1)
-        & (df_reset["MACD_long"] > df_reset["MACDs_long"])
-        & (df_reset["MACD_long"] > 0)
-    )
-    trade_signals = df_reset[valid_mask].copy()
-    if trade_signals.empty:
-        print("无有效信号（可能因MACD过滤或边界限制）。")
-        return
-    total_trades = len(trade_signals)
-    current_ema = trade_signals[f"EMA_{ema_length}"]
-    future_ema = df_reset.loc[
-        trade_signals.index + look_forward_steps, f"EMA_{ema_length}"
-    ].values
-    wins = (future_ema > current_ema).sum()
-    win_rate = (wins / total_trades) * 100
-    entry_price = trade_signals["Close"]
-    exit_price = df_reset.loc[trade_signals.index + look_forward_steps, "Close"].values
-    price_returns = (exit_price - entry_price) / entry_price
-    avg_price_return, cum_price_return = (
-        price_returns.mean() * 100,
-        price_returns.sum() * 100,
-    )
-    print(f"有效信号总数（含MACD过滤，可观测{look_forward_steps}步）: {total_trades}")
-    print(f"✅ 胜率（EMA趋势上涨，与训练目标一致）: {win_rate:.2f}%")
-    print(f"📊 平均价格回报率（实际盈亏参考）: {avg_price_return:.4f}%")
-    print(f"📈 累计价格回报率: {cum_price_return:.2f}%")
-    print(f"{'-'*40}")
-
-
-# --- 策略定义 ---
-class UltimateStrategy(Strategy):
-    symbol = None
+class UltimateBacktestStrategy(Strategy):
+    """
+    这是与 `backtesting.py` 库兼容的策略封装类。
+    """
 
     def init(self):
-        for k, v in STRATEGY_PARAMS.items():
-            setattr(self, k, v)
-        c, h, l = (
-            pd.Series(self.data.Close),
-            pd.Series(self.data.High),
-            pd.Series(self.data.Low),
+        # 将预先计算好的指标作为 `self.I` 注册，以便在图表中查看
+        self.market_regime = self.I(
+            lambda x: self.data.market_regime, self.data.Close, name="Market_Regime"
+        )
+        self.macro_trend_filter = self.I(
+            lambda x: self.data.macro_trend_filter, self.data.Close, name="Macro_Trend"
+        )
+        self.tf_donchian_h = self.I(
+            lambda x: self.data.tf_donchian_h, self.data.Close, name="Donchian_H"
+        )
+        self.tf_donchian_l = self.I(
+            lambda x: self.data.tf_donchian_l, self.data.Close, name="Donchian_L"
+        )
+        self.mr_bb_upper = self.I(
+            lambda x: self.data.mr_bb_upper, self.data.Close, name="BB_Upper"
+        )
+        self.mr_bb_lower = self.I(
+            lambda x: self.data.mr_bb_lower, self.data.Close, name="BB_Lower"
         )
 
-        self.v3_ml_signal_15m = self.I(lambda: self.data.v3_ml_signal_15m)
-        self.v3_ml_prob_15m = self.I(lambda: self.data.v3_ml_prob_15m)
-        # 与训练/评估一致的长周期 MACD 过滤器 (24, 52, 18)
-        self.macd_long = self.I(
-            lambda: ta.trend.MACD(
-                close=c, window_fast=24, window_slow=52, window_sign=18
-            ).macd()
-        )
-        self.macds_long = self.I(
-            lambda: ta.trend.MACD(
-                close=c, window_fast=24, window_slow=52, window_sign=18
-            ).macd_signal()
-        )
-        # 固定持仓最大K线数（与训练目标5根相近，这里取6根）
-        self.max_hold_bars = 6
+        # 存储策略参数
+        self.p = STRATEGY_PARAMS
+        self.score_threshold = self.p["score_entry_threshold"]
+        self.sl_atr_mult_tf = self.p["tf_stop_loss_atr_multiplier"]
+        self.sl_atr_mult_mr = self.p["mr_stop_loss_atr_multiplier"]
 
     def next(self):
+        # 获取当前K线的价格和指标
         price = self.data.Close[-1]
-        current_bar = len(self.data) - 1
+        atr = self.data.tf_atr[-1]
 
-        # ① 入场条件去掉长周期 MACD 过滤，仅使用模型信号
-        entry_signal = self.v3_ml_signal_15m[-1] > 0
-        # 改动 1：离场条件改为趋势转弱或概率显著走低
-        exit_signal = (
-            (self.macd_long[-1] < self.macds_long[-1])
-            or (self.v3_ml_prob_15m[-1] < 0.15)
-        )
-
-        # 管理持仓的移动止盈/止损
-        if self.position and self.position.is_long:
-            # ② 移动止损改为 ATR 动态波动止损
-            if not hasattr(self, "highest_since_entry") or self.highest_since_entry is None:
-                self.highest_since_entry = self.data.Close[-1]
-            self.highest_since_entry = max(self.highest_since_entry, price)
-            atr_val = ta.volatility.AverageTrueRange(
-                self.data.High, self.data.Low, self.data.Close, window=14
-            ).average_true_range()[-1]
-            trailing_sl = self.highest_since_entry - 1.8 * atr_val
-            if price <= trailing_sl:
-                self.close_all_positions("ATR Trailing Stop")
-
-            # ③ 固定持仓时间退出：达到最大持仓K线数则平仓
-            if hasattr(self, "entry_bar") and self.entry_bar is not None:
-                if current_bar - self.entry_bar >= self.max_hold_bars:
-                    self.close_all_positions("Time-based exit")
-
+        # --- 入场逻辑 ---
         if not self.position:
-            if entry_signal:
-                self.open_dynamic_position(price, current_bar)
-        elif self.position.is_long:
-            if exit_signal:
-                self.close_all_positions("趋势转弱/概率走低")
+            action = None
 
-    def get_confidence_factor(self, probability: float) -> float:
-        if probability > 0.65:
-            return 2.0
-        elif probability > 0.55:
-            return 1.5
-        elif probability > 0.45:
-            return 1.0
-        else:
-            return 0.5
+            # 趋势跟随 (TF) 逻辑
+            if self.market_regime[-1] == 1:  # 趋势市场
+                score = self._calculate_entry_score()
+                if self.macro_trend_filter[-1] == 1 and score > self.score_threshold:
+                    action = "BUY_TF"
+                elif (
+                    self.macro_trend_filter[-1] == -1 and score < -self.score_threshold
+                ):
+                    action = "SELL_TF"
 
-    def open_dynamic_position(self, price: float, current_bar: int):
-        probability = float(self.v3_ml_prob_15m[-1])
-        # 改动 3：更激进的仓位放大策略
-        if probability < 0.40:
-            return  # 不开仓
-        elif probability < 0.55:
-            invest_pct = 0.01
-        elif probability < 0.65:
-            invest_pct = 0.03
-        else:
-            # 0.65 起步 8%，到 0.85 线性放大至 12%
-            invest_pct = 0.08 + 0.04 * max(0.0, min(1.0, (probability - 0.65) / 0.20))
-        size = int((self.equity * invest_pct) / price)
-        if size > 0:
-            # 下单，不设固定TP，改为ATR追踪+时间退出
-            self.buy(size=size)
-            self.entry_price = price
-            self.highest_since_entry = price
-            self.entry_bar = current_bar
+            # 均值回归 (MR) 逻辑
+            elif self.market_regime[-1] == -1:  # 震荡市场
+                mr_signal = self._define_mr_entry_signal()
+                if self.macro_trend_filter[-1] == 1 and mr_signal == 1:
+                    action = "BUY_MR"
+                elif self.macro_trend_filter[-1] == -1 and mr_signal == -1:
+                    action = "SELL_MR"
 
-    def close_all_positions(self, reason: str):
-        """关闭所有仓位"""
-        if self.position:
-            self.position.close()
-            # 重置移动止盈相关状态
-            self.highest_since_entry = None
-            self.entry_bar = None
-    def _calculate_position_size(self, price, risk_per_share, risk_pct):
-        if risk_per_share <= 0 or price <= 0 or risk_pct <= 0:
-            return 0
-        return int((self.equity * risk_pct) / risk_per_share)
-
-
-# --- 阈值网格搜索 ---
-def _metric_from_stats(stats, metric: str):
-    try:
-        if metric == "sharpe":
-            val = stats.get("Sharpe Ratio", np.nan)
-            if val is None:
-                val = np.nan
-            return float(val)
-        elif metric == "return":
-            return float(stats.get("Return [%]", np.nan))
-    except Exception:
-        return np.nan
-    return np.nan
-
-
-def run_backtest_with_threshold(data: pd.DataFrame, symbol: str, threshold: float):
-    df = data.copy()
-    # 使用给定阈值生成信号
-    df["v3_ml_signal_15m"] = (df["v3_ml_prob_15m"] > threshold).astype(int)
-    bt = Backtest(
-        df,
-        UltimateStrategy,
-        cash=CONFIG["initial_cash"],
-        commission=CONFIG["commission"],
-        margin=CONFIG["spread"] / 2,
-        finalize_trades=True,
-    )
-    stats = bt.run(symbol=symbol)
-    return stats
-
-
-def grid_search_threshold(processed_backtest_data: dict, thresholds: list, metric: str):
-    results = {}
-    best_thr, best_score = None, -np.inf
-    for thr in thresholds:
-        per_symbol_scores = {}
-        per_symbol_stats = {}
-        for symbol, data in processed_backtest_data.items():
-            if data.empty:
-                continue
-            stats = run_backtest_with_threshold(data, symbol, thr)
-            score = _metric_from_stats(stats, metric)
-            # 若主指标无效，用收益率兜底
-            if not np.isfinite(score):
-                score = _metric_from_stats(stats, "return")
-            per_symbol_scores[symbol] = score if np.isfinite(score) else -np.inf
-            per_symbol_stats[symbol] = stats
-        # 汇总分数（平均）
-        valid_scores = [s for s in per_symbol_scores.values() if np.isfinite(s)]
-        agg = np.mean(valid_scores) if valid_scores else -np.inf
-        results[thr] = {"aggregate": agg, "scores": per_symbol_scores, "stats": per_symbol_stats}
-        if agg > best_score:
-            best_thr, best_score = thr, agg
-    return best_thr, best_score, results
-
-# --- 主程序入口 ---
-if __name__ == "__main__":
-    logger.info(f"🚀 简化版策略 - 仅使用15M模型 开始运行...")
-    backtest_start_dt = pd.to_datetime(CONFIG["backtest_start_date"])
-    data_fetch_start_date_str = (
-        backtest_start_dt - pd.Timedelta(days=365 * 2)
-    ).strftime("%Y-%m-%d")
-    if CONFIG["enable_ml_component"]:
-        training_window = timedelta(days=CONFIG["training_window_days"])
-        data_fetch_start_date_str = (backtest_start_dt - training_window).strftime(
-            "%Y-%m-%d"
-        )
-
-    logger.info(
-        f"回测时间段: {CONFIG['backtest_start_date']} to {CONFIG['backtest_end_date']}"
-    )
-    logger.info(f"数据获取起始日期 (包含训练窗口): {data_fetch_start_date_str}")
-    raw_data = {
-        s: fetch_binance_klines(
-            s,
-            CONFIG["interval"],
-            data_fetch_start_date_str,
-            CONFIG["backtest_end_date"],
-        )
-        for s in CONFIG["symbols_to_test"]
-    }
-    if not any(not df.empty for df in raw_data.values()):
-        logger.error("所有品种数据获取失败，程序终止。")
-        exit()
-
-    logger.info("### 模式: 跳过动态训练，使用静态模型进行回测 ###")
-    logger.info(f"### 准备完整回测数据 ###")
-    processed_backtest_data = {}
-    for symbol, data in raw_data.items():
-        if data.empty:
-            continue
-        logger.info(f"为 {symbol} 预处理完整时段数据...")
-        full_processed_data = preprocess_data_for_strategy(data, symbol)
-        backtest_slice = full_processed_data.loc[CONFIG["backtest_start_date"] :].copy()
-        if not backtest_slice.empty:
-            processed_backtest_data[symbol] = backtest_slice
-
-    if not processed_backtest_data:
-        logger.error("无回测数据，程序终止。")
-        exit()
-
-    # --- 阈值网格搜索 ---
-    ts_cfg = CONFIG.get("threshold_search", {})
-    if ts_cfg.get("enabled", False):
-        logger.info("### 启用阈值网格搜索 ###")
-        if ts_cfg.get("grid"):
-            thresholds = [float(x) for x in ts_cfg["grid"]]
-        else:
-            thresholds = [round(x, 3) for x in np.arange(0.25, 0.651, 0.025)]
-        metric = ts_cfg.get("metric", "sharpe").lower()
-        best_thr, best_score, grid_results = grid_search_threshold(
-            processed_backtest_data, thresholds, metric
-        )
-        print(f"\n{'#'*80}\n阈值网格搜索结果 (metric={metric})\n{'#'*80}")
-        for thr in thresholds:
-            agg = grid_results[thr]["aggregate"]
-            print(f"  阈值={thr:.3f} -> 综合得分={agg:.4f}")
-        print(f"\n>>> 最佳阈值: {best_thr:.3f}, 综合得分={best_score:.4f}")
-
-        if ts_cfg.get("rerun_with_best", True):
-            logger.info(f"### 使用最佳阈值 {best_thr:.3f} 进行最终回测 ###")
-            all_stats = {}
-            for symbol, data in processed_backtest_data.items():
-                print(f"\n{'='*80}\n正在回测品种: {symbol} (best_thr={best_thr:.3f})\n{'='*80}")
-                final_stats = run_backtest_with_threshold(data, symbol, best_thr)
-                all_stats[symbol] = final_stats
-                print(f"\n{'-'*40}\n          {symbol} 回测结果摘要\n{'-'*40}")
-                print(final_stats)
-                if CONFIG["show_plots"]:
-                    # 生成包含最佳阈值信号的数据用于绘图
-                    plot_df = data.copy()
-                    plot_df["v3_ml_signal_15m"] = (
-                        plot_df["v3_ml_prob_15m"] > best_thr
-                    ).astype(int)
-                    Backtest(
-                        plot_df,
-                        UltimateStrategy,
-                        cash=CONFIG["initial_cash"],
-                        commission=CONFIG["commission"],
-                        margin=CONFIG["spread"] / 2,
-                        finalize_trades=True,
-                    ).plot()
-            if all_stats:
-                initial_total = CONFIG["initial_cash"] * len(all_stats)
-                total_equity = sum(s["Equity Final [$]"] for s in all_stats.values())
-                ret = ((total_equity - initial_total) / initial_total) * 100
-                print(f"\n{'#'*80}\n                 组合策略表现总览 (best_thr={best_thr:.3f})\n{'#'*80}")
-                for symbol, stats in all_stats.items():
-                    print(
-                        f"  - {symbol}:\n    - 最终权益: ${stats['Equity Final [$]']:,.2f} (回报率: {stats['Return [%]']:.2f}%)\n    - 最大回撤: {stats['Max. Drawdown [%]']:.2f}%\n    - 夏普比率: {stats.get('Sharpe Ratio', 'N/A')}"
-                    )
-                print(
-                    f"\n--- 投资组合整体表现 ---\n总初始资金: ${initial_total:,.2f}\n总最终权益: ${total_equity:,.2f}\n组合总回报率: {ret:.2f}%"
+            # 如果有交易信号，则执行
+            if action:
+                sl_atr_mult = (
+                    self.sl_atr_mult_tf if "TF" in action else self.sl_atr_mult_mr
                 )
-        else:
-            logger.info("### 网格搜索已完成，未启用最终回测 ###")
-    else:
-        logger.info(f"### 进入回测模式 ###")
-        all_stats = {}
-        for symbol, data in processed_backtest_data.items():
-            print(f"\n{'='*80}\n正在回测品种: {symbol}\n{'='*80}")
-            bt = Backtest(
-                data,
-                UltimateStrategy,
-                cash=CONFIG["initial_cash"],
-                commission=CONFIG["commission"],
-                margin=CONFIG["spread"] / 2,
-                finalize_trades=True,
-            )
-            stats = bt.run(symbol=symbol)
-            all_stats[symbol] = stats
-            print(f"\n{'-'*40}\n          {symbol} 回测结果摘要\n{'-'*40}")
-            print(stats)
-            
-            # --- 模型独立表现分析 ---
-            analyze_v3_standalone_performance(data, signal_col="v3_ml_signal_15m")
-            
-            if CONFIG["show_plots"]:
-                bt.plot()
+                stop_loss_dist = atr * sl_atr_mult
 
-    if all_stats:
-        initial_total = CONFIG["initial_cash"] * len(all_stats)
-        total_equity = sum(stats["Equity Final [$]"] for stats in all_stats.values())
-        ret = ((total_equity - initial_total) / initial_total) * 100
-        print(f"\n{'#'*80}\n                 组合策略表现总览\n{'#'*80}")
-        for symbol, stats in all_stats.items():
-            print(
-                f"  - {symbol}:\n    - 最终权益: ${stats['Equity Final [$]']:,.2f} (回报率: {stats['Return [%]']:.2f}%)\n    - 最大回撤: {stats['Max. Drawdown [%]']:.2f}%\n    - 夏普比率: {stats.get('Sharpe Ratio', 'N/A')}"
-            )
-        print(
-            f"\n--- 投资组合整体表现 ---\n总初始资金: ${initial_total:,.2f}\n总最终权益: ${total_equity:,.2f}\n组合总回报率: {ret:.2f}%"
+                if "BUY" in action:
+                    self.buy(sl=price - stop_loss_dist, size=0.95)  # 使用95%的资金开仓
+                elif "SELL" in action:
+                    self.sell(sl=price + stop_loss_dist, size=0.95)
+
+        # --- 出场逻辑 ---
+        # 初始止损已在 self.buy/sell 中设置。
+        # 这里可以添加更复杂的出场逻辑，例如均值回归的目标止盈。
+        else:
+            if self.position.is_long and self.data.Close[-1] >= self.data.mr_bb_mid[-1]:
+                self.position.close()
+            elif (
+                self.position.is_short
+                and self.data.Close[-1] <= self.data.mr_bb_mid[-1]
+            ):
+                self.position.close()
+
+    # 策略内部的辅助计算函数
+    def _calculate_entry_score(self):
+        w = self.p["score_weights_tf"]
+        last = self.data
+
+        b_s = (
+            1
+            if last.High[-1] > self.tf_donchian_h[-1]
+            else -1 if last.Low[-1] < self.tf_donchian_l[-1] else 0
         )
+        # 使用已在数据中预计算的 EMA 列，避免访问未注册的属性
+        mo_s = 1 if last.tf_ema_fast[-1] > last.tf_ema_slow[-1] else -1
+
+        # 在回测中简化ML信号
+        ml_score, adv_ml_score = 0, 0
+
+        score = (
+            b_s * w.get("breakout", 0)
+            + mo_s * w.get("momentum", 0)
+            + last.mtf_signal[-1] * w.get("mtf", 0)
+            + ml_score * w.get("ml", 0)
+            + adv_ml_score * w.get("advanced_ml", 0)
+        )
+        return score
+
+    def _define_mr_entry_signal(self):
+        # 使用属性访问来获取当前和前一个 K 线的数据
+        last_close, prev_close = self.data.Close[-1], self.data.Close[-2]
+        last_k, last_d = self.data.mr_stoch_rsi_k[-1], self.data.mr_stoch_rsi_d[-1]
+        prev_k, prev_d = self.data.mr_stoch_rsi_k[-2], self.data.mr_stoch_rsi_d[-2]
+        bb_lower, bb_upper = (
+            self.data.mr_bb_lower,
+            self.data.mr_bb_upper,
+        )  # 获取布林带上下轨
+
+        # 定义买入信号
+        if (
+            prev_close < bb_lower[-2]
+            and last_close > bb_lower[-1]
+            and last_k > last_d
+            and prev_k <= prev_d
+            and last_k < 40
+        ):
+            return 1  # 买入信号
+
+        # 定义卖出信号
+        if (
+            prev_close > bb_upper[-2]
+            and last_close < bb_upper[-1]
+            and last_k < last_d
+            and prev_k >= prev_d
+            and last_k > 60
+        ):
+            return -1  # 卖出信号
+
+        return 0  # 无信号
+
+
+# --- 6. 主执行程序 ---
+if __name__ == "__main__":
+    # 步骤 1: 获取历史数据
+    data_df = fetch_binance_klines(SYMBOL, INTERVAL, START_DATE, END_DATE)
+
+    if not data_df.empty:
+        # 步骤 2: 预先计算所有策略指标
+        logger.info("正在预计算所有策略指标...")
+
+        # 创建一个模拟的'trader'对象，以满足特征计算函数的需求
+        class MockTrader:
+            def fetch_history_klines(self, symbol, bar, limit):
+                # 为MTF指标获取真实日线数据
+                return fetch_binance_klines(symbol, bar, START_DATE, END_DATE, limit)
+
+        # 使用计算器类来生成带有所有指标的DataFrame
+        calculator = UltimateStrategyCalculator(df=data_df.copy(), symbol=SYMBOL)
+        calculator.compute_all_features(trader=MockTrader(), kline_interval=INTERVAL)
+        augmented_df = calculator.data
+
+        # 步骤 3: 设置并运行回测
+        logger.info("设置并运行回测...")
+        bt = Backtest(
+            augmented_df,
+            UltimateBacktestStrategy,
+            cash=INITIAL_CASH,
+            commission=COMMISSION,
+            trade_on_close=True,
+        )
+
+        stats = bt.run()
+
+        # 步骤 4: 打印结果并生成图表
+        logger.info("回测完成，输出结果:")
+        print(stats)
