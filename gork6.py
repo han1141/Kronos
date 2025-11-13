@@ -75,11 +75,11 @@ set_chinese_font()
 # --- 核心配置 --- "BTCUSDT"
 CONFIG = {
     "symbols_to_test": ["ETHUSDT"],
-    "interval": "30m",
-    "backtest_start_date": "2025-01-01",
-    "backtest_end_date": "2025-08-14",
+    "interval": "15m",
+    "backtest_start_date": "2024-01-01",
+    "backtest_end_date": "2024-11-11",
     "initial_cash": 500_000,
-    "commission": 0.0002,
+    "commission": 0.0075,
     "spread": 0.0005,
     "show_plots": False,
     "training_window_days": 365 * 2,

@@ -39,6 +39,37 @@ RANGE_ADX_PERIOD = 14
 RANGE_ADX_THRESHOLD = 20.0
 RANGE_CONFIRM_BARS = 3
 
+# Scaling config
+# - "global": single scaler fit on train, applied to val/test (simpler, may leak across train time)
+# - "rolling": causal rolling min-max using only past W bars (recommended for deployment)
+SCALING_MODE = "rolling"
+ROLLING_SCALER_WINDOW = 500  # bars
+
+# Dynamic ADX thresholding (optional). If enabled, use rolling quantile as threshold.
+DYNAMIC_ADX = False
+DYNAMIC_ADX_WINDOW_BARS = 96 * 90  # approx 90 days for 15m bars
+DYNAMIC_ADX_QUANTILE = 0.30
+
+# Labeling mode: use composite signals beyond ADX
+LABEL_MODE = "composite"  # options: "adx", "composite"
+
+# Composite label components and thresholds
+COMPOSITE_USE_ADX = True
+COMPOSITE_USE_CHOP = True
+COMPOSITE_USE_DONCH_NO_BREAK = True
+COMPOSITE_USE_BB_CENTER = True
+COMPOSITE_MIN_VOTES = 2  # number of components that must agree on range
+
+# CHOP settings
+CHOP_PERIOD = 14
+CHOP_DYNAMIC = True
+CHOP_DYNAMIC_QUANTILE = 0.70
+CHOP_STATIC_THRESHOLD = 61.8
+
+# Donchian/BB settings
+DONCHIAN_WINDOW = 20
+BB_CENTER_TOLERANCE = 0.30  # fraction of band width from center
+
 MODELS_DIR = "models"
 DATA_DIR = "data"
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -165,6 +196,34 @@ def _compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int 
     return adx
 
 
+def _rolling_vwap(price: pd.Series, volume: pd.Series, window: int = 20) -> pd.Series:
+    pv = price * volume
+    vwap = pv.rolling(window=window, min_periods=window).sum() / (
+        volume.rolling(window=window, min_periods=window).sum() + 1e-14
+    )
+    vwap.name = f"VWAP_{window}"
+    return vwap
+
+
+def _compute_choppiness(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Choppiness Index (CHOP). Higher => more range-bound.
+    CHOP = 100 * log10( sum(TR_n) / (HH_n - LL_n) ) / log10(n)
+    Uses causal rolling sums with min_periods=period.
+    """
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    tr_sum = tr.rolling(window=period, min_periods=period).sum()
+    hh = high.rolling(window=period, min_periods=period).max()
+    ll = low.rolling(window=period, min_periods=period).min()
+    denom = (hh - ll).replace(0, np.nan)
+    chop = 100 * np.log10((tr_sum / (denom + 1e-14)).clip(lower=1e-14)) / np.log10(period)
+    chop.name = f"CHOP_{period}"
+    return chop
+
+
 def feature_engineering(df):
     df = df.copy()
 
@@ -193,6 +252,33 @@ def feature_engineering(df):
         df[bbu.name] = bbu
         df[bbl.name] = bbl
         df["ADX_14"] = _compute_adx(df["High"], df["Low"], df["Close"], 14)
+
+    # Additional hand-crafted features (causal, no future info)
+    # - Multi-scale RSI captures different momentum horizons
+    df["RSI_7"] = _compute_rsi(df["Close"], 7)
+    df["RSI_28"] = _compute_rsi(df["Close"], 28)
+    # - Choppiness Index
+    df["CHOP_14"] = _compute_choppiness(df["High"], df["Low"], df["Close"], 14)
+    df["CHOP_28"] = _compute_choppiness(df["High"], df["Low"], df["Close"], 28)
+    # - Bollinger bandwidth (relative width)
+    if {"BBU_20_2", "BBL_20_2", "BBM_20_2"}.issubset(df.columns):
+        bb_width = (df["BBU_20_2"] - df["BBL_20_2"]) / (df["BBM_20_2"].abs() + 1e-14)
+        df["BB_width_20_2"] = bb_width
+    # - Volume features
+    df["Vol_MA20"] = df["Volume"].rolling(window=20, min_periods=20).mean()
+    df["Vol_MA_Ratio"] = df["Volume"] / (df["Vol_MA20"] + 1e-14)
+    # - Donchian channel (20) position
+    donch_hi = df["High"].rolling(window=20, min_periods=20).max()
+    donch_lo = df["Low"].rolling(window=20, min_periods=20).min()
+    df["Donch_pos_20"] = (df["Close"] - donch_lo) / ((donch_hi - donch_lo) + 1e-14)
+    # - Rolling VWAP deviation (20)
+    vwap20 = _rolling_vwap(df["Close"], df["Volume"], window=20)
+    df["VWAP_dev_20"] = (df["Close"] - vwap20) / (vwap20.abs() + 1e-14)
+    # - Realized volatility (multi-scale)
+    ret = np.log(df["Close"]).diff()
+    df["rv_5"] = ret.rolling(5, min_periods=5).std()
+    df["rv_20"] = ret.rolling(20, min_periods=20).std()
+    df["rv_60"] = ret.rolling(60, min_periods=60).std()
 
     df["volatility"] = (np.log(df["Close"] / df["Close"].shift(1))).rolling(20).std()
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -240,16 +326,91 @@ def create_ranging_labels(
     """
     Create binary labels indicating range-bound (1) vs trending (0) market.
     Label rules:
-      - Compute ADX on OHLC.
-      - If ADX < threshold for 'confirm_bars' consecutive bars => Ranging (1), else Trending (0).
+      - Compute ADX on OHLC using a causal EWM-based formulation (no future leak).
+      - Base flag: ADX < threshold.
+      - If dynamic thresholding is enabled, the threshold is the rolling quantile
+        over the past window (bars), e.g., 30% quantile over ~90 days.
+      - Confirmation: require 'confirm_bars' consecutive bars to satisfy the flag.
+    Notes:
+      - Labels reflect information available at time t.
+      - For forecasting future regimes, shift labels as needed by the user.
     """
     df = df.copy()
+
+    # 1) ADX-based range flag (low ADX -> range)
     adx = _compute_adx(df["High"], df["Low"], df["Close"], adx_period)
-    # 为避免未来信息泄漏，默认不使用 rolling 确认
-    # 如需滚动确认，应将标签向前 shift(confirm_bars)，以对齐能被观测到的时刻
-    range_flag = (adx < adx_threshold).astype(int)
-    range_flag.name = "range_label"
-    return range_flag.dropna()
+    if DYNAMIC_ADX:
+        adx_thr = adx.rolling(
+            window=DYNAMIC_ADX_WINDOW_BARS,
+            min_periods=DYNAMIC_ADX_WINDOW_BARS,
+        ).quantile(DYNAMIC_ADX_QUANTILE)
+        adx_flag = adx < adx_thr
+    else:
+        adx_flag = adx < adx_threshold
+
+    if LABEL_MODE == "adx":
+        base_flag = adx_flag
+    else:
+        # 2) Choppiness high -> range
+        chop = _compute_choppiness(df["High"], df["Low"], df["Close"], CHOP_PERIOD)
+        if CHOP_DYNAMIC:
+            chop_thr = chop.rolling(
+                window=DYNAMIC_ADX_WINDOW_BARS,
+                min_periods=DYNAMIC_ADX_WINDOW_BARS,
+            ).quantile(CHOP_DYNAMIC_QUANTILE)
+            chop_flag = chop > chop_thr
+        else:
+            chop_flag = chop > CHOP_STATIC_THRESHOLD
+
+        # 3) No Donchian breakout at current bar -> range
+        hh = df["High"].rolling(window=DONCHIAN_WINDOW, min_periods=DONCHIAN_WINDOW).max()
+        ll = df["Low"].rolling(window=DONCHIAN_WINDOW, min_periods=DONCHIAN_WINDOW).min()
+        up_break = df["Close"] >= hh
+        dn_break = df["Close"] <= ll
+        no_break_flag = ~(up_break | dn_break)
+
+        # 4) Price near Bollinger center (20, 2) -> range
+        mavg = df["Close"].rolling(window=20, min_periods=20).mean()
+        sdev = df["Close"].rolling(window=20, min_periods=20).std(ddof=0)
+        upper = mavg + 2.0 * sdev
+        lower = mavg - 2.0 * sdev
+        width = (upper - lower).replace(0, np.nan)
+        bb_center_dist = (df["Close"] - mavg).abs() / (width + 1e-14)
+        bb_center_flag = bb_center_dist <= BB_CENTER_TOLERANCE
+
+        flags = []
+        valids = []
+        if COMPOSITE_USE_ADX:
+            flags.append(adx_flag)
+            valids.append(adx_flag.notna())
+        if COMPOSITE_USE_CHOP:
+            flags.append(chop_flag)
+            valids.append(chop_flag.notna())
+        if COMPOSITE_USE_DONCH_NO_BREAK:
+            flags.append(no_break_flag)
+            valids.append(no_break_flag.notna())
+        if COMPOSITE_USE_BB_CENTER:
+            flags.append(bb_center_flag)
+            valids.append(bb_center_flag.notna())
+
+        # Vote and require all components valid for a label at time t
+        valid_mask = valids[0]
+        for v in valids[1:]:
+            valid_mask = valid_mask & v
+        vote_count = None
+        for f in flags:
+            f_i = f.astype(int)
+            vote_count = f_i if vote_count is None else (vote_count + f_i)
+        vote_count = vote_count.astype(float)
+        vote_count.loc[~valid_mask] = np.nan
+        base_flag = vote_count >= COMPOSITE_MIN_VOTES
+
+    # Confirmation by consecutive bars (causal). Ensure windows valid in the confirm span
+    window_valid = base_flag.notna().rolling(window=confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars)
+    window_range = base_flag.fillna(False).rolling(window=confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars)
+    confirmed = (window_valid & window_range).astype(int)
+    confirmed.name = "range_label"
+    return confirmed.dropna()
 
 
 # ================== SEQUENCE BUILDER ==================
@@ -259,6 +420,17 @@ def create_flattened_sequences(X, y, look_back):
         X_seq.append(X[i : i + look_back].flatten())
         y_seq.append(y[i + look_back])
     return np.array(X_seq), np.array(y_seq)
+
+
+def _rolling_minmax_scale_df(df: pd.DataFrame, window: int) -> pd.DataFrame:
+    """Causal rolling min-max scaling per feature using only past 'window' bars.
+    Returns a DataFrame with the same index/columns; rows prior to 'window' will be NaN.
+    """
+    roll_min = df.rolling(window=window, min_periods=window).min()
+    roll_max = df.rolling(window=window, min_periods=window).max()
+    denom = (roll_max - roll_min).replace(0, np.nan)
+    scaled = (df - roll_min) / (denom + 1e-14)
+    return scaled
 
 
 # ================== TRAIN ==================
@@ -276,21 +448,51 @@ def train_and_validate(train_df, val_df):
     X_train_aligned, y_train_aligned = X_train_df.align(y_train, join="inner", axis=0)
     X_val_aligned, y_val_aligned = X_val_df.align(y_val, join="inner", axis=0)
 
-    # 提前转换为NumPy数组，让模型从始至终都看不到特征名
-    X_train_np = X_train_aligned.values
-    y_train_np = y_train_aligned.values
-    X_val_np = X_val_aligned.values
-    y_val_np = y_val_aligned.values
-
+    # Scaling
     print("Scaling data...")
-    scaler = MinMaxScaler()
-    X_train_scaled = scaler.fit_transform(X_train_np)
-    X_val_scaled = scaler.transform(X_val_np)
+    scaler = None
+    if SCALING_MODE == "global":
+        # Fit one scaler on training only
+        scaler = MinMaxScaler()
+        X_train_scaled_df = pd.DataFrame(
+            scaler.fit_transform(X_train_aligned.values),
+            index=X_train_aligned.index,
+            columns=X_train_aligned.columns,
+        )
+        X_val_scaled_df = pd.DataFrame(
+            scaler.transform(X_val_aligned.values),
+            index=X_val_aligned.index,
+            columns=X_val_aligned.columns,
+        )
+    else:
+        # Rolling causal scaling.
+        # Train: scale on its own history.
+        X_train_scaled_df = _rolling_minmax_scale_df(X_train_aligned, ROLLING_SCALER_WINDOW)
+        # Val: include last (window-1) bars from train to bootstrap rolling window.
+        bridge = X_train_aligned.tail(ROLLING_SCALER_WINDOW - 1)
+        combined = pd.concat([bridge, X_val_aligned], axis=0)
+        combined_scaled = _rolling_minmax_scale_df(combined, ROLLING_SCALER_WINDOW)
+        X_val_scaled_df = combined_scaled.loc[X_val_aligned.index]
+
+    # Drop rows without enough history (NaNs from rolling) and align with labels
+    idx_train = (
+        X_train_scaled_df.dropna(how="any").index.intersection(y_train_aligned.dropna().index)
+    )
+    X_train_scaled_df = X_train_scaled_df.loc[idx_train]
+    y_train_np = y_train_aligned.loc[idx_train].values
+
+    idx_val = (
+        X_val_scaled_df.dropna(how="any").index.intersection(y_val_aligned.dropna().index)
+    )
+    X_val_scaled_df = X_val_scaled_df.loc[idx_val]
+    y_val_np = y_val_aligned.loc[idx_val].values
 
     X_train_seq, y_train_seq = create_flattened_sequences(
-        X_train_scaled, y_train_np, LOOK_BACK
+        X_train_scaled_df.values, y_train_np, LOOK_BACK
     )
-    X_val_seq, y_val_seq = create_flattened_sequences(X_val_scaled, y_val_np, LOOK_BACK)
+    X_val_seq, y_val_seq = create_flattened_sequences(
+        X_val_scaled_df.values, y_val_np, LOOK_BACK
+    )
 
     # Create stable flattened column names to keep feature names consistent
     flattened_columns = []
@@ -359,9 +561,20 @@ def train_and_validate(train_df, val_df):
         )
     )
 
+    # Report top feature importances
+    try:
+        importances = pd.Series(model.feature_importances_, index=X_train_seq_df.columns)
+        top_imp = importances.sort_values(ascending=False).head(20)
+        print("\nTop-20 feature importances:")
+        print(top_imp.round(2))
+    except Exception:
+        pass
+
     artifacts = {
         "model": model,
         "scaler": scaler,
+        "scaling_mode": SCALING_MODE,
+        "rolling_window": ROLLING_SCALER_WINDOW,
         "feature_columns": feature_cols,
         "flattened_columns": keep_columns,
         "flattened_keep_indices": keep_indices,
@@ -375,7 +588,9 @@ def train_and_validate(train_df, val_df):
 def run_backtest(test_df, artifacts):
     print("\nRunning backtest...")
     model = artifacts["model"]
-    scaler = artifacts["scaler"]
+    scaler = artifacts.get("scaler")
+    scaling_mode = artifacts.get("scaling_mode", "global")
+    rolling_window = artifacts.get("rolling_window", ROLLING_SCALER_WINDOW)
     feature_cols = artifacts["feature_columns"]
     flattened_columns = artifacts.get("flattened_columns")
     if flattened_columns is None and hasattr(model, "feature_name_"):
@@ -386,10 +601,23 @@ def run_backtest(test_df, artifacts):
     X_test_aligned = X_test_df.reindex(columns=feature_cols, fill_value=0)
     final_idx = X_test_aligned.index[LOOK_BACK:]
 
-    X_test_np = X_test_aligned.values
-    scaled = scaler.transform(X_test_np)
+    if scaling_mode == "global" and scaler is not None:
+        X_test_scaled_df = pd.DataFrame(
+            scaler.transform(X_test_aligned.values),
+            index=X_test_aligned.index,
+            columns=X_test_aligned.columns,
+        )
+    else:
+        # Rolling scaling: include bridge from prior history if available
+        # Try to load cached data for bridge; if not, just use internal window within test
+        # Here we simply rely on test's own past because we are in backtest.
+        X_test_scaled_df = _rolling_minmax_scale_df(X_test_aligned, rolling_window)
+
+    X_test_scaled_df = X_test_scaled_df.dropna(how="any")
     preds = []
 
+    scaled = X_test_scaled_df.values
+    valid_index = X_test_scaled_df.index
     for i in tqdm(range(LOOK_BACK, len(scaled)), desc="Backtesting"):
         seq_full = scaled[i - LOOK_BACK : i].flatten().reshape(1, -1)
         keep_idx = artifacts.get("flattened_keep_indices")
@@ -401,7 +629,9 @@ def run_backtest(test_df, artifacts):
             pred = model.predict(seq_np)[0]
         preds.append(pred)
 
-    return pd.Series(preds, index=final_idx)
+    # Align predictions to valid index (accounting for rolling scaling drop and look_back)
+    pred_index = valid_index[LOOK_BACK:]
+    return pd.Series(preds, index=pred_index)
 
 
 # ================== WALK-FORWARD CV ==================
@@ -426,15 +656,45 @@ def _fit_and_eval_once(train_df, val_df):
     y_val_np = y_val_aligned.values
 
     # Scale
-    scaler = MinMaxScaler()
-    X_train_scaled = scaler.fit_transform(X_train_np)
-    X_val_scaled = scaler.transform(X_val_np)
+    if SCALING_MODE == "global":
+        scaler = MinMaxScaler()
+        X_train_scaled_df = pd.DataFrame(
+            scaler.fit_transform(X_train_aligned.values),
+            index=X_train_aligned.index,
+            columns=X_train_aligned.columns,
+        )
+        X_val_scaled_df = pd.DataFrame(
+            scaler.transform(X_val_aligned.values),
+            index=X_val_aligned.index,
+            columns=X_val_aligned.columns,
+        )
+    else:
+        # Rolling causal scaling
+        X_train_scaled_df = _rolling_minmax_scale_df(X_train_aligned, ROLLING_SCALER_WINDOW)
+        bridge = X_train_aligned.tail(ROLLING_SCALER_WINDOW - 1)
+        combined = pd.concat([bridge, X_val_aligned], axis=0)
+        combined_scaled = _rolling_minmax_scale_df(combined, ROLLING_SCALER_WINDOW)
+        X_val_scaled_df = combined_scaled.loc[X_val_aligned.index]
+
+    # Drop NaNs due to insufficient history and align with labels
+    idx_train = (
+        X_train_scaled_df.dropna(how="any").index.intersection(y_train_aligned.dropna().index)
+    )
+    X_train_scaled_df = X_train_scaled_df.loc[idx_train]
+    y_train_np = y_train_aligned.loc[idx_train].values
+    idx_val = (
+        X_val_scaled_df.dropna(how="any").index.intersection(y_val_aligned.dropna().index)
+    )
+    X_val_scaled_df = X_val_scaled_df.loc[idx_val]
+    y_val_np = y_val_aligned.loc[idx_val].values
 
     # Sequences
     X_train_seq, y_train_seq = create_flattened_sequences(
-        X_train_scaled, y_train_np, LOOK_BACK
+        X_train_scaled_df.values, y_train_np, LOOK_BACK
     )
-    X_val_seq, y_val_seq = create_flattened_sequences(X_val_scaled, y_val_np, LOOK_BACK)
+    X_val_seq, y_val_seq = create_flattened_sequences(
+        X_val_scaled_df.values, y_val_np, LOOK_BACK
+    )
 
     # Columns
     flattened_columns = []
