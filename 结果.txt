@@ -83,3 +83,57 @@ Ranging     17604
 Trending    11442
 Name: count, dtype: int64
 (kronos)  ~/work/conda/Kronos/ [main*] 
+
+
+(kronos)  ~/work/conda/Kronos/ [main*] python LightGBM_1.py
+/opt/homebrew/Caskroom/miniforge/base/envs/kronos/lib/python3.10/site-packages/pandas_ta/__init__.py:7: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import get_distribution, DistributionNotFound
+2025-11-14 09:01:15,625 - INFO - 从缓存加载数据: data/ethusdt_15m_data.csv
+2025-11-14 09:01:15,746 - INFO - 数据集划分完成: 209804 训练, 35136 验证, 29665 测试。
+2025-11-14 09:01:15,746 - INFO - --- 开始训练和验证流程 (V6 - Final Causal & Warning-Free) ---
+2025-11-14 09:01:15,747 - INFO - --- 开始计算特征 (V6 - Final Causal & Warning-Free) ---
+2025-11-14 09:01:15,905 - INFO - 特征计算完成，共 24 个特征。
+2025-11-14 09:01:15,912 - INFO - --- 开始计算特征 (V6 - Final Causal & Warning-Free) ---
+2025-11-14 09:01:15,946 - INFO - 特征计算完成，共 24 个特征。
+2025-11-14 09:01:16,643 - INFO - 调整后的 scale_pos_weight: 0.67
+2025-11-14 09:01:16,643 - INFO - 
+开始训练 LightGBM 模型 (全特征)...
+2025-11-14 09:01:43,854 - INFO - 在验证集上(全特征)最佳F1阈值: 0.3101
+2025-11-14 09:01:43,855 - INFO - 特征选择: 从 1440 -> 1440 列
+2025-11-14 09:01:44,031 - INFO - 
+开始训练 LightGBM 模型 (选择后特征)...
+2025-11-14 09:02:12,150 - INFO - 在验证集上(选择后特征)最佳F1阈值: 0.3101
+2025-11-14 09:02:12,156 - INFO - 模型和Scaler已保存到: models_gbm2
+2025-11-14 09:02:12,226 - INFO - 
+============================================================
+--- 开始在测试集上进行严格的回测评估 ---
+============================================================
+2025-11-14 09:02:12,229 - INFO - 逐根K线严格在线（expanding）评估...
+100%|███████████████████████████████████████████| 29665/29665 [10:09<00:00, 48.67it/s]
+
+--- [客观] 测试集回测评估结果 (应用MACD过滤器) ---
+总回测K线数: 29606
+发出看涨信号总次数: 13500
+精确率 (胜率): 0.6655
+召回率: 0.5853
+
+混淆矩阵 (TN, FP / FN, TP):
+ [[9741 4516]
+ [6365 8984]]
+2025-11-14 09:12:21,723 - INFO - 
+============================================================
+--- 开始在测试集上进行严格的回测评估 ---
+============================================================
+2025-11-14 09:12:21,725 - INFO - 逐根K线严格在线（expanding）评估...
+100%|███████████████████████████████████████████| 29665/29665 [10:18<00:00, 47.98it/s]
+
+--- [客观] 测试集回测评估结果 (无MACD过滤) ---
+总回测K线数: 29606
+发出看涨信号总次数: 23520
+精确率 (胜率): 0.6056
+召回率: 0.9279
+
+混淆矩阵 (TN, FP / FN, TP):
+ [[ 4980  9277]
+ [ 1106 14243]]
+(kronos)  ~/work/conda/Kronos/ [main*] 
