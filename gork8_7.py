@@ -99,13 +99,13 @@ STRATEGY_PARAMS = {
     "tf_chandelier_atr_multiplier": 3.0,
     "tf_atr_period": 14,
     "tf_stop_loss_atr_multiplier": 2.0,
-    # 提高 ML 权重、降低入场评分阈值
-    "score_entry_threshold": 0.45,
+    # TF 子策略入场评分阈值（越高越少交易）
+    "score_entry_threshold": 0.8,
     "score_weights_tf": {
-        "ml_signal": 0.40,
-        "breakout": 0.22,
-        "momentum": 0.22,
-        "mtf": 0.16,
+        "ml_signal": 0.35,  # ML 权重保持较高，但不过度
+        "breakout": 0.25,
+        "momentum": 0.25,
+        "mtf": 0.15,
     },
     "mr_bb_period": 20,
     "mr_bb_std": 2.0,
@@ -114,7 +114,8 @@ STRATEGY_PARAMS = {
     "mr_rsi_overbought": 70,
     "mr_stop_loss_atr_multiplier": 1.5,
     "mr_risk_multiplier": 0.5,
-    "mr_ml_entry_threshold": 0.3,  # MR 子策略中 ML 信号触发方向的最小绝对值 (|ML_signal|)
+    "mr_ml_entry_threshold": 0.4,  # MR 子策略中 ML 信号触发方向的最小绝对值 (|ML_signal|)
+    "tf_ml_entry_threshold": 0.4,  # TF 子策略中 ML 信号的硬阈值
     "volatility_filter_long_period": 100,
     "volatility_filter_short_period": 14,
     "volatility_filter_multiplier": 2.5,
@@ -508,6 +509,12 @@ class UltimateStrategy(Strategy):
         return self.dd_initial_scale + (1 - self.dd_initial_scale) * decay_progress
 
     def run_scoring_system_entry(self, price):
+        # 先用 ML 做一次硬过滤：ML 信号不够强则不参与本 bar 交易
+        ml_prob = self.ml_score[-1] if not np.isnan(self.ml_score[-1]) else 0.5
+        ml_signal = (ml_prob - 0.5) * 2
+        if abs(ml_signal) < self.tf_ml_entry_threshold:
+            return
+
         score = self._calculate_tf_entry_score()
         if (score > 0 and self.mtf_signal[-1] == -1) or (
             score < 0 and self.mtf_signal[-1] == 1
@@ -644,17 +651,23 @@ class UltimateStrategy(Strategy):
             self.data.Close[-2] > self.mr_bb_upper[-2]
             and self.mr_rsi[-2] > self.mr_rsi_overbought
         )
-        # 1) 经典均值回归信号：超卖/超买后出现反转
+        # 1) 经典均值回归信号：超卖/超买后出现反转（优先级最高）
         if is_oversold and self.data.Close[-1] > self.data.Close[-2]:
             return 1
         if is_overbought and self.data.Close[-1] < self.data.Close[-2]:
             return -1
 
-        # 2) 补充：在震荡市中，如果 ML 信号足够强，则允许 MR 子策略按照 ML 方向开仓
+        # 2) 补充：在震荡市中，如果 ML 信号足够强，则允许 MR 按 ML 方向开仓，
+        #    但要求价格位置「不追高不杀低」，只在相对合理价位参与。
         ml_prob = self.ml_score[-1] if not np.isnan(self.ml_score[-1]) else 0.5
         ml_signal = (ml_prob - 0.5) * 2  # 映射到 [-1, 1]
         if abs(ml_signal) >= self.mr_ml_entry_threshold:
-            return 1 if ml_signal > 0 else -1
+            # 多头：ML 看涨，且当前价格不高于中轨（避免高位追多）
+            if ml_signal > 0 and self.data.Close[-1] <= self.mr_bb_mid[-1]:
+                return 1
+            # 空头：ML 看跌，且当前价格不低于中轨（避免低位追空）
+            if ml_signal < 0 and self.data.Close[-1] >= self.mr_bb_mid[-1]:
+                return -1
 
         return 0
 
