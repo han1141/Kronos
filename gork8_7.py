@@ -102,7 +102,7 @@ STRATEGY_PARAMS = {
     # TF 子策略入场评分阈值（越高越少交易）
     "score_entry_threshold": 0.8,
     "score_weights_tf": {
-        "ml_signal": 0.35,  # ML 权重保持较高，但不过度
+        "ml_signal": 0.35,
         "breakout": 0.25,
         "momentum": 0.25,
         "mtf": 0.15,
@@ -759,3 +759,14 @@ if __name__ == "__main__":
     stats = bt.run()
     print("\n" + "-" * 40 + f"\n          {symbol} 回测结果摘要\n" + "-" * 40)
     print(stats)
+    # --- 按月收益率统计 ---
+    try:
+        equity_curve = stats["_equity_curve"]
+        if isinstance(equity_curve, pd.DataFrame) and not equity_curve.empty:
+            # 使用 'ME' (MonthEnd) 避免未来 pandas 版本中 'M' 的弃用告警
+            monthly_equity = equity_curve["Equity"].resample("ME").last()
+            monthly_returns = monthly_equity.pct_change().dropna() * 100
+            print("\n" + "-" * 40 + f"\n          {symbol} 每月收益率 [%]\n" + "-" * 40)
+            print(monthly_returns.to_frame(name="Monthly Return [%]").round(2))
+    except Exception as e:
+        logger.error(f"计算每月收益率时出错: {e}")
