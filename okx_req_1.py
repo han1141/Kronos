@@ -1,12 +1,13 @@
-# okx_live_trading_v4.9_defensive_cancel_fix.py
+# okx_live_trading_v4.9_defensive_cancel_fix_no_hurst.py
 """
-OKX REST API 轮询版 (V4.9 - 防御性取消修复版)
+OKX REST API 轮询版 (V4.9 - 防御性取消修复版 - 无Hurst版)
 - 核心变更:
     - [!!! 终极安全修复 !!!] 针对API响应不可靠问题，实现了“防御性取消”机制。
         - 重写了 `cancel_algo_orders` 函数，不再信任API的单次成功返回。
         - 新逻辑是“发送取消指令 -> 等待 -> 循环验证”，程序会主动在15秒的窗口期内，多次查询交易所的未成交订单列表，直到确认目标订单真正消失为止。
         - 如果在超时后订单依然存在，函数将返回失败，并记录严重错误日志。
         - 此项修改将应用于所有取消操作（启动接管、移动止损、交易后清扫），从根本上保证程序状态与交易所后台状态的强一致性。
+    - [移除] 移除了赫斯特指数(Hurst Exponent)相关的所有计算和依赖，简化了市场状态判断逻辑，并降低了计算复杂性。
     - [继承] 完整继承了 V4.8 的所有安全特性。此版本是为应对极端不可靠的API行为而设计的最终健壮版本。
 
 调试说明:
@@ -198,6 +199,8 @@ STRATEGY_PARAMS = {
     "dd_initial_pct": 0.35,  # 回撤初始风险调整比例
     "dd_final_pct": 0.25,  # 回撤最终风险调整比例
     "dd_decay_bars": 4320,  # 风险调整衰减周期
+    # 【调试】逆势交易风险折扣 - 允许逆势但降低风险
+    "counter_trend_risk_factor": 0.4,  # 逆势方向风险系数(0~1)，数值越小逆势仓位越轻
     # --- 市场状态检测参数 ---
     # 【调试】市场regime识别 - 区分趋势市场和震荡市场
     "regime_adx_period": 14,  # ADX周期 - 趋势强度指标
@@ -206,13 +209,14 @@ STRATEGY_PARAMS = {
     "regime_rsi_period": 14,  # RSI周期 - 超买超卖指标
     "regime_rsi_vol_period": 14,  # RSI波动率计算周期
     "regime_norm_period": 252,  # 归一化周期 - 调试：用于指标标准化
-    "regime_hurst_period": 80,  # Hurst指数计算周期 - 调试：趋势持续性
     # 【调试】市场regime评分权重 - 综合评估市场状态
-    "regime_score_weight_adx": 0.55,  # ADX权重 - 趋势强度的重要性
-    "regime_score_weight_atr": 0.3,  # ATR权重 - 波动率的重要性
-    "regime_score_weight_rsi": 0.1,  # RSI权重 - 震荡识别的重要性
-    "regime_score_weight_hurst": 0.05,  # Hurst权重 - 趋势持续性的重要性
+    "regime_score_weight_adx": 0.60,  # ADX权重 - 趋势强度的重要性
+    "regime_score_weight_atr": 0.25,  # ATR权重 - 波动率的重要性
+    "regime_score_weight_rsi": 0.15,  # RSI权重 - 震荡识别的重要性
     "regime_score_threshold": 0.4,  # 趋势判定阈值 - 调试：过低会误判震荡为趋势
+    # --- 宏观趋势过滤参数 ---
+    # 【调试】4小时级别EMA用于宏观趋势过滤（相对15m为中期趋势）
+    "macro_trend_ema_period_4h": 30,  # 4H EMA周期，默认30根4H K线（约5天），比50更偏中期
     # --- 趋势跟随(TF)模块参数 ---
     # 【调试】趋势跟随策略配置 - 用于捕捉趋势行情
     "tf_donchian_period": 24,  # 唐奇安通道周期 - 调试：突破信号敏感度
@@ -347,36 +351,6 @@ def load_kelly_history(symbol, maxlen):
 
 
 # --- 特征工程函数 ---
-# 【调试】Hurst指数计算 - 衡量时间序列的趋势持续性
-def compute_hurst(ts, max_lag=100):
-    """
-    计算Hurst指数，用于判断时间序列的趋势持续性
-    调试要点：
-    - 返回值范围[0,1]：0.5为随机游走，>0.5为趋势持续，<0.5为均值回归
-    - 数据量不足时返回0.5（中性值）
-    - 计算失败时返回0.5，避免程序崩溃
-    """
-    if len(ts) < 10:
-        return 0.5  # 【调试】数据不足，返回中性值
-
-    lags = range(2, min(max_lag, len(ts) // 2 + 1))
-    tau = [
-        np.std(np.subtract(ts[lag:], ts[:-lag]))
-        for lag in lags
-        if np.std(np.subtract(ts[lag:], ts[:-lag])) > 0  # 【调试】避免除零错误
-    ]
-
-    if len(tau) < 2:
-        return 0.5  # 【调试】有效数据点不足
-
-    try:
-        # 【调试】使用对数回归计算Hurst指数
-        hurst = np.polyfit(np.log(lags[: len(tau)]), np.log(tau), 1)[0]
-        return max(0.0, min(1.0, hurst))  # 【调试】限制在[0,1]范围内
-    except:
-        return 0.5  # 【调试】计算失败，返回中性值
-
-
 # 【调试】高级模型推理 - 简化版ML信号生成
 def run_advanced_model_inference(df):
     """
@@ -441,13 +415,6 @@ def add_ml_features_ported(df: pd.DataFrame) -> pd.DataFrame:
     df["feature_rsi_vol_norm"] = 1 - norm(
         rsi.rolling(p["regime_rsi_vol_period"]).std()
     )  # 【调试】RSI稳定性特征
-    df["feature_hurst"] = (
-        df.Close.rolling(p["regime_hurst_period"])
-        .apply(
-            lambda x: compute_hurst(np.log(x + 1e-9)), raw=False
-        )  # 【调试】添加小值避免log(0)
-        .fillna(0.5)
-    )  # 【调试】趋势持续性特征
     df["feature_obv_norm"] = norm(
         ta.volume.OnBalanceVolumeIndicator(df.Close, df.Volume).on_balance_volume()
     )  # 【调试】成交量特征
@@ -466,8 +433,6 @@ def add_ml_features_ported(df: pd.DataFrame) -> pd.DataFrame:
         df["feature_adx_norm"] * p["regime_score_weight_adx"]
         + df["feature_atr_slope_norm"] * p["regime_score_weight_atr"]
         + df["feature_rsi_vol_norm"] * p["regime_score_weight_rsi"]
-        + np.clip((df["feature_hurst"] - 0.3) / 0.7, 0, 1)  # 【调试】Hurst特征变换
-        * p["regime_score_weight_hurst"]
     )
     return df
 
@@ -1234,7 +1199,7 @@ class UltimateStrategy:
             self.data["mtf_signal"] = 0
         df_4h = self.data["Close"].resample("4H").last().to_frame()
         df_4h["macro_ema"] = ta.trend.EMAIndicator(
-            df_4h["Close"], window=50
+            df_4h["Close"], window=self.macro_trend_ema_period_4h
         ).ema_indicator()
         df_4h["macro_trend"] = np.where(df_4h["Close"] > df_4h["macro_ema"], 1, -1)
         self.data["macro_trend_filter"] = (
@@ -1325,33 +1290,32 @@ class UltimateStrategy:
         ):
             return None
         action_to_take = None
-        if last.macro_trend_filter == 1:
-            if last.market_regime == 1:
-                if (
-                    score := self._calculate_entry_score()
-                ) > self.score_entry_threshold:
-                    action_to_take = {
-                        "action": "BUY",
-                        "sub_strategy": "TF",
-                        "confidence": score,
-                    }
-            elif self._define_mr_entry_signal() == 1:
+        # 1) 先仅根据市场regime和信号确定方向与子策略，不再用macro_trend_filter做硬性方向限制
+        if last.market_regime == 1:
+            # 趋势市：使用趋势跟随评分决定多空
+            score = self._calculate_entry_score()
+            if score > self.score_entry_threshold:
+                action_to_take = {
+                    "action": "BUY",
+                    "sub_strategy": "TF",
+                    "confidence": score,
+                }
+            elif score < -self.score_entry_threshold:
+                action_to_take = {
+                    "action": "SELL",
+                    "sub_strategy": "TF",
+                    "confidence": abs(score),
+                }
+        else:
+            # 震荡市：使用均值回归信号决定多空
+            mr_signal = self._define_mr_entry_signal()
+            if mr_signal == 1:
                 action_to_take = {
                     "action": "BUY",
                     "sub_strategy": "MR",
                     "confidence": 1.0,
                 }
-        elif last.macro_trend_filter == -1:
-            if last.market_regime == 1:
-                if (
-                    score := self._calculate_entry_score()
-                ) < -self.score_entry_threshold:
-                    action_to_take = {
-                        "action": "SELL",
-                        "sub_strategy": "TF",
-                        "confidence": abs(score),
-                    }
-            elif self._define_mr_entry_signal() == -1:
+            elif mr_signal == -1:
                 action_to_take = {
                     "action": "SELL",
                     "sub_strategy": "MR",
@@ -1368,6 +1332,11 @@ class UltimateStrategy:
                 * action_to_take["confidence"]
                 * risk_multiplier
             )
+            # 2) 使用4H宏观趋势仅对逆势方向做风险折扣，而不是禁止逆势交易
+            macro_dir = last.macro_trend_filter
+            trade_dir = 1 if action_to_take["action"] == "BUY" else -1
+            if macro_dir in (1, -1) and macro_dir != trade_dir:
+                risk_pct *= getattr(self, "counter_trend_risk_factor", 0.4)
             sl_atr_mult = (
                 self.tf_stop_loss_atr_multiplier
                 if action_to_take["sub_strategy"] == "TF"
@@ -1689,7 +1658,9 @@ def main():
             "position_logger", "positions.csv", ["timestamp", "symbol", "position"]
         ),
     )
-    logging.info("启动 OKX REST API 轮询交易程序 (V4.9 防御性取消修复版)...")
+    logging.info(
+        "启动 OKX REST API 轮询交易程序 (V4.9 防御性取消修复版 - 无Hurst版)..."
+    )
     if not all(
         (
             OKX_API_KEY := os.getenv("OKX_API_KEY"),

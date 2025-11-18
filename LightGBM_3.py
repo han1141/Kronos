@@ -33,12 +33,12 @@ logger = logging.getLogger(__name__)
 
 # --- 🚀 全局配置 ---
 SYMBOL = "ETHUSDT"
-INTERVAL = "15m"
+INTERVAL = "30m"
 DATA_START_DATE = "2017-01-01"
 TRAIN_START = "2018-01-01"
 VALIDATION_START = "2024-01-01"
 TEST_START = "2025-01-01"
-TEST_END = "2025-11-09"
+TEST_END = "2025-11-16"
 LOOK_BACK = 60
 # 使用步进抽样的方式降低展平维度，如步长为5则仅取每5根中的一根
 LAG_STRIDE = 5  # 降维关键参数：5 -> 60窗口仅取12个滞后切片
@@ -61,8 +61,8 @@ REQUIRE_PRICE_ABOVE_EMA_4H = False  # 放宽：允许回撤中的入场
 ENFORCE_NO_OVERLAP = False  # 放宽：允许并行持仓
 COOLDOWN_BARS = 2  # 轻度冷却，减少过密交易
 
-# 固定止盈：涨到 target_return (默认0.4%) 直接止盈；止损仍按 max_drawdown_limit
-# 关闭ATR动态止盈/止损，确保TP严格为 target_return
+# 固定止盈：涨到 target_return 直接止盈；止损按 max_drawdown_limit（默认做 1:1 或略微正向的盈亏比）
+# 默认关闭 ATR 动态止盈/止损，先用简单、稳定的固定 TP/SL 结构
 USE_ATR_BASED_EXITS = False
 TP_ATR_MULT = 2.0
 SL_ATR_MULT = 1.2
@@ -91,12 +91,18 @@ BE_TRIGGER_RET = 0.002   # 浮盈达到 +0.20% 时激活保本
 BE_STOP_RET = 0.0        # 激活后止损抬到入场价（保本，未覆盖手续费/滑点）
 
 # 回测相关：手续费与滑点设置（单边费率与单边滑点）
-FEE_RATE = 0.001  # 0.1%
-SLIPPAGE_RATE = 0.0005  # 5 bps
+# 挂单 Maker 手续费（例如 0.02% -> 0.0002，可按实际费率调整）
+FEE_RATE = 0.0002
+SLIPPAGE_RATE = 0.0005  # 5 bps，若认为挂单几乎无滑点可进一步下调
+
+# 账户层最大回撤监控阈值（例如 10%），仅用于回测期统计和告警，不强制停止交易
+ACCOUNT_MAX_DRAWDOWN = 0.10
 TREND_CONFIG = {
-    "look_forward_steps": 3,
-    "target_return": 0.004,
-    "max_drawdown_limit": 0.02,
+    # 目标：在一个相对合理的时间窗口内（约 6 小时）博取 0.75% 左右的收益，
+    # 并允许更宽的回撤（约 1.2%），以便实际交易中能吃到更多“先跌后涨”的机会。
+    "look_forward_steps": 12,     # 向前最多观察 12 根 30m K 线（约 6 小时）
+    "target_return": 0.0075,      # 目标止盈 0.75%
+    "max_drawdown_limit": 0.012,  # 最大容忍回撤 1.20%（TP:SL ≈ 1:1.6）
 }
 logger.info(
     f"训练目标盈利：{TREND_CONFIG['target_return']*100}%，最大回撤限制：{TREND_CONFIG['max_drawdown_limit']*100}%"
@@ -489,6 +495,19 @@ def feature_engineering(df):
 # For completeness, I'll paste the rest of the script again.
 #
 def create_trend_labels(df, look_forward_steps, target_return, max_drawdown_limit):
+    """
+    标签 A 版本：只关注“未来是否有足够上行空间”，不在标签中强行约束回撤。
+
+    定义：
+      - label = 1 当且仅当：在未来 look_forward_steps 根 K 线内，
+        最高价曾经触及或超过当前收盘价 * (1 + target_return)；
+      - 否则 label = 0。
+
+    说明：
+      - max_drawdown_limit 参数在标签中不再使用，只作为策略/回测层 TP/SL 的风险控制；
+      - 这样可以增加正样本数量，使模型专注于学习“后续有足够上行空间”的情形，
+        回撤控制则在交易执行逻辑中通过止损/保本来完成。
+    """
     df_copy = df.copy()
     df_copy["target_price"] = df_copy["Close"] * (1 + target_return)
     future_highs = (
@@ -497,16 +516,8 @@ def create_trend_labels(df, look_forward_steps, target_return, max_drawdown_limi
         .max()
         .shift(-look_forward_steps)
     )
-    future_lows = (
-        df_copy["Low"]
-        .rolling(window=look_forward_steps)
-        .min()
-        .shift(-look_forward_steps)
-    )
-    drawdown_before_profit = (df_copy["Close"] - future_lows) / df_copy["Close"]
     profit_reached = future_highs >= df_copy["target_price"]
-    risk_controlled = drawdown_before_profit < max_drawdown_limit
-    df_copy["label"] = (profit_reached & risk_controlled).astype(int)
+    df_copy["label"] = profit_reached.astype(int)
     return df_copy
 
 
@@ -642,7 +653,12 @@ def train_and_validate(train_df, validation_df, look_back, trend_config):
             logger.info("已完成概率标定(Isotonic)并保存校准器。")
         except Exception as e:
             logger.warning(f"概率标定失败，使用未标定概率。Error: {e}")
+
+    # 统一的阈值变量与收益记录：
+    # - 若成本感知搜索找到“验证集平均净收益 > 0”的阈值，则优先采用；
+    # - 否则回退到基于精确率/F1 的阈值选择，避免强行锁定在亏损阈值上。
     best_threshold = 0.5
+    best_avg_net = None
 
     if ENABLE_COST_AWARE_THRESHOLD:
         # 使用验证集基于净收益选择阈值
@@ -683,10 +699,12 @@ def train_and_validate(train_df, validation_df, look_back, trend_config):
 
         # 使用一组候选阈值（分位数）
         # 候选阈值更多集中在高分位，减少过多交易
-        qs = np.concatenate([
-            np.linspace(0.35, 0.90, 24),
-            np.linspace(0.91, 0.98, 8),
-        ])
+        qs = np.concatenate(
+            [
+                np.linspace(0.35, 0.90, 24),
+                np.linspace(0.91, 0.98, 8),
+            ]
+        )
         thresh_candidates = np.unique(np.quantile(y_val_pred_probs, qs))
         best_avg_net = -1e9
         look_forward = trend_config["look_forward_steps"]
@@ -821,7 +839,7 @@ def train_and_validate(train_df, validation_df, look_back, trend_config):
             best_avg_net = -1e9
             best_threshold = 0.5
             for th in thresh_candidates:
-                sig_raw = (y_val_pred_probs > th)
+                sig_raw = y_val_pred_probs > th
                 sig = (sig_raw & risk_mask).astype(int)
                 pnl_list = []
                 busy_until = -1
@@ -830,12 +848,20 @@ def train_and_validate(train_df, validation_df, look_back, trend_config):
                         continue
                     if t <= busy_until:
                         continue
-                    if pd.isna(v_close.iloc[t]) or pd.isna(v_high.iloc[t]) or pd.isna(v_low.iloc[t]):
+                    if pd.isna(v_close.iloc[t]) or pd.isna(v_high.iloc[t]) or pd.isna(
+                        v_low.iloc[t]
+                    ):
                         continue
                     entry = v_close.iloc[t] * (1 + SLIPPAGE_RATE)
-                    if USE_ATR_BASED_EXITS and np.isfinite(atr_vals[t]) and v_close.iloc[t] > 0:
+                    if (
+                        USE_ATR_BASED_EXITS
+                        and np.isfinite(atr_vals[t])
+                        and v_close.iloc[t] > 0
+                    ):
                         atr_n = float(atr_vals[t] / v_close.iloc[t])
-                        tp_ret = max(trend_config["target_return"], TP_ATR_MULT * atr_n)
+                        tp_ret = max(
+                            trend_config["target_return"], TP_ATR_MULT * atr_n
+                        )
                         sl_ret = min(dd_limit, SL_ATR_MULT * atr_n)
                     else:
                         tp_ret = trend_config["target_return"]
@@ -869,11 +895,27 @@ def train_and_validate(train_df, validation_df, look_back, trend_config):
                         best_avg_net = avg_net
                         best_threshold = float(th)
         if best_avg_net == -1e9:
-            logger.warning("基于净收益选择未能找到有效阈值，将在回退路径中使用F1或默认阈值。")
+            logger.warning(
+                "基于净收益选择未能找到有效阈值，将在回退路径中使用F1或默认阈值。"
+            )
+            best_avg_net = None
+        elif best_avg_net <= 0:
+            logger.warning(
+                f"基于净收益搜索的最优阈值在验证集上的平均净收益仍为负: {best_avg_net:.5f}，将回退到基于精确率/F1 的阈值搜索。"
+            )
         else:
-            logger.info(f"基于净收益选择的最佳阈值: {best_threshold:.4f} (验证集平均净收益: {best_avg_net:.5f})")
-    else:
-        # 回退到F1/精确率方案
+            logger.info(
+                f"基于净收益选择的最佳阈值: {best_threshold:.4f} (验证集平均净收益: {best_avg_net:.5f})"
+            )
+
+    # --- 统一的 F1/精确率 回退逻辑 ---
+    # 触发条件：
+    # 1) 没开启成本感知搜索；或
+    # 2) 成本感知搜索找不到任何有效阈值；或
+    # 3) 找到的最佳阈值在验证集上的平均净收益仍为负。
+    if (not ENABLE_COST_AWARE_THRESHOLD) or (best_avg_net is None) or (
+        best_avg_net is not None and best_avg_net <= 0
+    ):
         MIN_PRECISION_TARGET = 0.55
         precisions, recalls, thresholds = precision_recall_curve(
             y_validation, y_val_pred_probs
@@ -1084,17 +1126,56 @@ def run_backtest_and_evaluate(
         logger.warning("无交易信号（取消风险后仍为空）。最终回退到阈值筛选且不使用Top-K。")
         selected_mask = prob_ok
 
-    # 顺序执行交易并统计，同时输出final_signals
+    # 兜底保护：若在以上所有放宽后仍然在回测区间内没有任何信号，
+    # 则退化为“仅使用风险过滤 + 每日 Top-K”的规则，完全移除概率阈值与期望过滤，
+    # 以便在极端标签/阈值设置下仍能观察策略的大致行为。
+    if not np.any(selected_mask[look_back:]):
+        logger.warning(
+            "回测最终仍无任何交易信号，将使用仅基于风险过滤和每日Top-K的兜底规则（不使用概率阈值与期望过滤）。"
+        )
+        selected_mask = np.zeros(n, dtype=bool)
+        if ENABLE_DAILY_TOP_K:
+            idx_all = np.arange(n)
+            day_index_full = pd.Index(idx_full)
+            for day, grp in pd.Series(idx_all, index=day_index_full).groupby(
+                day_index_full.normalize()
+            ):
+                idxs = grp.values
+                idxs = idxs[(idxs >= look_back)]
+                day_candidates = idxs[risk_ok[idxs]]
+                if day_candidates.size == 0:
+                    continue
+                k = min(DAILY_TOP_K, day_candidates.size)
+                topk = day_candidates[np.argsort(probs[day_candidates])[-k:]]
+                selected_mask[topk] = True
+        else:
+            selected_mask = risk_ok.copy()
+
+    # 顺序执行交易并统计，同时输出 final_signals（仅记录多头信号，用于分类评估）
     final_signals = []
     pnl_list = []
     trade_count = 0
     busy_until = -1
+    # 账户层最大回撤监控：以权益曲线为基准，仅用于统计和告警，不强制停止交易
+    equity = 1.0
+    equity_peak = 1.0
+    max_dd_overall = 0.0
+
     for i in range(look_back, n):
-        do_trade = bool(selected_mask[i])
+        long_signal = bool(selected_mask[i])
+
+        # 简单做空逻辑：模型未给多头信号 + ADX 足够强则考虑开空
+        short_signal = False
+        if (not long_signal) and np.isfinite(adx_arr[i]) and (adx_arr[i] >= ADX_MIN):
+            short_signal = True
+
         if (ENFORCE_NO_OVERLAP or COOLDOWN_BARS > 0) and i <= busy_until:
+            # 持有中或冷却期，不开新仓，多头信号标记为 0
             final_signals.append(0)
             continue
-        if do_trade:
+
+        if long_signal:
+            # 多头交易
             final_signals.append(1)
             trade_count += 1
             entry_price = close_arr[i] * (1 + slippage_rate)
@@ -1110,6 +1191,7 @@ def run_backtest_and_evaluate(
             breakeven = False
             exit_j = i_end
             for j in range(i + 1, i_end + 1):
+                # 1) 单笔 TP/SL/保本逻辑
                 if low_arr[j] <= stop_price:
                     exit_price = stop_price * (1 - slippage_rate)
                     stopped = True
@@ -1127,15 +1209,121 @@ def run_backtest_and_evaluate(
                     breakeven = True
                     exit_j = j
                     break
+
+                # 2) 账户层最大回撤：以当前收盘价估算权益，若回撤超过阈值则强制平仓
+                mark_price = close_arr[j]
+                if mark_price > 0:
+                    open_gross_ret = (mark_price - entry_price) / entry_price
+                    open_net_ret = open_gross_ret - 2 * fee_rate
+                    temp_equity = equity * (1.0 + open_net_ret)
+                    temp_peak = max(equity_peak, temp_equity)
+                    if temp_peak > 0:
+                        temp_dd = 1.0 - temp_equity / temp_peak
+                        if temp_dd >= ACCOUNT_MAX_DRAWDOWN:
+                            exit_price = mark_price * (1 - slippage_rate)
+                            stopped = True
+                            exit_j = j
+                            logger.warning(
+                                f"账户层回撤达到 {temp_dd*100:.2f}% (阈值 {ACCOUNT_MAX_DRAWDOWN*100:.2f}%)，在 {idx_full[j]} 强制平仓。"
+                            )
+                            break
+
             if not hit and not stopped and not breakeven:
                 exit_price = close_arr[i_end] * (1 - slippage_rate)
                 exit_j = i_end
+
             gross_ret = (exit_price - entry_price) / entry_price
             net_ret = gross_ret - 2 * fee_rate
             pnl_list.append(net_ret)
+
+            # 更新账户权益与最大回撤监控
+            equity *= (1.0 + net_ret)
+            if equity > equity_peak:
+                equity_peak = equity
+            if equity_peak > 0:
+                cur_dd = 1.0 - equity / equity_peak
+                if cur_dd > max_dd_overall:
+                    max_dd_overall = cur_dd
+
             if ENFORCE_NO_OVERLAP or COOLDOWN_BARS > 0:
                 busy_until = exit_j + COOLDOWN_BARS
+
+        elif short_signal:
+            # 空头交易：仅计入收益，不影响多头分类评估（final_signals 记为 0）
+            final_signals.append(0)
+            trade_count += 1
+            entry_price = close_arr[i] * (1 - slippage_rate)  # 做空按卖出价入场
+            target_price = entry_price * (1 - tp_arr[i])      # 价格下跌获利
+            stop_price = entry_price * (1 + sl_arr[i])        # 上涨触发止损
+            be_trigger = entry_price * (1 - BE_TRIGGER_RET) if ENABLE_BREAK_EVEN else 0.0
+            be_stop = entry_price * (1 - BE_STOP_RET) if ENABLE_BREAK_EVEN else 0.0
+            look_forward = trend_config["look_forward_steps"]
+            i_end = min(i + look_forward, n - 1)
+            hit = False
+            stopped = False
+            be_active = False
+            breakeven = False
+            exit_j = i_end
+            for j in range(i + 1, i_end + 1):
+                # 1) 单笔 TP/SL/保本逻辑（空头方向）
+                if high_arr[j] >= stop_price:
+                    exit_price = stop_price * (1 + slippage_rate)
+                    stopped = True
+                    exit_j = j
+                    break
+                if low_arr[j] <= target_price:
+                    exit_price = target_price * (1 + slippage_rate)
+                    hit = True
+                    exit_j = j
+                    break
+                if ENABLE_BREAK_EVEN and (not be_active) and (low_arr[j] <= be_trigger):
+                    be_active = True
+                if ENABLE_BREAK_EVEN and be_active and (high_arr[j] >= be_stop):
+                    exit_price = be_stop * (1 + slippage_rate)
+                    breakeven = True
+                    exit_j = j
+                    break
+
+                # 2) 账户层最大回撤：以当前收盘价估算权益，若回撤超过阈值则强制平仓（空头方向）
+                mark_price = close_arr[j]
+                if mark_price > 0:
+                    open_gross_ret = (entry_price - mark_price) / entry_price
+                    open_net_ret = open_gross_ret - 2 * fee_rate
+                    temp_equity = equity * (1.0 + open_net_ret)
+                    temp_peak = max(equity_peak, temp_equity)
+                    if temp_peak > 0:
+                        temp_dd = 1.0 - temp_equity / temp_peak
+                        if temp_dd >= ACCOUNT_MAX_DRAWDOWN:
+                            exit_price = mark_price * (1 + slippage_rate)
+                            stopped = True
+                            exit_j = j
+                            logger.warning(
+                                f"账户层回撤达到 {temp_dd*100:.2f}% (阈值 {ACCOUNT_MAX_DRAWDOWN*100:.2f}%)，在 {idx_full[j]} 强制平仓（空头头寸）。"
+                            )
+                            break
+
+            if not hit and not stopped and not breakeven:
+                exit_price = close_arr[i_end] * (1 + slippage_rate)
+                exit_j = i_end
+
+            gross_ret = (entry_price - exit_price) / entry_price
+            net_ret = gross_ret - 2 * fee_rate
+            pnl_list.append(net_ret)
+
+            # 更新账户权益与最大回撤监控
+            equity *= (1.0 + net_ret)
+            if equity > equity_peak:
+                equity_peak = equity
+            if equity_peak > 0:
+                cur_dd = 1.0 - equity / equity_peak
+                if cur_dd > max_dd_overall:
+                    max_dd_overall = cur_dd
+
+            if ENFORCE_NO_OVERLAP or COOLDOWN_BARS > 0:
+                busy_until = exit_j + COOLDOWN_BARS
+
         else:
+            # 无交易
             final_signals.append(0)
     actual_labels_df = create_trend_labels(test_df, **trend_config).dropna()
     pred_index = test_features_df.index[look_back : look_back + len(final_signals)]
@@ -1234,6 +1422,13 @@ def run_backtest_and_evaluate(
         print(f"平均单笔净收益: {np.mean(pnl_arr):.5f}")
         print(f"胜率(净收益>0): {np.mean(pnl_arr > 0):.4f}")
         print(f"累计净收益: {np.sum(pnl_arr):.4f}")
+        # 输出账户层最大回撤监控结果
+        if max_dd_overall > 0:
+            print(f"账户层最大回撤(基于回测权益曲线): {max_dd_overall*100:.2f}% (阈值: {ACCOUNT_MAX_DRAWDOWN*100:.2f}%)")
+            if max_dd_overall >= ACCOUNT_MAX_DRAWDOWN:
+                logger.warning(
+                    f"账户权益最大回撤已达到 {max_dd_overall*100:.2f}%，超过监控阈值 {ACCOUNT_MAX_DRAWDOWN*100:.2f}%。"
+                )
     else:
         print("\n--- [考虑交易成本与滑点] 策略收益概览 ---")
         print("无交易，无收益统计。")

@@ -70,9 +70,9 @@ set_chinese_font()
 # --- 3. 核心配置 ---
 CONFIG = {
     "symbol_to_test": "ETHUSDT",
-    "interval": "15m",  # 与模型训练脚本保持一致
+    "interval": "1h",  # 与模型训练脚本保持一致
     "backtest_start_date": "2025-01-01",  # 使用测试集时间范围
-    "backtest_end_date": "2025-11-12",
+    "backtest_end_date": "2025-11-17",
     "initial_cash": 500_000,
     "commission": 0.00075,
 }
@@ -407,11 +407,12 @@ def preprocess_data_for_strategy(data_in: pd.DataFrame, symbol: str) -> pd.DataF
         logger.info("✅ ML模型预测分数计算完成。")
 
     except FileNotFoundError as e:
-        logger.error(f"加载ML模型文件失败: {e}。将使用0作为ML分数。")
-        df["ml_score"] = 0.0
+        logger.error(f"加载ML模型文件失败: {e}。将使用 0.5 作为中性 ML 分数。")
+        # 使用中性概率 0.5，等价于“无观点”，避免被误解为强烈看空
+        df["ml_score"] = 0.5
     except Exception as e:
         logger.error(f"处理ML特征时发生未知错误: {e}", exc_info=True)
-        df["ml_score"] = 0.0
+        df["ml_score"] = 0.5
 
     df.dropna(
         subset=["Open", "High", "Low", "Close", "Volume", "ml_score"], inplace=True
@@ -430,7 +431,32 @@ class UltimateStrategy(Strategy):
             pd.Series(self.data.High),
             pd.Series(self.data.Low),
         )
+        # 交易与绩效跟踪
+        self.initial_equity = float(self.equity)
         self.recent_trade_returns = deque(maxlen=self.kelly_trade_history)
+        # ML 相关统计
+        self.ml_based_profit = 0.0
+        self.ml_based_trades = 0
+        self.ml_long_profit = 0.0
+        self.ml_short_profit = 0.0
+        self.ml_long_trades = 0
+        self.ml_short_trades = 0
+        self.ml_wins = 0
+        self.ml_losses = 0
+        self.ml_long_wins = 0
+        self.ml_long_losses = 0
+        self.ml_short_wins = 0
+        self.ml_short_losses = 0
+        # 不含手续费胜率统计
+        self.ml_wins_gross = 0
+        self.ml_losses_gross = 0
+        self.ml_long_wins_gross = 0
+        self.ml_long_losses_gross = 0
+        self.ml_short_wins_gross = 0
+        self.ml_short_losses_gross = 0
+        self.total_trades = 0
+        self.current_trade_is_ml_based = False
+        self.last_mr_signal_from_ml = False
         self.reset_trade_state()
         self.equity_peak, self.bars_since_equity_peak = self.equity, 0
         self.consecutive_losses, self.paused_until_bar = 0, 0
@@ -534,6 +560,7 @@ class UltimateStrategy(Strategy):
             score > 0 and self.tf_rsi_filter[-1] > self.tf_rsi_long_threshold
         ) or (score < 0 and self.tf_rsi_filter[-1] < self.tf_rsi_short_threshold)
         if abs(score) >= self.score_entry_threshold and rsi_ok:
+            # 趋势跟随子策略始终依赖 ML 信号
             self.open_tf_position(
                 price, is_long=(score > 0), confidence_factor=abs(score)
             )
@@ -541,9 +568,16 @@ class UltimateStrategy(Strategy):
     def run_mean_reversion_entry(self, price):
         signal = self._define_mr_entry_signal()
         if signal != 0:
+            # 记录此次 MR 入场是否由 ML 信号触发
+            self.current_trade_is_ml_based = bool(
+                getattr(self, "last_mr_signal_from_ml", False)
+            )
             self.open_mr_position(price, is_long=(signal == 1))
 
     def open_tf_position(self, p, is_long, confidence_factor):
+        # 趋势跟随子策略的开仓视为 ML 驱动
+        self.current_trade_is_ml_based = True
+        self.current_entry_price = float(p)
         risk_ps = self.tf_atr[-1] * self.tf_stop_loss_atr_multiplier
         if risk_ps <= 0 or np.isnan(risk_ps):
             return
@@ -585,7 +619,7 @@ class UltimateStrategy(Strategy):
             return  # 如果ATR无效则不操作
         if self.position.is_long:
             if p < self.tf_initial_stop_loss:
-                self.close_position()
+                self.close_position(exit_price=p)
                 return
             self.highest_high_in_trade = max(
                 self.highest_high_in_trade, self.data.High[-1]
@@ -594,17 +628,17 @@ class UltimateStrategy(Strategy):
                 self.highest_high_in_trade - atr * self.tf_chandelier_atr_multiplier
             )
             if p < chandelier_exit:
-                self.close_position()
+                self.close_position(exit_price=p)
         elif self.position.is_short:
             if p > self.tf_initial_stop_loss:
-                self.close_position()
+                self.close_position(exit_price=p)
                 return
             self.lowest_low_in_trade = min(self.lowest_low_in_trade, self.data.Low[-1])
             chandelier_exit = (
                 self.lowest_low_in_trade + atr * self.tf_chandelier_atr_multiplier
             )
             if p > chandelier_exit:
-                self.close_position()
+                self.close_position(exit_price=p)
 
     def manage_mean_reversion_exit(self, p):
         if (
@@ -614,7 +648,7 @@ class UltimateStrategy(Strategy):
             self.position.is_short
             and (p <= self.mr_bb_mid[-1] or p >= self.mr_stop_loss)
         ):
-            self.close_position()
+            self.close_position(exit_price=p)
 
     def _calculate_tf_entry_score(self) -> float:
         w = self.score_weights_tf
@@ -636,6 +670,8 @@ class UltimateStrategy(Strategy):
 
     def _define_mr_entry_signal(self) -> int:
         # 增加对NaN值的检查
+        # 默认视为非 ML 触发
+        self.last_mr_signal_from_ml = False
         if (
             len(self.data.Close) < 2
             or np.isnan(self.mr_bb_lower[-2])
@@ -653,8 +689,10 @@ class UltimateStrategy(Strategy):
         )
         # 1) 经典均值回归信号：超卖/超买后出现反转（优先级最高）
         if is_oversold and self.data.Close[-1] > self.data.Close[-2]:
+            self.last_mr_signal_from_ml = False
             return 1
         if is_overbought and self.data.Close[-1] < self.data.Close[-2]:
+            self.last_mr_signal_from_ml = False
             return -1
 
         # 2) 补充：在震荡市中，如果 ML 信号足够强，则允许 MR 按 ML 方向开仓，
@@ -664,9 +702,11 @@ class UltimateStrategy(Strategy):
         if abs(ml_signal) >= self.mr_ml_entry_threshold:
             # 多头：ML 看涨，且当前价格不高于中轨（避免高位追多）
             if ml_signal > 0 and self.data.Close[-1] <= self.mr_bb_mid[-1]:
+                self.last_mr_signal_from_ml = True
                 return 1
             # 空头：ML 看跌，且当前价格不低于中轨（避免低位追空）
             if ml_signal < 0 and self.data.Close[-1] >= self.mr_bb_mid[-1]:
+                self.last_mr_signal_from_ml = True
                 return -1
 
         return 0
@@ -695,11 +735,63 @@ class UltimateStrategy(Strategy):
                 kelly_risk = min(max(0.005, kelly * 0.5), self.max_risk_pct)
         return kelly_risk * self._get_drawdown_risk_scale()
 
-    def close_position(self):
-        eq_before = self.equity
+    def close_position(self, exit_price=None):
+        # 在关闭前记录方向与该笔交易盈亏
+        was_long = self.position.is_long
+        was_short = self.position.is_short
+        eq_before = float(self.equity) if self.equity is not None else 0.0
+        trade_pl = float(self.position.pl) if self.position.pl is not None else 0.0
+        # 记录价格用于不含手续费胜率统计
+        entry_price = float(getattr(self, "current_entry_price", float("nan")))
+        if np.isnan(entry_price):
+            entry_price = None
+        if exit_price is None and len(self.data.Close):
+            exit_price = float(self.data.Close[-1])
+        # 按原始逻辑关闭仓位，并使用账户权益变化驱动 Kelly 风控
         self.position.close()
-        pnl_pct = self.equity / eq_before - 1
+        pnl_pct = self.equity / eq_before - 1 if eq_before != 0 else 0.0
+        pnl_abs = trade_pl
         self.recent_trade_returns.append(pnl_pct)
+        # 累计统计整体与基于 ML 的交易表现
+        self.total_trades += 1
+        if self.current_trade_is_ml_based:
+            self.ml_based_trades += 1
+            self.ml_based_profit += pnl_abs
+            # 含手续费胜负判断
+            if was_long:
+                self.ml_long_trades += 1
+                self.ml_long_profit += pnl_abs
+                if pnl_abs > 0:
+                    self.ml_wins += 1
+                    self.ml_long_wins += 1
+                elif pnl_abs < 0:
+                    self.ml_losses += 1
+                    self.ml_long_losses += 1
+            elif was_short:
+                self.ml_short_trades += 1
+                self.ml_short_profit += pnl_abs
+                if pnl_abs > 0:
+                    self.ml_wins += 1
+                    self.ml_short_wins += 1
+                elif pnl_abs < 0:
+                    self.ml_losses += 1
+                    self.ml_short_losses += 1
+            # 不含手续费胜负判断（仅看价格方向）
+            if entry_price is not None and exit_price is not None:
+                if was_long:
+                    if exit_price > entry_price:
+                        self.ml_wins_gross += 1
+                        self.ml_long_wins_gross += 1
+                    elif exit_price < entry_price:
+                        self.ml_losses_gross += 1
+                        self.ml_long_losses_gross += 1
+                elif was_short:
+                    if exit_price < entry_price:
+                        self.ml_wins_gross += 1
+                        self.ml_short_wins_gross += 1
+                    elif exit_price > entry_price:
+                        self.ml_losses_gross += 1
+                        self.ml_short_losses_gross += 1
         if pnl_pct < 0:
             self.consecutive_losses += 1
             if self.consecutive_losses >= self.max_consecutive_losses:
@@ -708,6 +800,8 @@ class UltimateStrategy(Strategy):
         else:
             self.consecutive_losses = 0
         self.reset_trade_state()
+        # 当前交易已结束，重置 ML 标记
+        self.current_trade_is_ml_based = False
 
     def reset_trade_state(self):
         self.active_sub_strategy, self.mr_stop_loss, self.tf_initial_stop_loss = (
@@ -759,6 +853,89 @@ if __name__ == "__main__":
     stats = bt.run()
     print("\n" + "-" * 40 + f"\n          {symbol} 回测结果摘要\n" + "-" * 40)
     print(stats)
+    # --- 基于 ML 信号的胜率统计 ---
+    try:
+        strat = stats.get("_strategy", None)
+    except AttributeError:
+        strat = stats["_strategy"] if "_strategy" in stats else None
+    if strat is not None and hasattr(strat, "ml_based_trades"):
+        total_trades = getattr(strat, "total_trades", 0)
+        ml_trades = getattr(strat, "ml_based_trades", 0)
+        ml_wins = getattr(strat, "ml_wins", 0)
+        ml_losses = getattr(strat, "ml_losses", 0)
+        ml_long_trades = getattr(strat, "ml_long_trades", 0)
+        ml_short_trades = getattr(strat, "ml_short_trades", 0)
+        ml_long_wins = getattr(strat, "ml_long_wins", 0)
+        ml_short_wins = getattr(strat, "ml_short_wins", 0)
+
+        ml_win_rate = (ml_wins / ml_trades * 100) if ml_trades > 0 else float("nan")
+        ml_long_win_rate = (
+            ml_long_wins / ml_long_trades * 100 if ml_long_trades > 0 else float("nan")
+        )
+        ml_short_win_rate = (
+            ml_short_wins / ml_short_trades * 100
+            if ml_short_trades > 0
+            else float("nan")
+        )
+
+        print("\n" + "-" * 40 + "\n   基于ML信号的胜率（含手续费）\n" + "-" * 40)
+        print(f"总成交笔数: {total_trades}")
+        print(f"ML 信号相关成交笔数: {ml_trades}")
+        if ml_win_rate == ml_win_rate:
+            print(f"ML 信号总体胜率 [%]: {ml_win_rate:.2f}")
+        else:
+            print("ML 信号总体胜率 [%]: NaN")
+
+        print("\n   ML 多头 / 空头胜率分解（含手续费）")
+        print(f"ML 多头成交笔数: {ml_long_trades}")
+        if ml_long_win_rate == ml_long_win_rate:
+            print(f"ML 多头胜率 [%]: {ml_long_win_rate:.2f}")
+        else:
+            print("ML 多头胜率 [%]: NaN")
+        print(f"ML 空头成交笔数: {ml_short_trades}")
+        if ml_short_win_rate == ml_short_win_rate:
+            print(f"ML 空头胜率 [%]: {ml_short_win_rate:.2f}")
+        else:
+            print("ML 空头胜率 [%]: NaN")
+
+        # 不含手续费的胜率（仅看价格方向）
+        ml_wins_gross = getattr(strat, "ml_wins_gross", 0)
+        ml_losses_gross = getattr(strat, "ml_losses_gross", 0)
+        ml_long_wins_gross = getattr(strat, "ml_long_wins_gross", 0)
+        ml_short_wins_gross = getattr(strat, "ml_short_wins_gross", 0)
+
+        ml_win_rate_gross = (
+            ml_wins_gross / ml_trades * 100 if ml_trades > 0 else float("nan")
+        )
+        ml_long_win_rate_gross = (
+            ml_long_wins_gross / ml_long_trades * 100
+            if ml_long_trades > 0
+            else float("nan")
+        )
+        ml_short_win_rate_gross = (
+            ml_short_wins_gross / ml_short_trades * 100
+            if ml_short_trades > 0
+            else float("nan")
+        )
+
+        print("\n" + "-" * 40 + "\n   基于ML信号的胜率（不含手续费，仅看方向）\n" + "-" * 40)
+        print(f"ML 信号相关成交笔数: {ml_trades}")
+        if ml_win_rate_gross == ml_win_rate_gross:
+            print(f"ML 信号总体胜率（不含手续费）[%]: {ml_win_rate_gross:.2f}")
+        else:
+            print("ML 信号总体胜率（不含手续费）[%]: NaN")
+
+        print("\n   ML 多头 / 空头胜率分解（不含手续费）")
+        print(f"ML 多头成交笔数: {ml_long_trades}")
+        if ml_long_win_rate_gross == ml_long_win_rate_gross:
+            print(f"ML 多头胜率（不含手续费）[%]: {ml_long_win_rate_gross:.2f}")
+        else:
+            print("ML 多头胜率（不含手续费）[%]: NaN")
+        print(f"ML 空头成交笔数: {ml_short_trades}")
+        if ml_short_win_rate_gross == ml_short_win_rate_gross:
+            print(f"ML 空头胜率（不含手续费）[%]: {ml_short_win_rate_gross:.2f}")
+        else:
+            print("ML 空头胜率（不含手续费）[%]: NaN")
     # --- 按月收益率统计 ---
     try:
         equity_curve = stats["_equity_curve"]

@@ -42,12 +42,12 @@ logger = logging.getLogger(__name__)
 
 # --- 🚀 全局配置 ---
 SYMBOL = "ETHUSDT"
-INTERVAL = "15m"
+INTERVAL = "1h"
 DATA_START_DATE = "2017-01-01"
 TRAIN_START = "2018-01-01"
 VALIDATION_START = "2024-01-01"
 TEST_START = "2025-01-01"
-TEST_END = "2025-11-12"
+TEST_END = "2025-11-17"
 LOOK_BACK = 60
 TREND_CONFIG = {"look_forward_steps": 5, "ema_length": 8}
 

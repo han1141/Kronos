@@ -44,12 +44,12 @@ logger = logging.getLogger(__name__)
 
 
 SYMBOL = "ETHUSDT"
-INTERVAL = "15m"
+INTERVAL = "4h"
 DATA_START_DATE = "2021-01-01"
 TRAIN_START_DATE = "2022-01-01"
 TRAIN_END_DATE = "2025-09-30"
 TEST_START_DATE = "2025-10-01"
-TEST_END_DATE = "2025-11-10"
+TEST_END_DATE = "2025-11-17"
 LOOK_BACK = 60
 
 TREND_CONFIG = {
@@ -135,6 +135,31 @@ def feature_engineering(df):
     df["volume_change_rate"] = df["Volume"].pct_change()
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     return df
+
+
+def get_training_device():
+    """
+    选择用于训练的 TensorFlow 设备。
+    在支持 tensorflow-metal 的 macOS 上，GPU 实际上是通过 MPS 实现的，
+    因此这里检测到 GPU 后使用 /GPU:0 即可让训练跑在 MPS 上。
+    """
+    try:
+        gpus = tf.config.list_physical_devices("GPU")
+        if gpus:
+            try:
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+            except Exception:
+                # 某些环境下不支持设置 memory growth，忽略即可
+                pass
+            logger.info(f"检测到 GPU 设备，将使用 GPU/MPS 训练: {gpus[0].name}")
+            return "/GPU:0"
+        else:
+            logger.info("未检测到 GPU 设备，将使用 CPU 训练")
+            return "/CPU:0"
+    except Exception as e:
+        logger.warning(f"检测 GPU 设备失败({e})，回退到 CPU 训练")
+        return "/CPU:0"
 
 
 def create_trend_labels(df, look_forward_steps=12, ema_length=8):
@@ -239,16 +264,19 @@ def train_and_evaluate(
     )
 
     logger.info("\n开始训练模型...")
-    model.fit(
-        X_train,
-        y_train,
-        batch_size=32,
-        epochs=100,
-        class_weight=class_weight_dict,
-        validation_data=(X_test, y_test),
-        callbacks=[early_stopping],
-        verbose=1,
-    )
+    device_name = get_training_device()
+    logger.info(f"使用设备进行训练: {device_name}")
+    with tf.device(device_name):
+        model.fit(
+            X_train,
+            y_train,
+            batch_size=32,
+            epochs=100,
+            class_weight=class_weight_dict,
+            validation_data=(X_test, y_test),
+            callbacks=[early_stopping],
+            verbose=1,
+        )
 
     os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
     model.save(model_save_path)
@@ -274,6 +302,7 @@ def train_and_evaluate(
     print(f"精确率 (胜率): {precision_score(y_test, y_pred_labels_best_f1):.4f}")
     print(f"召回率: {recall_score(y_test, y_pred_labels_best_f1):.4f}")
     print(f"F1 分数: {f1_score(y_test, y_pred_labels_best_f1):.4f}")
+    print(f"推荐阈值（基于F1最优）: {best_f1_threshold:.4f}")
 
     return model, scaler, best_f1_threshold
 
