@@ -936,6 +936,50 @@ if __name__ == "__main__":
             print(f"ML 空头胜率（不含手续费）[%]: {ml_short_win_rate_gross:.2f}")
         else:
             print("ML 空头胜率（不含手续费）[%]: NaN")
+
+    # --- 纯策略信号方向胜率（不含手续费，仅看方向） ---
+    try:
+        trades_df = stats["_trades"]
+    except KeyError:
+        trades_df = None
+    if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+        trades = trades_df.dropna(subset=["EntryPrice", "ExitPrice"])
+        total_signals = len(trades)
+        longs = trades[trades["Size"] > 0]
+        shorts = trades[trades["Size"] < 0]
+        long_wins = (longs["ExitPrice"] > longs["EntryPrice"]).sum()
+        short_wins = (shorts["ExitPrice"] < shorts["EntryPrice"]).sum()
+        total_wins = long_wins + short_wins
+        pure_win_rate = (
+            total_wins / total_signals * 100 if total_signals > 0 else float("nan")
+        )
+        pure_long_win_rate = (
+            long_wins / len(longs) * 100 if len(longs) > 0 else float("nan")
+        )
+        pure_short_win_rate = (
+            short_wins / len(shorts) * 100 if len(shorts) > 0 else float("nan")
+        )
+        print(
+            "\n"
+            + "-" * 40
+            + "\n   纯策略信号方向胜率（不含手续费，仅看方向）\n"
+            + "-" * 40
+        )
+        print(f"总信号数（成交笔数）: {total_signals}")
+        print(f"多头信号数: {len(longs)}")
+        print(f"空头信号数: {len(shorts)}")
+        if pure_win_rate == pure_win_rate:
+            print(f"总体方向胜率 [%]: {pure_win_rate:.2f}")
+        else:
+            print("总体方向胜率 [%]: NaN")
+        if pure_long_win_rate == pure_long_win_rate:
+            print(f"多头方向胜率 [%]: {pure_long_win_rate:.2f}")
+        else:
+            print("多头方向胜率 [%]: NaN")
+        if pure_short_win_rate == pure_short_win_rate:
+            print(f"空头方向胜率 [%]: {pure_short_win_rate:.2f}")
+        else:
+            print("空头方向胜率 [%]: NaN")
     # --- 按月收益率统计 ---
     try:
         equity_curve = stats["_equity_curve"]
